@@ -85,3 +85,6 @@ Thumbs.db
 # uses data/ and results/, while newer workflows may use hidden directories.
 /data/
 /results/
+
+# Local compiled caches
+/.cache/

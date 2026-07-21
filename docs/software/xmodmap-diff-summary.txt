@@ -1,0 +1,20 @@
+Files vendor/xIV-LDDMM-Particle/xmodmap/deformation/Hamiltonian.py and legacy/xmodmap/deformation/Hamiltonian.py differ
+Only in legacy/xmodmap/distance: dummykl.py
+Files vendor/xIV-LDDMM-Particle/xmodmap/distance/__init__.py and legacy/xmodmap/distance/__init__.py differ
+Only in legacy/xmodmap/distance: .ipynb_checkpoints
+Only in legacy/xmodmap/distance: LossVarifoldNormBoundary_PartialNNet.py
+Files vendor/xIV-LDDMM-Particle/xmodmap/distance/LossVarifoldNorm.py and legacy/xmodmap/distance/LossVarifoldNorm.py differ
+Only in legacy/xmodmap/distance: NoSupportRestriction.py
+Only in legacy/xmodmap: distances
+Files vendor/xIV-LDDMM-Particle/xmodmap/__init__.py and legacy/xmodmap/__init__.py differ
+Only in legacy/xmodmap/io: .ipynb_checkpoints
+Only in legacy/xmodmap: .ipynb_checkpoints
+Only in legacy/xmodmap/model: .ipynb_checkpoints
+Files vendor/xIV-LDDMM-Particle/xmodmap/model/Model.py and legacy/xmodmap/model/Model.py differ
+Files vendor/xIV-LDDMM-Particle/xmodmap/model/SingleModality.py and legacy/xmodmap/model/SingleModality.py differ
+Only in legacy/xmodmap/optimizer: .ipynb_checkpoints
+Only in legacy/xmodmap/preprocess: BoundaryClassifier.py
+Only in legacy/xmodmap/preprocess: classify.py
+Files vendor/xIV-LDDMM-Particle/xmodmap/preprocess/__init__.py and legacy/xmodmap/preprocess/__init__.py differ
+Only in legacy/xmodmap/preprocess: .ipynb_checkpoints
+Files vendor/xIV-LDDMM-Particle/xmodmap/preprocess/preprocess.py and legacy/xmodmap/preprocess/preprocess.py differ

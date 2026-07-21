@@ -1,0 +1,405 @@
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/__init__.py b/legacy/xmodmap/__init__.py
+index 10a8081..f6c962b 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/__init__.py
++++ b/legacy/xmodmap/__init__.py
+@@ -58,4 +58,5 @@ def normalize(x, p=1.0, dim=1):
+ 
+ import xmodmap.distance as distance
+ import xmodmap.deformation as deformation
+-import xmodmap.model as model
+\ No newline at end of file
++import xmodmap.model as model
++import xmodmap.preprocess as preprocess
+\ No newline at end of file
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/deformation/Hamiltonian.py b/legacy/xmodmap/deformation/Hamiltonian.py
+index 1bbe5cd..2270565 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/deformation/Hamiltonian.py
++++ b/legacy/xmodmap/deformation/Hamiltonian.py
+@@ -116,8 +116,8 @@ class HamiltonianSystemGrid(Hamiltonian):
+             getUdiv(self.sigma, self.d, self.uCoeff)(gx, qx, px, pw * qw) * gw
+             + Alpha.sum() * gw
+         )
+-        print(Gpx)
+-        print(Gg)
++        #print(Gpx)
++        #print(Gg)
+ 
+         return -Gqx, -Gqw, Gpx, Gpw, Gg, Ggw
+     
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/distance/LossVarifoldNorm.py b/legacy/xmodmap/distance/LossVarifoldNorm.py
+index 75971f0..f41de0f 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/distance/LossVarifoldNorm.py
++++ b/legacy/xmodmap/distance/LossVarifoldNorm.py
+@@ -43,8 +43,8 @@ class LossVarifoldNorm:
+     @staticmethod
+     def GaussLinKernelSingle(sig, d, l):
+         # u and v are the feature vectors
+-        x, y, u, v = Vi(0, d), Vj(1, d), Vi(2, l), Vj(3, l)
+-        D2 = x.sqdist(y)
++        x, y, u, v = Vi(0, d), Vj(1, d), Vi(2, l), Vj(3, l) #positions, features
++        D2 = x.sqdist(y) #|| x_i-y_j||^2
+         K = (-D2 / (2.0 * sig * sig)).exp() * (u * v).sum()
+         return K.sum_reduction(axis=1)
+     
+@@ -94,9 +94,9 @@ class LossVarifoldNorm:
+         beta = []
+         for sig in self.sigmaVar:
+             Kinit = self.GaussLinKernelSingle(sig, self.d, self.labs)
+-            cinit = Kinit(self.Ttilde, self.Ttilde, self.w_T * self.zeta_T, self.w_T * self.zeta_T).sum()
+-            k1 = Kinit(Stilde, Stilde, tmp, tmp).sum()
+-            k2 = (- 2.0 * Kinit(Stilde, self.Ttilde, tmp, self.w_T * self.zeta_T)).sum()
++            cinit = Kinit(self.Ttilde, self.Ttilde, self.w_T * self.zeta_T, self.w_T * self.zeta_T).sum()#<\mu_T,\mu_T>_sigma
++            k1 = Kinit(Stilde, Stilde, tmp, tmp).sum()#<\mu_S^\pi,\mu_S^pi>_sigma
++            k2 = (- 2.0 * Kinit(Stilde, self.Ttilde, tmp, self.w_T * self.zeta_T)).sum()#-2<\mu_S^\pi,\mu_T>_\sigma
+ 
+             beta.append((0.6 / sig) * 2.0 / (cinit + k1 + k2))
+ 
+@@ -127,7 +127,7 @@ class LossVarifoldNorm:
+         pi_ST : Source to Target features mapping
+         """
+ 
+-        nu_Spi = (sSw * zeta_S) @ (pi_ST ** 2)  # Ns x L * L x F
++        nu_Spi = (sSw * zeta_S) @ (pi_ST ** 2)  # Ns x L * L x F (weighted source features mapped to target)
+         
+         '''
+         # attempt at using bands for speed up 
+@@ -135,8 +135,8 @@ class LossVarifoldNorm:
+         k2 = sum([self.K[i](sSx, self.Ttilde, nu_Spi[:,self.bands[i][0]:self.bands[i][1]], self.w_T * self.zeta_T[:,self.bands[i][0]:self.bands[i][1]]) for i in range(self.nb_bands)])
+         '''
+ 
+-        k1 = self.K(sSx, sSx, nu_Spi, nu_Spi)
+-        k2 = self.K(sSx, self.Ttilde, nu_Spi, self.w_T * self.zeta_T)
++        k1 = self.K(sSx, sSx, nu_Spi, nu_Spi)  # ⟨μ_{S^π}, μ_{S^π}⟩_W (vector over i)
++        k2 = self.K(sSx, self.Ttilde, nu_Spi, self.w_T * self.zeta_T)# ⟨μ_{S^π}, μ_T⟩_W     (vector over i)
+         
+         return (1.0 / 2.0) * (self.cst + k1.sum() - 2.0 * k2.sum())
+ 
+diff --git a/legacy/xmodmap/distance/LossVarifoldNormBoundary_PartialNNet.py b/legacy/xmodmap/distance/LossVarifoldNormBoundary_PartialNNet.py
+new file mode 100644
+index 0000000..d407a11
+--- /dev/null
++++ b/legacy/xmodmap/distance/LossVarifoldNormBoundary_PartialNNet.py
+@@ -0,0 +1,37 @@
++import torch
++import xmodmap
++
++from xmodmap.distance.LossVarifoldNormBoundary import LossVarifoldNormBoundary
++#from xmodmap.preprocess.BoundaryClassifer import BoundaryClassifier
++from xmodmap.preprocess.preprocess import resizeData
++
++#from xmodmap.distance.LossVarifoldNorm import GaussLinKernelSingle
++
++
++class LossVarifoldNormBoundary_PartialNNet(LossVarifoldNormBoundary):
++    '''
++    Support weights reflect density of particles in target space and interior of set of coronal sections.
++    
++    densSigma = bandwith (for data in unit cube) of Gaussian kernel used to compute local density of particles
++    in target space.
++    '''
++
++    def __init__(self, sigmaVar, w_T, zeta_T, Ttilde, nnetFile, s=1., m=0.):
++        
++        super().__init__(sigmaVar, w_T, zeta_T, Ttilde)
++        self.nnet = xmodmap.preprocess.BoundaryClassifier(param_file=nnetFile)
++        
++        # rescaling parameters
++        self.s = s
++        self.m = m
++
++        if self.w_T.shape[-1] != 1:
++            self.w_T = self.w_T[..., None]
++
++    def supportWeight(self, qx, lamb):
++        sW = self.nnet.predict(1.0 / lamb, resizeData(qx, self.s, self.m))
++        return sW[..., None]
++    
++    def __call__(self, sSx, sSw, zeta_S, pi_ST, lamb):
++        return super().__call__(sSx, sSw, zeta_S, pi_ST, lamb)
++
+diff --git a/legacy/xmodmap/distance/NoSupportRestriction.py b/legacy/xmodmap/distance/NoSupportRestriction.py
+new file mode 100644
+index 0000000..4375200
+--- /dev/null
++++ b/legacy/xmodmap/distance/NoSupportRestriction.py
+@@ -0,0 +1,18 @@
++import torch
++
++# boundary weight regularization
++class NoSupportRestriction:
++    def __init__(self, eta0=None):
++        """
++        `lam` is a bandwith used to describe the transition zone between the ROI and the exterior.
++        """
++        self.eta0 = torch.sqrt(torch.tensor(0.1)) if eta0 is None else eta0
++        self.weight = 1.0
++
++    def get_params(self):
++        return {"eta0": self.eta0, "weight": self.weight}
++
++    def __call__(self, lamb_est=None):
++        reg = 1.0
++        return reg
++
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/distance/__init__.py b/legacy/xmodmap/distance/__init__.py
+index 89b5ccd..ad63077 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/distance/__init__.py
++++ b/legacy/xmodmap/distance/__init__.py
+@@ -1,6 +1,9 @@
+ from .LossVarifoldNorm import LossVarifoldNorm
+ from .LossVarifoldNormBoundary import LossVarifoldNormBoundary
+ from .LossVarifoldNormBoundary_Partial import LossVarifoldNormBoundary_Partial
++from .LossVarifoldNormBoundary_PartialNNet import LossVarifoldNormBoundary_PartialNNet
+ 
+ from .SupportRestrictionReg import SupportRestrictionReg
+-from .kl import PiRegularizationSystem as PiRegularizationSystem
+\ No newline at end of file
++from .kl import PiRegularizationSystem as PiRegularizationSystem
++from .dummykl import PiRegularizationSystemDummy as PiRegularizationSystemDummy
++from .NoSupportRestriction import NoSupportRestriction
+\ No newline at end of file
+diff --git a/legacy/xmodmap/distance/dummykl.py b/legacy/xmodmap/distance/dummykl.py
+new file mode 100644
+index 0000000..da0463b
+--- /dev/null
++++ b/legacy/xmodmap/distance/dummykl.py
+@@ -0,0 +1,32 @@
++import torch
++
++
++class PiRegularizationSystemDummy:
++    """
++        pi regularization (KL divergence)
++    """
++    def __init__(self, zeta_S, nu_T, norm=True):
++        self.nuTconst = torch.sum(nu_T)
++        # two alternatives for distribution to compare to
++        if not norm:
++            self.nu_Tprob = torch.sum(nu_T, dim=0) / torch.sum(
++                nu_T
++            )  # compare to overall distribution of features
++        else:
++            self.nu_Tprob = (torch.ones((1, nu_T.shape[-1])) / nu_T.shape[-1])
++
++        self.zeta_S = zeta_S
++        self.nu_T = nu_T
++
++        self.weight = 1.0 #TODO: put normalizing cste here ?1.0 / torch.log(torch.tensor(nu_T.shape[-1]))
++
++    def get_params(self):
++        params_dict = {
++            "weight": self.weight,
++            "norm": True,
++            "nuTconst": self.nuTconst
++        }
++        return params_dict
++
++    def __call__(self, qw, pi_est):
++        return 0.0*self.nuTconst
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/model/Model.py b/legacy/xmodmap/model/Model.py
+index 8b1447e..ca29bcb 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/model/Model.py
++++ b/legacy/xmodmap/model/Model.py
+@@ -29,10 +29,9 @@ class Model:
+     def init(self, variables, variables_to_optimize, precond=None, savedir=os.path.join(os.getcwd(), "output")):
+         # a dict containing all the variables of the model
+         self.variables = variables
+-
+         # a list of the variables to optimize
+         self.variables_to_optimize = {key: self.variables[key] for i, key in enumerate(variables_to_optimize)}
+-
++        self.log=[]
+         # no precond by default, see self.set_precond()
+         if precond is not None:
+             self.set_precond(precond)
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/model/SingleModality.py b/legacy/xmodmap/model/SingleModality.py
+index 22e9e5b..15a2339 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/model/SingleModality.py
++++ b/legacy/xmodmap/model/SingleModality.py
+@@ -41,7 +41,7 @@ class SingleModality(Model):
+         assert self.dataLoss.get_params() == checkpoint["dataLoss"]
+         assert self.hamiltonian.get_params() == checkpoint["hamiltonian"]
+     
+-    def print_log(self, logScale=False):
++    def print_log(self, logScale=False,return_HD=False):
+         # split logs
+         logH = []
+         logD = []
+@@ -49,18 +49,18 @@ class SingleModality(Model):
+         for i in range(0,len(self.log)):
+             logH.append(self.log[i][0].numpy())
+             logD.append(self.log[i][1].numpy())
+-        
++        f, ax = plt.subplots()
++
+         if not logScale:
+-            f,ax = plt.subplots()
+             ax.plot(logH, label=f"Hamiltonian Loss, Final = {logH[-1]}")
+             ax.plot(logD, label=f"Data Loss, Final = {logD[-1]}")
+-            ax.legend()
+         else:
+-            f,ax = plt.subplots()
+-            ax.plot(np.log(np.asarray(logH)+1.0), label=f"Hamiltonian Loss, Final = {logH[-1]}")
+-            ax.plot(np.log(np.asarray(logD)+1.0), label=f"Data Loss, Final = {logD[-1]}")
+-            ax.legend()
+-            
++            ax.plot(np.log(np.asarray(logH) + 1.0), label=f"Hamiltonian Loss, Final = {logH[-1]}")
++            ax.plot(np.log(np.asarray(logD) + 1.0), label=f"Data Loss, Final = {logD[-1]}")
++
++        ax.legend()
++        if return_HD:
++            return f, logH[-1], logD[-1]   
+         
+         return f
+ 
+diff --git a/legacy/xmodmap/preprocess/BoundaryClassifier.py b/legacy/xmodmap/preprocess/BoundaryClassifier.py
+new file mode 100644
+index 0000000..096222d
+--- /dev/null
++++ b/legacy/xmodmap/preprocess/BoundaryClassifier.py
+@@ -0,0 +1,72 @@
++import torch
++from torch import nn
++import pickle
++from skorch import NeuralNetClassifier
++
++
++class MyModule(nn.Module):
++    def __init__(self, nonlin=nn.ELU(), interface_scale=1.):
++        super().__init__()
++
++        self.interface_scale = interface_scale
++
++        self.dense0 = nn.Linear(3, 15)
++        self.nonlin = nonlin
++        # self.dropout = nn.Dropout(0.5)
++        self.dense1 = nn.Linear(15, 5)
++        self.output = nn.Linear(5, 1)
++        self.softmax = nn.Tanh()
++
++    def forward(self, X, **kwargs):
++        X = self.nonlin(self.dense0(X))
++        # X = self.dropout(X)
++        X = self.nonlin(self.dense1(X))
++        y_pred = self.softmax(self.interface_scale * self.output(X))
++
++        return torch.hstack([0.5 - y_pred / 2., 0.5 + y_pred / 2.])
++
++
++class BoundaryClassifier:
++    def __init__(self, param_file=None):
++        self.mod = None
++        if param_file is not None:
++            self.mod = MyModule()
++            self.mod.load_state_dict(torch.load(param_file))
++            self.mod.eval()
++            self.mod.requires_grad_(False)
++            self.mod = self.mod.to('cuda:0')
++
++    def train(self, trainingFile):
++        info = torch.load(trainingFile)
++
++        old_device = torch.tensor(0).device
++        torch.set_default_device('cpu')
++
++        nnet = NeuralNetClassifier(
++            MyModule,
++            max_epochs=500,
++            lr=0.1,
++            iterator_train__shuffle=True,
++            train_split=None
++        )
++
++        nnet.fit(info['X'], info['y'], sample_weight=info['sample_weight'])
++
++        torch.set_default_device(old_device)
++
++        self.mod = nnet.module_
++        self.mod.eval()
++        self.mod.requires_grad_(False)
++        self.mod = self.mod.to('cuda:0')
++        
++        return
++
++    def predict(self, bandwidth, qx):
++        self.mod.interface_scale = bandwidth
++        p1 = self.mod.forward(qx)[:, 1]
++        # convolve output with Gaussian
++        
++        return p1
++        
++    def save(self, filename):
++        torch.save(self.mod.state_dict(), filename)
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/preprocess/__init__.py b/legacy/xmodmap/preprocess/__init__.py
+index e69de29..4a904d3 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/preprocess/__init__.py
++++ b/legacy/xmodmap/preprocess/__init__.py
+@@ -0,0 +1 @@
++from .BoundaryClassifier import BoundaryClassifier
+\ No newline at end of file
+diff --git a/legacy/xmodmap/preprocess/classify.py b/legacy/xmodmap/preprocess/classify.py
+new file mode 100644
+index 0000000..74d991f
+--- /dev/null
++++ b/legacy/xmodmap/preprocess/classify.py
+@@ -0,0 +1,39 @@
++import sys
++import os
++import torch
++from matplotlib import pyplot as plt
++sys.path.append('..')
++sys.path.append('../..')
++import xmodmap
++
++from xmodmap.io.getOutput import writeVTK
++
++trainingFile = sys.argv[1]
++savedir = sys.argv[2]
++if len(sys.argv) > 3:
++    suff = sys.argv[3]
++else:
++    suff = ""
++
++bc = xmodmap.preprocess.BoundaryClassifier()
++bc.train(trainingFile)
++bc.save(os.path.join(savedir,suff + "boundaryModel.pt"))
++#print(loss)
++#f,ax = plt.subplots()
++#ax.plot(loss)
++#f.savefig(os.path.join(savedir,"boundaryModelLoss.png"),dpi=300)
++
++T = torch.load(trainingFile)['X']
++
++# plot grid 
++mi = torch.min(T,axis=0).values
++ma = torch.max(T,axis=0).values
++xx = torch.arange(mi[0]-3.0,ma[0]+1.0,0.25)
++yy = torch.arange(mi[1]-3.0,ma[1]+1.0,0.25)
++zz = torch.arange(mi[2]-3.0,ma[2]+1.0,0.25)
++
++XX,YY,ZZ = torch.meshgrid(xx,yy,zz,indexing='ij')
++XXYYZZ = torch.stack((XX.ravel(),YY.ravel(),ZZ.ravel()),axis=-1)
++swGrid1 = bc.predict(1.0,XXYYZZ)
++
++writeVTK(XXYYZZ,[swGrid1.cpu().numpy()],['supportWeights1'],os.path.join(savedir,suff+"initialSupportWeights.vtk"))
+diff --git a/vendor/xIV-LDDMM-Particle/xmodmap/preprocess/preprocess.py b/legacy/xmodmap/preprocess/preprocess.py
+index b484e66..443a9b5 100644
+--- a/vendor/xIV-LDDMM-Particle/xmodmap/preprocess/preprocess.py
++++ b/legacy/xmodmap/preprocess/preprocess.py
+@@ -141,6 +141,16 @@ def rescaleDataSM(X, s, m):
+     Xtilde = (X - m) * (1.0 / s)
+     return Xtilde
+ 
++def rescaleDataUnits(X,s):
++    '''
++    Rescales different dimensions of X by s.
++    Use before scaling to bounding box of 1mm^3.
++    '''
++    if len(s) == 3:
++        Xtilde = torch.stack((X[:,0]*s[0],X[:,1]*s[1],X[:,2]*s[2]),axis=-1)
++    elif len(s) == 2:
++        Xtilde = torch.stack((X[:,0]*s[0],X[:,1]*s[1]),axis=-1)
++    return Xtilde
+ 
+ def scaleDataByVolumes(S, nuS, T, nuT, dRel=3):
+     """

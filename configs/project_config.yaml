@@ -3,13 +3,16 @@
 # On Dalet, edit project.root once. All relative paths below resolve from that root.
 # Absolute paths are also accepted. ~ and $HOME are expanded.
 project:
-  root: "."
+  root: ".."
   name: "Kavli Allen-SEA-AD xIV-LDDMM"
 
 software:
   # Prefer the colleague's exact repository/commit for first reproduction. The public
   # repository currently uses the "unpack" branch.
-  xiv_lddmm_repository: "software/xIV-LDDMM-Particle"
+  xiv_lddmm_repository: "legacy"
+
+  # Reference checkout; not used by the runtime loader.
+  xiv_lddmm_upstream_reference: "vendor/xIV-LDDMM-Particle"
 
 # Coordinate-space registry. These names become metadata in particle NPZ files.
 # They are assertions to be verified, not substitutes for header/transform QC.

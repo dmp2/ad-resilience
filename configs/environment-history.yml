@@ -1,0 +1,12 @@
+name: ad-resilience-xiv
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - cmake
+  - python=3.10
+  - cxx-compiler
+  - pip
+  - git
+  - ninja
+prefix: /cis/home/dpadova/miniconda3/envs/ad-resilience-xiv
