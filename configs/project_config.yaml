@@ -1,0 +1,300 @@
+# Kavli xIV-LDDMM project setup
+# =================================
+# On Dalet, edit project.root once. All relative paths below resolve from that root.
+# Absolute paths are also accepted. ~ and $HOME are expanded.
+project:
+  root: "."
+  name: "Kavli Allen-SEA-AD xIV-LDDMM"
+
+software:
+  # Prefer the colleague's exact repository/commit for first reproduction. The public
+  # repository currently uses the "unpack" branch.
+  xiv_lddmm_repository: "software/xIV-LDDMM-Particle"
+
+# Coordinate-space registry. These names become metadata in particle NPZ files.
+# They are assertions to be verified, not substitutes for header/transform QC.
+spaces:
+  ding_raw_native:
+    description: >-
+      Native coordinate convention of the original Allen/Ding donor images. Raw files
+      may not share one voxel grid; inspect affines and documentation.
+  ding_openneuro_subject:
+    description: >-
+      ds003590 reconstructed MRI/Nissl/parvalbumin subject space at 0.25 mm isotropic.
+      This is the same Allen donor/reference lineage as the Ding material, but exact
+      grid equivalence must still be checked file by file.
+  mni_icbm2009b_symmetric:
+    description: >-
+      MNI ICBM 2009b nonlinear symmetric population-template space used by the Allen
+      Human Reference Atlas 3-D, 2020. This is not a single-donor native space.
+  seaad_donor_native:
+    description: >-
+      Placeholder for a SEA-AD donor-native/slab/block/section coordinate hierarchy.
+
+# Informational data roots. Download scripts can target these directories.
+datasets:
+  ding_imaging:
+    root: "data/raw/ding_imaging"
+    coordinate_space: "ding_raw_native"
+  openneuro_ds003590:
+    root: "data/raw/openneuro/ds003590"
+    coordinate_space: "ding_openneuro_subject"
+    notes: >-
+      The reconstructed subject-space outputs and MNI-space mappings should be kept
+      distinct in filenames and metadata.
+  allen_human_reference_atlas_3d_2020:
+    root: "data/raw/allen_hra_3d_2020"
+    coordinate_space: "mni_icbm2009b_symmetric"
+    notes: >-
+      Parcellation was drawn on ICBM 2009b nonlinear symmetric and adapts Ding's prior
+      2-D atlas/ontology; it is not the Ding donor anatomy itself.
+  sea_ad:
+    root: "data/raw/sea_ad"
+    coordinate_space: "seaad_donor_native"
+
+# Feature maps from integer segmentation labels to fine and coarse particle features.
+# Fine features are columns of nu_All. Each group is one column of nu_Sub.
+label_maps:
+  legacy_target_5labels:
+    groups:
+      - name: "amygdala"
+        labels:
+          - {id: 1, name: "amygdala"}
+      - name: "entorhinal_temporal"
+        labels:
+          - {id: 2, name: "entorhinal"}
+          - {id: 3, name: "temporal_extension"}
+      - name: "hippocampal_formation"
+        labels:
+          - {id: 4, name: "hippocampal_subfield_1"}
+          - {id: 5, name: "hippocampal_subfield_2"}
+
+  legacy_brain7_three_regions:
+    groups:
+      - name: "amygdala"
+        labels:
+          - {id: 12, name: "amygdala_12"}
+          - {id: 11, name: "amygdala_11"}
+          - {id: 13, name: "amygdala_13"}
+          - {id: 14, name: "amygdala_14"}
+      - name: "entorhinal_perirhinal"
+        labels:
+          - {id: 9, name: "entorhinal"}
+          - {id: 17, name: "perirhinal"}
+      - name: "hippocampal_formation"
+        labels:
+          - {id: 15, name: "dentate_gyrus"}
+          - {id: 16, name: "endfolial"}
+          - {id: 8, name: "hilus"}
+          - {id: 2, name: "hippocampal_2"}
+          - {id: 3, name: "hippocampal_3"}
+          - {id: 4, name: "hippocampal_4"}
+          - {id: 5, name: "hippocampal_5"}
+          - {id: 6, name: "hippocampal_6"}
+          - {id: 7, name: "hippocampal_7"}
+
+  # Useful for inventory/QC of an atlas annotation. It makes one feature per nonzero
+  # integer. Do not use it for SingleModality across different ontologies unless the
+  # feature IDs and order have been explicitly harmonized.
+  infer_all_labels:
+    infer_all_nonbackground: true
+
+particle_jobs:
+  sources:
+    # Replace input_nifti with the segmentation/annotation you intend to use. Raw MRI,
+    # dMRI, Nissl, and parvalbumin images are not label images.
+    ding_subject_source:
+      enabled: false
+      input_nifti: "data/processed/segmentations/ding_subject_labels.nii.gz"
+      output_dir: "data/processed/particles/sources/ding_subject"
+      coordinate_space: "ding_openneuro_subject"
+      coordinate_mode: "affine_world"
+      construction_backend: "project_affine_block"
+      vtk_coordinate_convention: "xyz"
+      label_map: "infer_all_labels"
+      background_labels: [0]
+      downsample_factors: [1, 5]
+      write_vtk: true
+      notes: >-
+        First use a small validated ROI. Replace infer_all_labels with a biologically
+        defined feature crosswalk before registering to another dataset.
+
+    allen_hra_mni_source:
+      enabled: false
+      input_nifti: "data/raw/allen_hra_3d_2020/annotation.nii.gz"
+      output_dir: "data/processed/particles/sources/allen_hra_mni"
+      coordinate_space: "mni_icbm2009b_symmetric"
+      coordinate_mode: "affine_world"
+      construction_backend: "project_affine_block"
+      vtk_coordinate_convention: "xyz"
+      label_map: "infer_all_labels"
+      background_labels: [0]
+      downsample_factors: [1, 5]
+      write_vtk: true
+      notes: >-
+        Whole-brain full-resolution particles may be very large. Crop to an ROI or use
+        a reduced representation for initial tests.
+
+    legacy_brain7_source:
+      enabled: false
+      input_nifti: "data/legacy/labelsTr_reorient_3label/brain7.nii.gz"
+      output_dir: "data/processed/particles/sources/legacy_brain7"
+      coordinate_space: "legacy_reoriented_subject"
+      coordinate_mode: "legacy_centered"
+      construction_backend: "project_affine_block"
+      vtk_coordinate_convention: "xyz"
+      label_map: "legacy_brain7_three_regions"
+      background_labels: [0]
+      downsample_factors: [1, 5]
+      write_vtk: true
+
+  targets:
+    example_target:
+      enabled: false
+      input_nifti: "data/processed/segmentations/example_target_labels.nii.gz"
+      output_dir: "data/processed/particles/targets/example"
+      coordinate_space: "ding_openneuro_subject"
+      coordinate_mode: "affine_world"
+      construction_backend: "project_affine_block"
+      vtk_coordinate_convention: "xyz"
+      label_map: "infer_all_labels"
+      background_labels: [0]
+      downsample_factor: 1
+      write_vtk: true
+
+    legacy_adni_targets:
+      enabled: false
+      input_glob: "data/legacy/labelsTr/*.nii.gz"
+      output_dir: "data/processed/particles/targets/legacy_adni"
+      coordinate_space: "legacy_reoriented_subject"
+      coordinate_mode: "legacy_centered"
+      construction_backend: "xmodmap_native"
+      vtk_coordinate_convention: "xyz"
+      label_map: "legacy_target_5labels"
+      background_labels: [0]
+      downsample_factor: 1
+      write_vtk: true
+
+registrations:
+  # This is a template. Source and target feature columns must have identical meaning.
+  ding_subject_test:
+    source_particles: "data/processed/particles/sources/ding_subject/ding_subject_labels_ds5.npz"
+    target_particles: "data/processed/particles/targets/example/example_target_labels_ds1.npz"
+    full_target_particles: "data/processed/particles/targets/example/example_target_labels_ds1.npz"
+    output_dir: "results/registrations/ding_subject_test"
+    feature_key: "nu_Sub"
+    report_feature_key: "nu_All"
+    allow_space_mismatch: false
+    vtk_coordinate_convention: "xyz"
+    model:
+      seed: 0
+      device: "cpu"          # e.g. cuda:0 after validating the environment
+      torch_dtype: "float32"
+      effective_dimension: 3
+      isotropic_scale: true
+      sigma_rkhs: [0.20, 0.10, 0.05]
+      sigma_var: [0.20, 0.05, 0.02]
+      steps: 250
+      shooting_time_steps: 10
+      gamma: 0.01
+      c_rotation: 1.0
+      c_translation: 1.0
+      c_nonrigid: 5.0
+      data_loss_weight: 1.0
+      precondition_scale: 1.0
+      center_source: false
+      center_target: false
+
+  # Deliberately disabled conceptually: HRA and subject particles are in different
+  # spaces and may have different feature ontologies. First use ds003590's documented
+  # MNI mapping or a separate cross-modal/atlas-registration stage.
+  allen_hra_to_ding_NOT_READY:
+    source_particles: "data/processed/particles/sources/allen_hra_mni/annotation_ds5.npz"
+    target_particles: "data/processed/particles/targets/example/example_target_labels_ds1.npz"
+    output_dir: "results/registrations/allen_hra_to_ding_not_ready"
+    feature_key: "nu_Sub"
+    report_feature_key: "nu_All"
+    allow_space_mismatch: false
+    vtk_coordinate_convention: "xyz"
+    model:
+      seed: 0
+      device: "cpu"
+      torch_dtype: "float32"
+      sigma_rkhs: [0.20, 0.10, 0.05]
+      sigma_var: [0.20, 0.05, 0.02]
+      steps: 50
+
+# Dense scalar-image particles.  The xmodmap-native backend is retained for exact
+# legacy-style experiments; Allen production jobs use the affine/block extension.
+dense_image_particle_jobs:
+  legacy_brain7_t2_xmodmap_native:
+    enabled: false
+    input_nifti: "data/legacy/imagesTr_reorient/brain7_0000.nii.gz"
+    output_dir: "data/processed/particles/dense/legacy_brain7_t2"
+    coordinate_space: "legacy_reoriented_subject"
+    coordinate_mode: "legacy_centered"
+    construction_backend: "xmodmap_native"
+    vtk_coordinate_convention: "xyz"
+    downsample_factors: [1]
+    load_scaled: false
+    mask: {mode: "positive"}
+    intensity:
+      normalization: "uint8_legacy"
+      clip: true
+    histogram:
+      enabled: true
+      bins: 256
+      reverse: false
+    write_vtk: true
+    write_legacy_t2_alias: true
+    notes: >-
+      Uses xmodmap.io.getInput.makeBinsFromMultiChannelImage for nu_bin.  It is
+      intentionally limited to native sampling and centered coordinates.
+
+  ding_7t_t1_example:
+    enabled: false
+    input_nifti: "data/raw/ding_imaging/REPLACE_WITH_7T_T1.nii.gz"
+    mask_nifti: null
+    output_dir: "data/processed/particles/dense/ding_7t_t1"
+    coordinate_space: "ding_raw_native"
+    coordinate_mode: "affine_world"
+    construction_backend: "project_affine_block"
+    vtk_coordinate_convention: "xyz"
+    position_mode: "block_center"
+    downsample_factors: [5]
+    load_scaled: true
+    mask: {mode: "positive"}
+    intensity:
+      normalization: "robust_minmax"
+      lower_quantile: 0.01
+      upper_quantile: 0.99
+      clip: true
+    histogram:
+      enabled: true
+      bins: 64
+      assignment: "linear"
+    write_vtk: true
+    write_legacy_t2_alias: false
+    notes: >-
+      Start with a validated ROI and explicit tissue mask.  The project backend is used
+      because xmodmap's native image converter does not preserve the complete NIfTI
+      affine and its stride downsampling is not a 3-D mass-conserving aggregation.
+
+particle_reconstruction_jobs:
+  ding_7t_t1_roundtrip_example:
+    particle_file: "data/processed/particles/dense/ding_7t_t1/REPLACE_intensity_ds5.npz"
+    coordinate_key: "X"
+    feature_key: "nu_intensity"
+    mode: "scalar"
+    reference_nifti: "data/raw/ding_imaging/REPLACE_WITH_7T_T1.nii.gz"
+    output_nifti: "results/qc/ding_7t_t1_roundtrip.nii.gz"
+    interpolation:
+      method: "gaussian_knn"
+      k: 8
+      sigma_mm: 0.25
+      support_radius_mm: 1.0
+      chunk_size: 200000
+      minimum_weight: 1.0e-8
+    write_mass_image: true
+    write_support_mask: true
+

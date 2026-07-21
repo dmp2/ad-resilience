@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------------
+# Local data and generated outputs
+# Never commit these directories: they may be large or sensitive.
+# ---------------------------------------------------------------------
+/.data/
+/.outputs/
+
+# ---------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+build/
+dist/
+*.egg-info/
+
+# ---------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------
+.venv/
+venv/
+env/
+.conda/
+
+# ---------------------------------------------------------------------
+# Local configuration and credentials
+# ---------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+
+# Machine-specific project configuration
+configs/project_config.local.yaml
+
+# ---------------------------------------------------------------------
+# Jupyter
+# ---------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------
+# Editors and operating systems
+# ---------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------
+# Temporary files and logs
+# ---------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+
+# ---------------------------------------------------------------------
+# Historical and unaudited code
+# Contains obsolete scripts and a potentially modified xmodmap copy.
+# Keep locally until provenance and useful changes have been reviewed.
+# ---------------------------------------------------------------------
+/legacy/
+
+# ---------------------------------------------------------------------
+# Third-party source
+# Do not commit a copied upstream repository until its version,
+# modifications, and licensing have been verified.
+# ---------------------------------------------------------------------
+/vendor/xIV-LDDMM-Particle/
+
+# Project data and generated results
+# Both naming conventions are protected because current configuration
+# uses data/ and results/, while newer workflows may use hidden directories.
+/data/
+/results/
