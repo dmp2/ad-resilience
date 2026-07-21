@@ -1,0 +1,4 @@
+[submodule "vendor/xIV-LDDMM-Particle"]
+	path = vendor/xIV-LDDMM-Particle
+	url = https://github.com/kstouff4/xIV-LDDMM-Particle.git
+	branch = unpack
