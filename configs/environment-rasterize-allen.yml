@@ -1,0 +1,15 @@
+name: ad-resilience-allen-zarr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip=25.2
+  - pip:
+      - defusedxml==0.7.1
+      - numpy==2.3.3
+      - numcodecs==0.16.5
+      - ome-zarr==0.18.0
+      - Pillow==11.3.0
+      - skia-python==138.0
+      - svg.path==7.0
+      - zarr==3.1.3
