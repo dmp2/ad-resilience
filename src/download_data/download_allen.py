@@ -1,50 +1,8 @@
 #!/usr/bin/env python3
-"""Download and preprocess Allen human brain atlas histology sections.
+"""Acquire and validate raw Allen/Ding atlas data for specimen 708424.
 
-Python translation of:
-    acasamitjana/3dhirest/database/preprocessing/download_allen.m
-
-The workflow:
-1. Query section metadata for Allen specimen 708424.
-2. Separate Nissl (treatment ID 3) and IHC/parvalbumin (treatment ID 16).
-3. Download JPEG section images at the requested effective downsample level.
-4. Query the selected Allen 2-D atlas for its AtlasImage records.
-5. Download the atlas SVG annotations from those AtlasImage IDs.
-6. Generate tissue masks using the thresholds and morphology in the MATLAB code.
-7. Save legacy ``secInfo.json``/``secInfo.mat`` plus standards-aligned JSON/TSV metadata.
-
-Notes on fidelity and fixes
----------------------------
-* Allen image downsample is logarithmic: level n reduces each image axis by 2**n.
-* The default ``allen-direct`` mode requests the final pyramid level directly and
-  preserves the returned JPEG bytes. ``matlab-compatible`` remains available to
-  reproduce the original request-at-one-level-higher plus local bicubic resize.
-* The original MATLAB script references undefined variables ``NISSL_DIR`` and
-  ``it_slice``. Here, the Nissl directory is derived from ``data_dir`` and the
-  intended one-based loop ordinal is used for the slice-specific thresholds.
-* The original MATLAB script inferred annotated sections from the specimen image
-  metadata. This implementation instead queries ``AtlasImage`` records for the
-  requested atlas ID, as required by Allen's atlas/SVG workflow, then downloads
-  each annotation by AtlasImage ID.
-* SVGs are requested by graphic-group IDs only. They remain vector graphics and
-  retain the coordinate system encoded by their SVG ``viewBox``.
-* Allen ``SectionImage.resolution`` and image dimensions are retained per section.
-* Standards-aligned metadata are written to ``metadata/dataset.json`` and TSV tables;
-  legacy ``secInfo.json``/``secInfo.mat`` remain available for 3DHiResT compatibility.
-* Image provenance is recorded per file in ``metadata/image_files.tsv``. Existing
-  files are not assumed to match the requested mode; use ``--verify-existing`` or
-  ``--overwrite`` before treating them as verified direct downloads.
-* All writes are atomic, HTTP requests use retries, and existing files are
-  skipped unless ``--overwrite`` is supplied.
-
-Install dependencies:
-    python -m pip install numpy scipy pillow requests
-
-Example:
-    python download_allen.py --data-dir /path/to/Allen/downloads
-
-Metadata-only smoke test:
-    python download_allen.py --data-dir ./allen_downloads --metadata-only
+Only source JPEGs, multi-group SVGs, the raw Allen ontology, and compact
+metadata are handled here. Rasterization and all 3-D products are out of scope.
 """
 
 from __future__ import annotations
@@ -56,1950 +14,2286 @@ import io
 import json
 import logging
 import os
-import sys
 import tempfile
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import requests
 from PIL import Image, UnidentifiedImageError
-from requests.adapters import HTTPAdapter
-from scipy import ndimage
 from scipy.io import loadmat, savemat
-from urllib3.util.retry import Retry
+
+try:
+    from .download_allen_legacy import (
+        _atomic_save_pil,
+        build_session,
+        generate_ihc_mask,
+        generate_nissl_mask,
+    )
+except ImportError:  # Direct execution places this directory on sys.path.
+    from download_allen_legacy import (
+        _atomic_save_pil,
+        build_session,
+        generate_ihc_mask,
+        generate_nissl_mask,
+    )
 
 API_BASE = "https://api.brain-map.org/api/v2"
-DEFAULT_ATLAS_ID = 265297126  # Human, 34 years, Cortex - Modified Brodmann.
-DEFAULT_ATLAS_IMAGE_TYPE = "Atlas - Developing Human Brodmann"
-DEFAULT_SPECIMEN_ID = 708424
-DEFAULT_GROUPS = (31, 113753816, 141667008, 265297118)  # Brodmann groups.
-DEFAULT_DOWNSAMPLE = 5
-DEFAULT_IMAGE_DOWNLOAD_MODE = "allen-direct"
-METADATA_SCHEMA_VERSION = "1.1.0"
-BIDS_MICROSCOPY_VERSION = "1.11.1"
-DING_PAPER_DOI = "10.1002/cne.24080"
-DING_SCAN_RESOLUTION_UM_PER_PIXEL = 1.0
-DING_SECTION_THICKNESS_UM = 50.0
-NISSL_NOMINAL_SPACING_UM = 200.0
-PV_NOMINAL_SPACING_UM = 400.0
-NISSL_TREATMENT_ID = 3
-IHC_TREATMENT_ID = 16
+SPECIMEN_ID = 708424
+DONOR_ID = 12767
+ATLAS_ID = 265297126
+ATLAS_IMAGE_TYPE = "Atlas - Developing Human Brodmann"
+GRAPH_ID = 16
+GROUPS = (31, 113753816, 141667008, 265297118)
+GROUP_LABELS = {
+    31: "Atlas - Developing Human",
+    113753816: "Atlas - Developing Human Sulci",
+    141667008: "Atlas - Developing Human Hotspots",
+    265297118: "Atlas - Developing Human Brodmann",
+}
+SERIES_LABELS = {"nissl": "Nissl", "pv": "PV", "smi32": "SMI-32"}
+SERIES_ROOTS = {"nissl": "nissl", "pv": "ihc", "smi32": "smi32"}
+TREATMENT_SERIES = {
+    "nissl": "nissl",
+    "ihc:parvalbumin": "pv",
+    "ihc:smi-32": "smi32",
+}
+BASELINE_SERIES = {
+    "nissl": {
+        "treatment_id": 3,
+        "treatment_name": "NISSL",
+        "data_set_ids": [100149965],
+        "image_count": 641,
+    },
+    "pv": {
+        "treatment_id": 16,
+        "treatment_name": "IHC:Parvalbumin",
+        "data_set_ids": [100147602],
+        "image_count": 287,
+    },
+    "smi32": {
+        "treatment_id": 5,
+        "treatment_name": "IHC:SMI-32",
+        "data_set_ids": [],
+        "image_count": 0,
+    },
+}
+PUBLISHED = {"nissl": 679, "pv": 339, "smi32": 338}
+DISCOVERY_DATE = "2026-07-28"
+EXPECTED_SVGS = 106
+VERSION = "2.0.0"
+VERIFIED = {
+    "downloaded",
+    "verified-existing",
+    "manifest-verified-existing",
+    "redownloaded-after-quarantine",
+}
+MANIFEST_FIELDS = (
+    "kind",
+    "series_or_layer",
+    "section_number",
+    "allen_section_image_id",
+    "allen_atlas_image_id",
+    "path",
+    "width_px",
+    "height_px",
+    "pixel_size_um",
+    "sha256",
+    "source_url",
+    "status",
+    "source_provider",
+    "allen_data_set_id",
+    "treatment_id",
+    "graphic_groups_present",
+    "matching_nissl_section_image_id",
+    "mapping_status",
+)
+STRUCTURE_FIELDS = (
+    "structure_id",
+    "acronym",
+    "name",
+    "parent_structure_id",
+    "color_hex",
+    "structure_graph_id",
+    "structure_id_path",
+)
+LOG = logging.getLogger("download_allen")
 
-LOGGER = logging.getLogger("download_allen")
+
+class APIInventoryChanged(RuntimeError):
+    pass
 
 
-@dataclass(frozen=True, slots=True)
-class SectionRecord:
-    """Metadata required for one downloaded section."""
-
-    stain: str
+@dataclass(frozen=True)
+class Section:
+    series: str
     section_id: int
     section_number: int
+    treatment_id: int
+    treatment_name: str
+    data_set_id: int
+    specimen_id: int
+    donor_id: int | None
     annotated: bool = False
-    resolution_um_per_pixel: float | None = None
-    width_px: int | None = None
-    height_px: int | None = None
+    resolution: float | None = None
+    width: int | None = None
+    height: int | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class AtlasAnnotationRecord:
-    """One atlas plate whose anatomical drawings are downloadable as SVG."""
-
+@dataclass(frozen=True)
+class AtlasPlate:
     atlas_image_id: int
     section_number: int
+    width: int | None = None
+    height: int | None = None
+    resolution: float | None = None
+    nissl_id: int | None = None
+    mapping_status: str = "unresolved"
 
 
-@dataclass(frozen=True, slots=True)
-class ImageFileRecord:
-    """Observed provenance for one local section JPEG."""
-
-    stain: str
-    allen_section_image_id: int
-    section_number: int
-    relative_output_path: str
-    requested_mode: str
-    status: str
-    verified_mode: str | None
-    source_url: str
+@dataclass(frozen=True)
+class Artifact:
+    kind: str
+    series_or_layer: str
+    section_number: int | None
+    allen_section_image_id: int | None
+    allen_atlas_image_id: int | None
+    path: str
+    width_px: int | None
+    height_px: int | None
+    pixel_size_um: float | None
     sha256: str
-    size_bytes: int
-    width_px: int
-    height_px: int
-    recorded_at_utc: str
+    source_url: str | None
+    status: str
+    source_provider: str
+    allen_data_set_id: int | None = None
+    treatment_id: int | None = None
+    graphic_groups_present: str | None = None
+    matching_nissl_section_image_id: int | None = None
+    mapping_status: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class OutputPaths:
-    """Filesystem layout matching the original 3dhirest downloader."""
+@dataclass(frozen=True)
+class Structure:
+    structure_id: int
+    acronym: str
+    name: str
+    parent_structure_id: int | None
+    color_hex: str | None
+    structure_graph_id: int
+    structure_id_path: str | None
 
-    data_dir: Path
-    nissl_images: Path
-    nissl_labels: Path
-    nissl_masks: Path
-    ihc_images: Path
-    ihc_masks: Path
-    metadata_json: Path
-    metadata_mat: Path
-    metadata_dir: Path
-    dataset_metadata_json: Path
-    sections_tsv: Path
-    atlas_annotations_tsv: Path
-    image_files_tsv: Path
+
+@dataclass(frozen=True)
+class Paths:
+    root: Path
+    metadata: Path
+    dataset: Path
+    manifest: Path
+    structures: Path
+    secjson: Path
+    secmat: Path
+    ontology: Path
 
     @classmethod
-    def from_data_dir(cls, data_dir: Path) -> "OutputPaths":
-        data_dir = data_dir.expanduser().resolve()
+    def make(cls, value: Path) -> "Paths":
+        root = value.expanduser().resolve()
         return cls(
-            data_dir=data_dir,
-            nissl_images=data_dir / "nissl" / "images_orig",
-            nissl_labels=data_dir / "nissl" / "labels_orig",
-            nissl_masks=data_dir / "nissl" / "masks_orig",
-            ihc_images=data_dir / "ihc" / "images_orig",
-            ihc_masks=data_dir / "ihc" / "masks_orig",
-            metadata_json=data_dir / "secInfo.json",
-            metadata_mat=data_dir / "secInfo.mat",
-            metadata_dir=data_dir / "metadata",
-            dataset_metadata_json=data_dir / "metadata" / "dataset.json",
-            sections_tsv=data_dir / "metadata" / "sections.tsv",
-            atlas_annotations_tsv=data_dir / "metadata" / "atlas_annotations.tsv",
-            image_files_tsv=data_dir / "metadata" / "image_files.tsv",
+            root,
+            root / "metadata",
+            root / "metadata/dataset.json",
+            root / "metadata/manifest.tsv",
+            root / "metadata/structures.tsv",
+            root / "secInfo.json",
+            root / "secInfo.mat",
+            root / "ontology/structure_graph_16.json",
         )
 
-    def create(self) -> None:
-        for directory in (
-            self.data_dir,
-            self.nissl_images,
-            self.nissl_labels,
-            self.nissl_masks,
-            self.ihc_images,
-            self.ihc_masks,
-            self.metadata_dir,
+    def image_dir(self, series: str) -> Path:
+        return self.root / SERIES_ROOTS[series] / "images_orig"
+
+    @property
+    def svg_dir(self) -> Path:
+        return self.root / "nissl/labels_orig"
+
+    def create(self, available: Iterable[str]) -> None:
+        for path in (
+            self.root,
+            self.metadata,
+            self.svg_dir,
+            self.ontology.parent,
+            self.root / "nissl/masks_orig",
+            self.root / "ihc/masks_orig",
         ):
-            directory.mkdir(parents=True, exist_ok=True)
+            path.mkdir(parents=True, exist_ok=True)
+        for series in available:
+            self.image_dir(series).mkdir(parents=True, exist_ok=True)
 
 
-def build_session(retries: int = 5, backoff_factor: float = 1.0) -> requests.Session:
-    """Create an HTTP session with bounded retries for transient failures."""
-
-    retry = Retry(
-        total=retries,
-        connect=retries,
-        read=retries,
-        status=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        respect_retry_after_header=True,
-        raise_on_status=False,
+def now() -> str:
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
-    adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(
-        {
-            "User-Agent": (
-                "download_allen.py/1.0 "
-                "(Python translation of acasamitjana/3dhirest download_allen.m)"
-            )
-        }
-    )
-    return session
 
 
-def _as_list(value: Any) -> list[Any]:
+def opt_int(value: Any) -> int | None:
+    try:
+        return None if value in (None, "", "n/a") else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def opt_float(value: Any) -> float | None:
+    try:
+        return None if value in (None, "", "n/a") else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def values(value: Any) -> list[Any]:
     if value is None:
         return []
     return value if isinstance(value, list) else [value]
 
 
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, np.integer)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
-    return False
+def sha_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def _optional_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if np.isfinite(result) else None
+def sha_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def _optional_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _section_record_from_json(item: Mapping[str, Any]) -> SectionRecord:
-    """Load current or older JSON records while ignoring derived fields."""
-
-    allowed = {field.name for field in fields(SectionRecord)}
-    return SectionRecord(**{key: value for key, value in item.items() if key in allowed})
-
-
-def query_section_metadata(
-    session: requests.Session,
-    specimen_id: int = DEFAULT_SPECIMEN_ID,
-    timeout: tuple[float, float] = (20.0, 180.0),
-) -> tuple[list[SectionRecord], list[SectionRecord]]:
-    """Query Allen RMA metadata and return sorted Nissl and IHC records."""
-
-    criteria = (
-        "model::SectionDataSet,"
-        f"rma::criteria,specimen[id$eq{specimen_id}],"
-        "rma::include,section_images(associates,alternate_images,treatments)"
-    )
-    url = f"{API_BASE}/data/query.json"
-    LOGGER.info("Querying section metadata for specimen %d", specimen_id)
-    response = session.get(
-        url,
-        params={"criteria": criteria, "num_rows": "all", "start_row": 0},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Allen metadata endpoint did not return valid JSON") from exc
-
-    if payload.get("success") is False:
-        raise RuntimeError(f"Allen API query failed: {payload.get('msg')!r}")
-
-    datasets = _as_list(payload.get("msg"))
-    if not datasets:
-        raise RuntimeError(f"No SectionDataSet found for specimen {specimen_id}")
-
-    records: dict[tuple[str, int], SectionRecord] = {}
-    for dataset in datasets:
-        if not isinstance(dataset, Mapping):
-            continue
-        for image in _as_list(dataset.get("section_images")):
-            if not isinstance(image, Mapping):
-                continue
-            section_id = image.get("id")
-            section_number = image.get("section_number")
-            if section_id is None or section_number is None:
-                LOGGER.warning("Skipping section image with incomplete metadata: %r", image)
-                continue
-
-            treatment_ids = {
-                int(treatment["id"])
-                for treatment in _as_list(image.get("treatments"))
-                if isinstance(treatment, Mapping) and treatment.get("id") is not None
-            }
-            annotated = _as_bool(image.get("annotated"))
-
-            if NISSL_TREATMENT_ID in treatment_ids:
-                record = SectionRecord(
-                    stain="nissl",
-                    section_id=int(section_id),
-                    section_number=int(section_number),
-                    annotated=annotated,
-                    resolution_um_per_pixel=_optional_float(image.get("resolution")),
-                    width_px=_optional_int(image.get("width")),
-                    height_px=_optional_int(image.get("height")),
-                )
-                records[(record.stain, record.section_id)] = record
-
-            if IHC_TREATMENT_ID in treatment_ids:
-                record = SectionRecord(
-                    stain="ihc",
-                    section_id=int(section_id),
-                    section_number=int(section_number),
-                    annotated=False,
-                    resolution_um_per_pixel=_optional_float(image.get("resolution")),
-                    width_px=_optional_int(image.get("width")),
-                    height_px=_optional_int(image.get("height")),
-                )
-                records[(record.stain, record.section_id)] = record
-
-    nissl = sorted(
-        (record for record in records.values() if record.stain == "nissl"),
-        key=lambda record: (record.section_number, record.section_id),
-    )
-    ihc = sorted(
-        (record for record in records.values() if record.stain == "ihc"),
-        key=lambda record: (record.section_number, record.section_id),
-    )
-
-    if not nissl and not ihc:
-        raise RuntimeError(
-            "The API response contained no sections with treatment IDs 3 (Nissl) "
-            "or 16 (IHC). Inspect the returned metadata or verify the specimen ID."
-        )
-
-    LOGGER.info("Found %d Nissl and %d IHC sections", len(nissl), len(ihc))
-    resolutions = sorted(
-        {
-            record.resolution_um_per_pixel
-            for record in [*nissl, *ihc]
-            if record.resolution_um_per_pixel is not None
-        }
-    )
-    if resolutions:
-        LOGGER.info(
-            "Allen SectionImage source resolution(s): %s µm/pixel",
-            ", ".join(f"{value:g}" for value in resolutions),
-        )
-    else:
-        LOGGER.warning(
-            "Allen SectionImage records did not include a usable resolution field; "
-            "paper-level 1 µm/pixel remains nominal only"
-        )
-    return nissl, ihc
-
-
-def query_atlas_annotation_metadata(
-    session: requests.Session,
-    atlas_id: int = DEFAULT_ATLAS_ID,
-    atlas_image_type: str = DEFAULT_ATLAS_IMAGE_TYPE,
-    timeout: tuple[float, float] = (20.0, 180.0),
-) -> list[AtlasAnnotationRecord]:
-    """Return the ordered AtlasImage records belonging to one 2-D atlas.
-
-    Allen's SVG service accepts a SectionImage ID, and anatomical atlas drawings
-    are attached specifically to ``AtlasImage`` records. Querying by ``atlas_id``
-    avoids relying on the separate specimen metadata's ``annotated`` flag and
-    makes the selected annotation scheme explicit.
-    """
-
-    if "'" in atlas_image_type:
-        raise ValueError("atlas_image_type may not contain a single quote")
-
-    criteria = (
-        "model::AtlasImage,"
-        "rma::criteria,"
-        "[annotated$eqtrue],"
-        f"atlas_data_set(atlases[id$eq{atlas_id}]),"
-        f"alternate_images[image_type$eq'{atlas_image_type}'],"
-        "rma::options[order$eq'sub_images.section_number'][num_rows$eqall]"
-    )
-    url = f"{API_BASE}/data/query.json"
-    LOGGER.info("Querying AtlasImage metadata for atlas %d", atlas_id)
-    response = session.get(
-        url,
-        params={"criteria": criteria, "num_rows": "all", "start_row": 0},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Allen atlas metadata endpoint did not return valid JSON") from exc
-
-    if payload.get("success") is False:
-        raise RuntimeError(f"Allen atlas API query failed: {payload.get('msg')!r}")
-
-    images = _as_list(payload.get("msg"))
-    if not images:
-        raise RuntimeError(f"No AtlasImage records found for atlas {atlas_id}")
-
-    records: dict[int, AtlasAnnotationRecord] = {}
-    section_to_image: dict[int, int] = {}
-    for image in images:
-        if not isinstance(image, Mapping):
-            continue
-        atlas_image_id = image.get("id")
-        section_number = image.get("section_number")
-        if atlas_image_id is None or section_number is None:
-            LOGGER.warning("Skipping AtlasImage with incomplete metadata: %r", image)
-            continue
-
-        record = AtlasAnnotationRecord(
-            atlas_image_id=int(atlas_image_id),
-            section_number=int(section_number),
-        )
-        prior_image_id = section_to_image.get(record.section_number)
-        if prior_image_id is not None and prior_image_id != record.atlas_image_id:
-            raise RuntimeError(
-                "Atlas contains multiple AtlasImage IDs for section number "
-                f"{record.section_number}: {prior_image_id}, {record.atlas_image_id}. "
-                "The current filename convention would be ambiguous."
-            )
-        records[record.atlas_image_id] = record
-        section_to_image[record.section_number] = record.atlas_image_id
-
-    annotations = sorted(
-        records.values(),
-        key=lambda record: (record.section_number, record.atlas_image_id),
-    )
-    if not annotations:
-        raise RuntimeError(
-            f"Atlas {atlas_id} returned no usable AtlasImage IDs and section numbers"
-        )
-
-    LOGGER.info(
-        "Found %d atlas plates with SVG annotation records for atlas %d",
-        len(annotations),
-        atlas_id,
-    )
-    return annotations
-
-
-def _atomic_save_mat(path: Path, payload: Mapping[str, Any]) -> None:
+def atomic_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.stem}.", suffix=".mat", dir=path.parent
-    )
-    os.close(fd)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        savemat(temporary_name, payload, do_compression=True, appendmat=False)
-        os.replace(temporary_name, path)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
     except BaseException:
         try:
-            os.unlink(temporary_name)
+            os.unlink(temporary)
         except FileNotFoundError:
             pass
         raise
 
 
-
-def _tsv_value(value: Any) -> Any:
-    """Return a stable TSV representation; ``n/a`` follows BIDS convention."""
-
-    return "n/a" if value is None else value
+def atomic_text(path: Path, text: str) -> None:
+    atomic_bytes(path, text.encode())
 
 
-def _atomic_write_tsv(
-    path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, Any]]
+def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+    atomic_text(path, json.dumps(payload, indent=2) + "\n")
+
+
+def atomic_tsv(
+    path: Path, fields: Sequence[str], rows: Iterable[Mapping[str, Any]]
 ) -> None:
-    """Atomically write a tab-separated metadata table."""
-
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(
         buffer,
-        fieldnames=list(fieldnames),
+        fieldnames=fields,
         delimiter="\t",
         lineterminator="\n",
         extrasaction="raise",
     )
     writer.writeheader()
     for row in rows:
-        writer.writerow({key: _tsv_value(row.get(key)) for key in fieldnames})
-    _atomic_write_text(path, buffer.getvalue())
+        writer.writerow(
+            {key: "n/a" if row.get(key) is None else row.get(key) for key in fields}
+        )
+    atomic_text(path, buffer.getvalue())
 
 
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def api_json(session: requests.Session, criteria: str) -> Mapping[str, Any]:
+    response = session.get(
+        f"{API_BASE}/data/query.json",
+        params={"criteria": criteria, "num_rows": "all", "start_row": 0},
+        timeout=(20, 180),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, Mapping) or payload.get("success") is False:
+        raise RuntimeError(f"Allen API query failed: {payload!r}")
+    return payload
 
 
-def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
+def classify_treatment(name: str) -> str | None:
+    return TREATMENT_SERIES.get(name.strip().lower())
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+def inventory_payload(
+    specimen_id: int,
+    donor_id: int | None,
+    series: Mapping[str, Mapping[str, Any]],
+    observed: str,
+) -> dict[str, Any]:
+    core = {
+        "specimen_id": specimen_id,
+        "donor_id": donor_id,
+        "series": {
+            key: {
+                "treatment_id": int(series[key]["treatment_id"]),
+                "treatment_name": str(series[key]["treatment_name"]),
+                "data_set_ids": sorted(map(int, series[key].get("data_set_ids", []))),
+                "image_count": int(series[key]["image_count"]),
+            }
+            for key in SERIES_LABELS
+        },
+    }
+    digest = sha_bytes(json.dumps(core, sort_keys=True, separators=(",", ":")).encode())
+    return {**core, "observed_at_utc": observed, "inventory_sha256": digest}
 
 
-def _read_image_dimensions(path: Path) -> tuple[int, int]:
+def baseline_inventory() -> dict[str, Any]:
+    return inventory_payload(
+        SPECIMEN_ID, DONOR_ID, BASELINE_SERIES, "2026-07-28T14:22:45Z"
+    )
+
+
+def inventory_core(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"observed_at_utc", "inventory_sha256"}
+    }
+
+
+class AllenSectionDataSetProvider:
+    name = "AllenSectionDataSetProvider"
+
+    def __init__(self, session: requests.Session):
+        self.session = session
+
+    def discover(
+        self, specimen_id: int
+    ) -> tuple[dict[str, list[Section]], dict[str, Any]]:
+        treatment_data = api_json(
+            self.session, "model::Treatment,rma::options[num_rows$eqall]"
+        )
+        vocabulary = {}
+        for item in values(treatment_data.get("msg")):
+            if isinstance(item, Mapping) and (
+                series := classify_treatment(str(item.get("name", "")))
+            ):
+                vocabulary[series] = {
+                    "treatment_id": int(item["id"]),
+                    "treatment_name": str(item["name"]),
+                }
+        criteria = (
+            "model::SectionDataSet,"
+            f"rma::criteria,specimen[id$eq{specimen_id}],"
+            "rma::include,treatments,specimen(donor),section_images(treatments),"
+            "rma::options[num_rows$eqall]"
+        )
+        payload = api_json(self.session, criteria)
+        records = {key: [] for key in SERIES_LABELS}
+        datasets = defaultdict(set)
+        metadata = {}
+        donor_id = None
+        for dataset in values(payload.get("msg")):
+            if not isinstance(dataset, Mapping):
+                continue
+            did = int(dataset["id"])
+            specimen = dataset.get("specimen", {})
+            if isinstance(specimen, Mapping):
+                donor_id = opt_int(specimen.get("donor_id")) or donor_id
+                if isinstance(specimen.get("donor"), Mapping):
+                    donor_id = opt_int(specimen["donor"].get("id")) or donor_id
+            recognized = [
+                (classify_treatment(str(t.get("name", ""))), t)
+                for t in values(dataset.get("treatments"))
+                if isinstance(t, Mapping)
+            ]
+            recognized = [(s, t) for s, t in recognized if s]
+            if len(recognized) != 1:
+                raise RuntimeError(f"Dataset {did} has ambiguous treatment metadata")
+            series, treatment = recognized[0]
+            tid = int(treatment["id"])
+            tname = str(treatment["name"])
+            datasets[series].add(did)
+            metadata[series] = {"treatment_id": tid, "treatment_name": tname}
+            for image in values(dataset.get("section_images")):
+                if not isinstance(image, Mapping):
+                    continue
+                iid, number = opt_int(image.get("id")), opt_int(
+                    image.get("section_number")
+                )
+                if iid is None or number is None:
+                    raise RuntimeError(f"Incomplete image in dataset {did}")
+                records[series].append(
+                    Section(
+                        series,
+                        iid,
+                        number,
+                        tid,
+                        tname,
+                        did,
+                        specimen_id,
+                        donor_id,
+                        bool(image.get("annotated", False)),
+                        opt_float(image.get("resolution")),
+                        opt_int(image.get("width")),
+                        opt_int(image.get("height")),
+                    )
+                )
+        snapshot_series = {}
+        for series in SERIES_LABELS:
+            meta = metadata.get(series) or vocabulary.get(series)
+            if meta is None:
+                raise RuntimeError(f"Missing Allen treatment vocabulary for {series}")
+            records[series].sort(
+                key=lambda item: (item.section_number, item.section_id)
+            )
+            if len({item.section_id for item in records[series]}) != len(
+                records[series]
+            ):
+                raise RuntimeError(f"Duplicate {series} SectionImage IDs")
+            snapshot_series[series] = {
+                **meta,
+                "data_set_ids": sorted(datasets[series]),
+                "image_count": len(records[series]),
+            }
+        return records, inventory_payload(specimen_id, donor_id, snapshot_series, now())
+
+
+class AllenAtlasPlateProvider:
+    name = "AllenAtlasPlateProvider"
+
+    def __init__(self, session: requests.Session):
+        self.session = session
+
+    def discover(self) -> tuple[dict[str, Any], list[AtlasPlate]]:
+        criteria = (
+            f"model::Atlas,rma::criteria,[id$eq{ATLAS_ID}],"
+            "rma::include,structure_graph,treatment,specimen,graphic_group_labels,atlas_data_sets,"
+            "rma::options[num_rows$eqall]"
+        )
+        rows = values(api_json(self.session, criteria).get("msg"))
+        if len(rows) != 1:
+            raise RuntimeError("Expected exactly one selected Atlas")
+        atlas = rows[0]
+        graph = atlas.get("structure_graph", {})
+        if int(graph.get("id", -1)) != GRAPH_ID:
+            raise RuntimeError("Selected atlas is not associated with graph 16")
+        specimen = atlas.get("specimen", {})
+        treatment = atlas.get("treatment", {})
+        if (
+            opt_int(specimen.get("id")) != SPECIMEN_ID
+            or opt_int(specimen.get("donor_id")) != DONOR_ID
+        ):
+            raise RuntimeError("Selected atlas specimen/donor identity changed")
+        if opt_int(treatment.get("id")) != 3 or treatment.get("name") != "NISSL":
+            raise RuntimeError("Selected atlas treatment identity changed")
+        labels = {
+            int(item["id"]): str(item["name"])
+            for item in values(atlas.get("graphic_group_labels"))
+        }
+        if any(labels.get(gid) != GROUP_LABELS[gid] for gid in GROUPS):
+            raise RuntimeError(f"Atlas graphic-group metadata changed: {labels}")
+        info = {
+            "atlas_id": ATLAS_ID,
+            "name": atlas.get("name"),
+            "structure_graph_id": GRAPH_ID,
+            "structure_graph_name": graph.get("name"),
+            "graphic_groups": [{"id": gid, "name": labels[gid]} for gid in GROUPS],
+        }
+        criteria = (
+            "model::AtlasImage,rma::criteria,[annotated$eqtrue],"
+            f"atlas_data_set(atlases[id$eq{ATLAS_ID}]),"
+            f"alternate_images[image_type$eq'{ATLAS_IMAGE_TYPE}'],"
+            "rma::options[order$eq'section_number'][num_rows$eqall]"
+        )
+        plates = [
+            AtlasPlate(
+                int(item["id"]),
+                int(item["section_number"]),
+                opt_int(item.get("width")),
+                opt_int(item.get("height")),
+                opt_float(item.get("resolution")),
+            )
+            for item in values(api_json(self.session, criteria).get("msg"))
+        ]
+        plates.sort(key=lambda item: item.section_number)
+        if len(plates) != EXPECTED_SVGS:
+            raise RuntimeError(f"Atlas returned {len(plates)} plates, expected 106")
+        return info, plates
+
+
+class AllenStructureGraphProvider:
+    name = "AllenStructureGraphProvider"
+    url = f"{API_BASE}/structure_graph_download/{GRAPH_ID}.json"
+
+    def __init__(self, session: requests.Session):
+        self.session = session
+
+    def fetch(self) -> bytes:
+        response = self.session.get(self.url, timeout=(20, 180))
+        response.raise_for_status()
+        parse_ontology(response.content)
+        return response.content
+
+
+def load_stored_inventory(paths: Paths) -> dict[str, Any]:
+    if paths.dataset.is_file():
+        try:
+            stored = json.loads(paths.dataset.read_text()).get("accepted_api_inventory")
+            if isinstance(stored, Mapping):
+                return dict(stored)
+        except (OSError, ValueError):
+            pass
+    return baseline_inventory()
+
+
+def gate_inventory(
+    stored: Mapping[str, Any],
+    observed: Mapping[str, Any],
+    report_path: Path | None,
+    accepted_digest: str | None,
+) -> None:
+    if inventory_core(stored) == inventory_core(observed):
+        return
+    if accepted_digest:
+        if accepted_digest != observed["inventory_sha256"]:
+            raise RuntimeError(
+                f"Accepted inventory digest does not match live digest {observed['inventory_sha256']}"
+            )
+        return
+    print("Stored inventory:\n" + json.dumps(stored, indent=2))
+    print("Observed inventory:\n" + json.dumps(observed, indent=2))
+    if report_path:
+        atomic_json(report_path.expanduser().resolve(), observed)
+    print("Status: API_INVENTORY_CHANGED")
+    print(
+        "Corrective action: review and rerun with --accept-api-inventory-sha256 "
+        + observed["inventory_sha256"]
+    )
+    raise APIInventoryChanged("API_INVENTORY_CHANGED")
+
+
+def resolve_mappings(
+    plates: Sequence[AtlasPlate],
+    nissl: Sequence[Section],
+    cached: Mapping[int, int] | None = None,
+    filenames: set[int] | None = None,
+) -> list[AtlasPlate]:
+    cached, filenames = cached or {}, filenames or set()
+    by_id = {item.section_id: item for item in nissl}
+    by_number = defaultdict(list)
+    for item in nissl:
+        by_number[item.section_number].append(item)
+    result = []
+    for plate in plates:
+        direct, prior = by_id.get(plate.atlas_image_id), cached.get(
+            plate.atlas_image_id
+        )
+        if prior is not None and prior not in by_id:
+            raise RuntimeError(f"Unknown cached Nissl ID {prior}")
+        if direct and prior is not None and direct.section_id != prior:
+            raise RuntimeError("Conflicting non-null plate mappings")
+        if direct:
+            if direct.section_number != plate.section_number:
+                raise RuntimeError("Atlas/Nissl section-number conflict")
+            nid, status = direct.section_id, "exact_id"
+        elif prior is not None:
+            if by_id[prior].section_number != plate.section_number:
+                raise RuntimeError("Cached mapping section conflict")
+            nid, status = prior, "repaired_unique_section"
+        elif len(by_number[plate.section_number]) == 1:
+            nid, status = (
+                by_number[plate.section_number][0].section_id,
+                "repaired_unique_section",
+            )
+        elif len(by_number[plate.section_number]) > 1:
+            raise RuntimeError(
+                f"Multiple Nissl candidates for plate {plate.atlas_image_id}"
+            )
+        elif plate.section_number in filenames:
+            nid, status = None, "filename_only"
+        else:
+            nid, status = None, "unresolved"
+        result.append(
+            AtlasPlate(
+                plate.atlas_image_id,
+                plate.section_number,
+                plate.width,
+                plate.height,
+                plate.resolution,
+                nid,
+                status,
+            )
+        )
+    return result
+
+
+def parse_ontology(content: bytes) -> Mapping[str, Any]:
+    try:
+        payload = json.loads(content)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Invalid ontology JSON") from exc
+    roots = values(payload.get("msg")) if isinstance(payload, Mapping) else []
+    if payload.get("success") is False or len(roots) != 1:
+        raise RuntimeError("Expected one successful ontology root")
+    return payload
+
+
+def flatten_ontology(payload: Mapping[str, Any]) -> list[Structure]:
+    result, seen = [], set()
+
+    def visit(node: Mapping[str, Any], parent: int | None) -> None:
+        sid = int(node["id"])
+        if sid in seen:
+            raise RuntimeError(f"Duplicate structure {sid}")
+        seen.add(sid)
+        pid = opt_int(node.get("parent_structure_id")) or parent
+        color = node.get("color_hex_triplet")
+        result.append(
+            Structure(
+                sid,
+                str(node.get("acronym", "")),
+                str(node.get("name", "")),
+                pid,
+                None if not color else "#" + str(color).lstrip("#").upper(),
+                GRAPH_ID,
+                (
+                    None
+                    if not node.get("structure_id_path")
+                    else str(node["structure_id_path"])
+                ),
+            )
+        )
+        for child in values(node.get("children")):
+            if not isinstance(child, Mapping):
+                raise RuntimeError("Non-object ontology child")
+            visit(child, sid)
+
+    visit(values(payload["msg"])[0], None)
+    return result
+
+
+def inspect_svg(
+    content: bytes,
+) -> tuple[list[int], dict[int, int], dict[int, set[int]]]:
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        raise RuntimeError("Unparseable SVG") from exc
+    if root.tag.rsplit("}", 1)[-1] != "svg":
+        raise RuntimeError("Missing SVG root")
+    present, counts, ids = [], Counter(), defaultdict(set)
+    for group in root.iter():
+        gid = opt_int(group.attrib.get("graphic_group_label_id"))
+        if gid is None:
+            continue
+        if (
+            gid not in GROUPS
+            or group.attrib.get("graphic_group_label") != GROUP_LABELS[gid]
+        ):
+            raise RuntimeError(f"Unexpected SVG graphic group {gid}")
+        if gid not in present:
+            present.append(gid)
+        for element in group.iter():
+            sid = opt_int(element.attrib.get("structure_id"))
+            if sid is not None:
+                counts[gid] += 1
+                ids[gid].add(sid)
+    present.sort(key=GROUPS.index)
+    return present, dict(counts), ids
+
+
+def load_manifest(path: Path) -> dict[str, Artifact]:
+    if not path.is_file():
+        return {}
+    result = {}
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != MANIFEST_FIELDS:
+            raise RuntimeError("Noncanonical manifest columns")
+        for row in reader:
+            artifact = Artifact(
+                row["kind"],
+                row["series_or_layer"],
+                opt_int(row["section_number"]),
+                opt_int(row["allen_section_image_id"]),
+                opt_int(row["allen_atlas_image_id"]),
+                row["path"],
+                opt_int(row["width_px"]),
+                opt_int(row["height_px"]),
+                opt_float(row["pixel_size_um"]),
+                row["sha256"],
+                None if row["source_url"] == "n/a" else row["source_url"],
+                row["status"],
+                row["source_provider"],
+                opt_int(row["allen_data_set_id"]),
+                opt_int(row["treatment_id"]),
+                (
+                    None
+                    if row["graphic_groups_present"] == "n/a"
+                    else row["graphic_groups_present"]
+                ),
+                opt_int(row["matching_nissl_section_image_id"]),
+                None if row["mapping_status"] == "n/a" else row["mapping_status"],
+            )
+            if artifact.path in result:
+                raise RuntimeError(f"Duplicate manifest path {artifact.path}")
+            result[artifact.path] = artifact
+    return result
+
+
+def save_manifest(path: Path, items: Mapping[str, Artifact]) -> None:
+    ordered = sorted(
+        items.values(),
+        key=lambda item: (
+            item.kind,
+            item.series_or_layer,
+            item.section_number or -1,
+            item.path,
+        ),
+    )
+    atomic_tsv(path, MANIFEST_FIELDS, (asdict(item) for item in ordered))
+
+
+def image_dimensions(path: Path) -> tuple[int, int]:
     try:
         with Image.open(path) as image:
             image.load()
             return image.size
-    except UnidentifiedImageError as exc:
-        raise RuntimeError(f"Local image is unreadable: {path}") from exc
+    except (OSError, UnidentifiedImageError) as exc:
+        raise RuntimeError(f"Unreadable image {path}") from exc
 
 
-def load_image_file_manifest(paths: OutputPaths) -> dict[str, ImageFileRecord]:
-    """Load observed per-file provenance, keyed by relative output path."""
-
-    if not paths.image_files_tsv.exists():
-        return {}
-
-    records: dict[str, ImageFileRecord] = {}
-    with paths.image_files_tsv.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            relative_path = row.get("relative_output_path")
-            if not relative_path:
-                continue
-            verified_mode = row.get("verified_mode")
-            if verified_mode in {None, "", "n/a"}:
-                verified_mode = None
-            record = ImageFileRecord(
-                stain=str(row["stain"]),
-                allen_section_image_id=int(row["allen_section_image_id"]),
-                section_number=int(row["section_number"]),
-                relative_output_path=relative_path,
-                requested_mode=str(row["requested_mode"]),
-                status=str(row["status"]),
-                verified_mode=verified_mode,
-                source_url=str(row["source_url"]),
-                sha256=str(row["sha256"]),
-                size_bytes=int(row["size_bytes"]),
-                width_px=int(row["width_px"]),
-                height_px=int(row["height_px"]),
-                recorded_at_utc=str(row["recorded_at_utc"]),
-            )
-            records[relative_path] = record
-    LOGGER.info("Loaded %d image provenance records from %s", len(records), paths.image_files_tsv)
-    return records
+def image_path(paths: Paths, section: Section) -> Path:
+    return paths.image_dir(section.series) / f"image_{section.section_number:04d}.jpg"
 
 
-def save_image_file_manifest(
-    paths: OutputPaths, records: Mapping[str, ImageFileRecord]
-) -> None:
-    """Atomically save observed per-file provenance."""
-
-    rows = [asdict(record) for record in sorted(
-        records.values(), key=lambda item: (item.stain, item.section_number)
-    )]
-    _atomic_write_tsv(
-        paths.image_files_tsv,
-        (
-            "stain",
-            "allen_section_image_id",
-            "section_number",
-            "relative_output_path",
-            "requested_mode",
-            "status",
-            "verified_mode",
-            "source_url",
-            "sha256",
-            "size_bytes",
-            "width_px",
-            "height_px",
-            "recorded_at_utc",
-        ),
-        rows,
+def source_url(section: Section, level: int) -> str:
+    return (
+        f"{API_BASE}/image_download/{section.section_id}?downsample={level}&quality=100"
     )
 
 
-def _image_file_record(
-    *,
-    record: SectionRecord,
-    destination: Path,
-    data_dir: Path,
-    requested_mode: str,
-    status: str,
-    verified_mode: str | None,
-    source_url: str,
-) -> ImageFileRecord:
-    width_px, height_px = _read_image_dimensions(destination)
-    return ImageFileRecord(
-        stain=record.stain,
-        allen_section_image_id=record.section_id,
-        section_number=record.section_number,
-        relative_output_path=destination.relative_to(data_dir).as_posix(),
-        requested_mode=requested_mode,
-        status=status,
-        verified_mode=verified_mode,
-        source_url=source_url,
-        sha256=_sha256_file(destination),
-        size_bytes=destination.stat().st_size,
-        width_px=width_px,
-        height_px=height_px,
-        recorded_at_utc=_utc_now(),
+def artifact_image(
+    paths: Paths, section: Section, path: Path, status: str, level: int
+) -> Artifact:
+    width, height = image_dimensions(path)
+    pixel = (
+        None
+        if section.resolution is None
+        else section.resolution * (2 ** (level if level >= 0 else 0))
+    )
+    return Artifact(
+        "histology_jpeg",
+        section.series,
+        section.section_number,
+        section.section_id,
+        None,
+        path.relative_to(paths.root).as_posix(),
+        width,
+        height,
+        pixel,
+        sha_file(path),
+        source_url(section, level),
+        status,
+        AllenSectionDataSetProvider.name,
+        section.data_set_id,
+        section.treatment_id,
     )
 
 
-def _image_processing_parameters(
-    *, downsample: int, image_download_mode: str
-) -> dict[str, Any]:
-    """Return explicit server/local sampling provenance for one download mode."""
-
-    if image_download_mode == "allen-direct":
-        return {
-            "server_downsample_level": downsample,
-            "server_linear_downsample_factor": 2**downsample,
-            "local_resize_scale": 1.0,
-            "local_interpolation": None,
-            "effective_linear_downsample_factor": 2**downsample,
-            "jpeg_transcoding": False,
-        }
-    if image_download_mode == "matlab-compatible":
-        if downsample < 1:
-            raise ValueError(
-                "matlab-compatible mode requires downsample >= 1"
-            )
-        return {
-            "server_downsample_level": downsample - 1,
-            "server_linear_downsample_factor": 2 ** (downsample - 1),
-            "local_resize_scale": 0.5,
-            "local_interpolation": "Pillow Image.Resampling.BICUBIC",
-            "effective_linear_downsample_factor": 2**downsample,
-            "jpeg_transcoding": True,
-        }
-    raise ValueError(f"Unsupported image download mode: {image_download_mode}")
+def quarantine(path: Path, paths: Paths, run_id: str) -> Path:
+    destination = paths.root / "quarantine" / run_id / path.relative_to(paths.root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(path, destination)
+    return destination
 
 
-def save_standard_metadata(
-    paths: OutputPaths,
-    nissl: Sequence[SectionRecord],
-    ihc: Sequence[SectionRecord],
-    annotations: Sequence[AtlasAnnotationRecord],
-    *,
-    specimen_id: int,
-    atlas_id: int,
-    atlas_image_type: str,
-    groups: Sequence[int],
-    downsample: int,
-    image_download_mode: str,
-    image_files: Mapping[str, ImageFileRecord] | None = None,
-) -> None:
-    """Write concise standards-aligned JSON/TSV metadata.
-
-    The directory deliberately retains the original 3DHiResT filenames and JPEG/SVG
-    products, so it is not claimed to be a fully BIDS-compliant microscopy dataset.
-    BIDS Microscopy field names and units are used where they fit; detailed per-file
-    provenance is kept in TSV tables. OME-TIFF/OME-Zarr is the intended later image
-    container when the sections and rasterized label maps are converted.
-    """
-
-    image_files = {} if image_files is None else image_files
-    processing = _image_processing_parameters(
-        downsample=downsample, image_download_mode=image_download_mode
-    )
-    server_level = int(processing["server_downsample_level"])
-    server_factor = int(processing["server_linear_downsample_factor"])
-    local_resize_scale = float(processing["local_resize_scale"])
-    effective_factor = int(processing["effective_linear_downsample_factor"])
-
-    dataset_payload = {
-        "MetadataSchema": {
-            "Name": "ad-resilience Allen histology metadata",
-            "Version": METADATA_SCHEMA_VERSION,
-            "StandardsAlignment": [
-                {
-                    "Name": "BIDS Microscopy",
-                    "Version": BIDS_MICROSCOPY_VERSION,
-                    "Use": (
-                        "Field vocabulary, explicit units, sample/acquisition concepts, "
-                        "and separation of lower-resolution derivatives"
-                    ),
-                    "Compliance": "aligned, not fully BIDS-formatted",
-                    "Reason": (
-                        "The legacy 3DHiResT-compatible directory names and Allen JPEG/SVG "
-                        "products are intentionally retained."
-                    ),
-                },
-                {
-                    "Name": "REMBI",
-                    "Use": (
-                        "Coverage of study, biosample, specimen, acquisition, image data, "
-                        "correlation, and analysed-data provenance"
-                    ),
-                },
-                {
-                    "Name": "OME",
-                    "Use": (
-                        "Target metadata/container model for later OME-TIFF or OME-Zarr "
-                        "conversion; source JPEG and SVG files are not rewritten here"
-                    ),
-                },
-            ],
-        },
-        "Dataset": {
-            "Name": "Allen Human Brain Atlas histology, specimen 708424",
-            "Description": (
-                "Nissl and parvalbumin histology section images plus selected Ding 2016 "
-                "two-dimensional atlas SVG annotations."
-            ),
-            "SpecimenID": specimen_id,
-            "BodyPart": "BRAIN",
-            "SampleEnvironment": "ex vivo",
-            "Modality": "bright-field microscopy",
-            "CitationDOI": DING_PAPER_DOI,
-            "SourceAPI": API_BASE,
-        },
-        "Specimen": {
-            "SliceThickness": DING_SECTION_THICKNESS_UM,
-            "SliceThicknessUnits": "um",
-            "NominalSeriesSpacing": {
-                "nissl": NISSL_NOMINAL_SPACING_UM,
-                "parvalbumin": PV_NOMINAL_SPACING_UM,
-                "Units": "um",
-                "Note": (
-                    "Nominal retained-series spacing; missing sections and slab gaps make "
-                    "the physical stack irregular."
-                ),
-            },
-            "SampleStaining": ["Nissl", "parvalbumin immunohistochemistry"],
-        },
-        "SourceImages": {
-            "PixelSize": [
-                DING_SCAN_RESOLUTION_UM_PER_PIXEL,
-                DING_SCAN_RESOLUTION_UM_PER_PIXEL,
-            ],
-            "PixelSizeUnits": "um",
-            "PixelSizeStatus": "paper-level nominal value",
-            "AuthoritativePerImageField": "Allen SectionImage.resolution",
-            "Note": (
-                "Per-image values in sections.tsv supersede the paper-level nominal value "
-                "when Allen reports them."
-            ),
-        },
-        "DerivedImages": {
-            "RequestedImageDownloadMode": image_download_mode,
-            "ServerDownsampleLevel": server_level,
-            "ServerLinearDownsampleFactor": server_factor,
-            "LocalResizeScale": [local_resize_scale, local_resize_scale],
-            "LocalInterpolation": processing["local_interpolation"],
-            "JPEGTranscoding": processing["jpeg_transcoding"],
-            "EffectiveLinearDownsampleFactor": effective_factor,
-            "PixelSizeFormula": "source PixelSize multiplied by 2**downsample",
-            "NominalPixelSize": [
-                DING_SCAN_RESOLUTION_UM_PER_PIXEL * effective_factor,
-                DING_SCAN_RESOLUTION_UM_PER_PIXEL * effective_factor,
-            ],
-            "PixelSizeUnits": "um",
-            "Encoding": "JPEG",
-            "ServerJPEGQualityRequest": 100,
-            "OutputJPEGQuality": (
-                None if image_download_mode == "allen-direct" else 100
-            ),
-            "OutputJPEGSubsampling": (
-                None if image_download_mode == "allen-direct" else 0
-            ),
-            "EncodingPreservedFromServerForNewDownloads": (
-                image_download_mode == "allen-direct"
-            ),
-            "PerFileProvenance": (
-                "The requested mode applies to new downloads only. Existing files are "
-                "never assumed to match it; consult metadata/image_files.tsv and the "
-                "local-file columns in metadata/sections.tsv."
-            ),
-            "DerivativeStatus": (
-                "Lower-resolution derivative generated from the Allen image-download "
-                "service; despite the legacy images_orig directory name, it is not the "
-                "native scanner image."
-            ),
-        },
-        "AtlasAnnotations": {
-            "AtlasID": atlas_id,
-            "AtlasImageType": atlas_image_type,
-            "GraphicGroupIDs": list(groups),
-            "Format": "SVG",
-            "CoordinateSystem": (
-                "Allen full-resolution section-image pixel canvas with SVG transforms; "
-                "all nested transforms must be honored during rasterization."
-            ),
-        },
-        "Tables": {
-            "Sections": paths.sections_tsv.relative_to(paths.data_dir).as_posix(),
-            "AtlasAnnotations": paths.atlas_annotations_tsv.relative_to(
-                paths.data_dir
-            ).as_posix(),
-            "ImageFiles": paths.image_files_tsv.relative_to(paths.data_dir).as_posix(),
-            "LegacyJSON": paths.metadata_json.relative_to(paths.data_dir).as_posix(),
-            "LegacyMATLAB": paths.metadata_mat.relative_to(paths.data_dir).as_posix(),
-        },
-        "GeneratedBy": {
-            "Name": "download_allen.py",
-            "Description": (
-                "Python translation of acasamitjana/3dhirest download_allen.m with "
-                "atlas-specific SVG acquisition and explicit resolution provenance."
-            ),
-        },
-    }
-    _atomic_write_text(
-        paths.dataset_metadata_json,
-        json.dumps(dataset_payload, indent=2) + "\n",
-    )
-
-    section_rows: list[dict[str, Any]] = []
-    for record in [*nissl, *ihc]:
-        source_pixel_size = record.resolution_um_per_pixel
-        output_pixel_size = (
-            None if source_pixel_size is None else source_pixel_size * effective_factor
-        )
-        nominal_spacing = (
-            NISSL_NOMINAL_SPACING_UM
-            if record.stain == "nissl"
-            else PV_NOMINAL_SPACING_UM
-        )
-        output_root = "nissl" if record.stain == "nissl" else "ihc"
-        relative_output_path = (
-            f"{output_root}/images_orig/image_{record.section_number:04d}.jpg"
-        )
-        local_path = paths.data_dir / relative_output_path
-        observed = image_files.get(relative_output_path)
-        if local_path.exists() and observed is not None:
-            local_status = observed.status
-        elif local_path.exists():
-            local_status = "existing-unverified"
-        elif observed is not None:
-            local_status = "missing-despite-manifest"
-        else:
-            local_status = "missing"
-
-        section_rows.append(
-            {
-                "stain": record.stain,
-                "allen_section_image_id": record.section_id,
-                "section_number": record.section_number,
-                "annotated_in_section_metadata": int(record.annotated),
-                "source_pixel_size_x_um": source_pixel_size,
-                "source_pixel_size_y_um": source_pixel_size,
-                "source_width_px": record.width_px,
-                "source_height_px": record.height_px,
-                "physical_section_thickness_um": DING_SECTION_THICKNESS_UM,
-                "nominal_series_spacing_um": nominal_spacing,
-                "server_downsample_level": server_level,
-                "server_linear_downsample_factor": server_factor,
-                "requested_image_download_mode": image_download_mode,
-                "local_resize_scale_x": local_resize_scale,
-                "local_resize_scale_y": local_resize_scale,
-                "effective_linear_downsample_factor": effective_factor,
-                "output_pixel_size_x_um": output_pixel_size,
-                "output_pixel_size_y_um": output_pixel_size,
-                "source_url": (
-                    f"{API_BASE}/image_download/{record.section_id}"
-                    f"?downsample={server_level}&quality=100"
-                ),
-                "relative_output_path": relative_output_path,
-                "local_file_status": local_status,
-                "local_file_verified_mode": (
-                    None if observed is None else observed.verified_mode
-                ),
-                "local_file_sha256": None if observed is None else observed.sha256,
-                "local_file_size_bytes": (
-                    None if observed is None else observed.size_bytes
-                ),
-                "local_width_px": None if observed is None else observed.width_px,
-                "local_height_px": None if observed is None else observed.height_px,
-                "provenance_recorded_at_utc": (
-                    None if observed is None else observed.recorded_at_utc
-                ),
-            }
-        )
-
-    _atomic_write_tsv(
-        paths.sections_tsv,
-        (
-            "stain",
-            "allen_section_image_id",
-            "section_number",
-            "annotated_in_section_metadata",
-            "source_pixel_size_x_um",
-            "source_pixel_size_y_um",
-            "source_width_px",
-            "source_height_px",
-            "physical_section_thickness_um",
-            "nominal_series_spacing_um",
-            "server_downsample_level",
-            "server_linear_downsample_factor",
-            "requested_image_download_mode",
-            "local_resize_scale_x",
-            "local_resize_scale_y",
-            "effective_linear_downsample_factor",
-            "output_pixel_size_x_um",
-            "output_pixel_size_y_um",
-            "source_url",
-            "relative_output_path",
-            "local_file_status",
-            "local_file_verified_mode",
-            "local_file_sha256",
-            "local_file_size_bytes",
-            "local_width_px",
-            "local_height_px",
-            "provenance_recorded_at_utc",
-        ),
-        section_rows,
-    )
-
-    nissl_by_section = {record.section_number: record for record in nissl}
-    group_text = ",".join(str(group) for group in groups)
-    annotation_rows: list[dict[str, Any]] = []
-    for record in annotations:
-        matching_nissl = nissl_by_section.get(record.section_number)
-        annotation_rows.append(
-            {
-                "atlas_id": atlas_id,
-                "atlas_image_type": atlas_image_type,
-                "atlas_image_id": record.atlas_image_id,
-                "section_number": record.section_number,
-                "matching_nissl_section_image_id": (
-                    None if matching_nissl is None else matching_nissl.section_id
-                ),
-                "graphic_group_ids": group_text,
-                "coordinate_system": (
-                    "full-resolution Allen section-image pixels; honor SVG transforms"
-                ),
-                "source_url": (
-                    f"{API_BASE}/svg_download/{record.atlas_image_id}?groups={group_text}"
-                ),
-                "relative_output_path": (
-                    f"nissl/labels_orig/seg_{record.section_number:04d}.svg"
-                ),
-            }
-        )
-
-    _atomic_write_tsv(
-        paths.atlas_annotations_tsv,
-        (
-            "atlas_id",
-            "atlas_image_type",
-            "atlas_image_id",
-            "section_number",
-            "matching_nissl_section_image_id",
-            "graphic_group_ids",
-            "coordinate_system",
-            "source_url",
-            "relative_output_path",
-        ),
-        annotation_rows,
-    )
-
-    save_image_file_manifest(paths, image_files)
-    LOGGER.info(
-        "Saved standards-aligned metadata to %s, %s, %s, and %s",
-        paths.dataset_metadata_json,
-        paths.sections_tsv,
-        paths.atlas_annotations_tsv,
-        paths.image_files_tsv,
-    )
-
-def save_metadata(
-    paths: OutputPaths,
-    nissl: Sequence[SectionRecord],
-    ihc: Sequence[SectionRecord],
-    annotations: Sequence[AtlasAnnotationRecord],
-    *,
-    specimen_id: int,
-    atlas_id: int,
-    atlas_image_type: str,
-    groups: Sequence[int],
-    downsample: int,
-    image_download_mode: str,
-    image_files: Mapping[str, ImageFileRecord] | None = None,
-) -> None:
-    """Save transparent JSON metadata and a MATLAB-compatible secInfo.mat."""
-
-    processing = _image_processing_parameters(
-        downsample=downsample, image_download_mode=image_download_mode
-    )
-    payload = {
-        "specimen_id": specimen_id,
-        "atlas_id": atlas_id,
-        "atlas_image_type": atlas_image_type,
-        "groups": list(groups),
-        "downsample": downsample,
-        "image_download_mode": image_download_mode,
-        "histology_sampling": {
-            "paper_nominal_scan_resolution_um_per_pixel": DING_SCAN_RESOLUTION_UM_PER_PIXEL,
-            "physical_section_thickness_um": DING_SECTION_THICKNESS_UM,
-            "nissl_nominal_section_spacing_um": NISSL_NOMINAL_SPACING_UM,
-            "pv_nominal_section_spacing_um": PV_NOMINAL_SPACING_UM,
-            "source_resolution_field": "Allen SectionImage.resolution",
-            "server_downsample_level": processing["server_downsample_level"],
-            "server_linear_downsample_factor": processing[
-                "server_linear_downsample_factor"
-            ],
-            "local_resize_linear_factor": processing["local_resize_scale"],
-            "local_interpolation": processing["local_interpolation"],
-            "jpeg_transcoding": processing["jpeg_transcoding"],
-            "effective_linear_downsample_factor": processing[
-                "effective_linear_downsample_factor"
-            ],
-            "nominal_effective_resolution_um_per_pixel": (
-                DING_SCAN_RESOLUTION_UM_PER_PIXEL * (2**downsample)
-            ),
-        },
-        "nissl": [asdict(record) for record in nissl],
-        "ihc": [asdict(record) for record in ihc],
-        "atlas_annotations": [asdict(record) for record in annotations],
-    }
-    _atomic_write_text(paths.metadata_json, json.dumps(payload, indent=2) + "\n")
-
-    _atomic_save_mat(
-        paths.metadata_mat,
-        {
-            "annotatedNissl": np.asarray(
-                [int(record.annotated) for record in nissl], dtype=np.uint8
-            ),
-            "secIDNissl": np.asarray(
-                [record.section_id for record in nissl], dtype=np.int64
-            ),
-            "secNumberNissl": np.asarray(
-                [record.section_number for record in nissl], dtype=np.int64
-            ),
-            "secIDIHC": np.asarray(
-                [record.section_id for record in ihc], dtype=np.int64
-            ),
-            "secNumberIHC": np.asarray(
-                [record.section_number for record in ihc], dtype=np.int64
-            ),
-            "atlasImageID": np.asarray(
-                [record.atlas_image_id for record in annotations], dtype=np.int64
-            ),
-            "atlasSectionNumber": np.asarray(
-                [record.section_number for record in annotations], dtype=np.int64
-            ),
-            "resolutionNisslUmPerPixel": np.asarray(
-                [
-                    np.nan if record.resolution_um_per_pixel is None
-                    else record.resolution_um_per_pixel
-                    for record in nissl
-                ],
-                dtype=np.float64,
-            ),
-            "resolutionIHCUmPerPixel": np.asarray(
-                [
-                    np.nan if record.resolution_um_per_pixel is None
-                    else record.resolution_um_per_pixel
-                    for record in ihc
-                ],
-                dtype=np.float64,
-            ),
-            "widthNisslPx": np.asarray(
-                [-1 if record.width_px is None else record.width_px for record in nissl],
-                dtype=np.int64,
-            ),
-            "heightNisslPx": np.asarray(
-                [-1 if record.height_px is None else record.height_px for record in nissl],
-                dtype=np.int64,
-            ),
-            "widthIHCPx": np.asarray(
-                [-1 if record.width_px is None else record.width_px for record in ihc],
-                dtype=np.int64,
-            ),
-            "heightIHCPx": np.asarray(
-                [-1 if record.height_px is None else record.height_px for record in ihc],
-                dtype=np.int64,
-            ),
-            "imageDownloadMode": np.asarray([image_download_mode], dtype=object),
-            "serverDownsampleLevel": np.asarray(
-                [[processing["server_downsample_level"]]], dtype=np.int64
-            ),
-            "localResizeLinearFactor": np.asarray(
-                [[processing["local_resize_scale"]]], dtype=np.float64
-            ),
-            "effectiveLinearDownsampleFactor": np.asarray(
-                [[processing["effective_linear_downsample_factor"]]], dtype=np.int64
-            ),
-            "paperNominalScanResolutionUmPerPixel": np.asarray(
-                [[DING_SCAN_RESOLUTION_UM_PER_PIXEL]], dtype=np.float64
-            ),
-            "physicalSectionThicknessUm": np.asarray(
-                [[DING_SECTION_THICKNESS_UM]], dtype=np.float64
-            ),
-            "nisslNominalSectionSpacingUm": np.asarray(
-                [[NISSL_NOMINAL_SPACING_UM]], dtype=np.float64
-            ),
-            "pvNominalSectionSpacingUm": np.asarray(
-                [[PV_NOMINAL_SPACING_UM]], dtype=np.float64
-            ),
-            "DS_FACTOR": np.asarray([[downsample]], dtype=np.int64),
-        },
-    )
-    save_standard_metadata(
-        paths,
-        nissl,
-        ihc,
-        annotations,
-        specimen_id=specimen_id,
-        atlas_id=atlas_id,
-        atlas_image_type=atlas_image_type,
-        groups=groups,
-        downsample=downsample,
-        image_download_mode=image_download_mode,
-        image_files=image_files,
-    )
-    LOGGER.info("Saved metadata to %s and %s", paths.metadata_json, paths.metadata_mat)
-
-
-def load_cached_metadata(
-    paths: OutputPaths,
-) -> tuple[list[SectionRecord], list[SectionRecord], list[AtlasAnnotationRecord]]:
-    """Load metadata from JSON, falling back to the original MATLAB cache format."""
-
-    if paths.metadata_json.exists():
-        payload = json.loads(paths.metadata_json.read_text(encoding="utf-8"))
-        nissl = [
-            _section_record_from_json(item) for item in payload.get("nissl", [])
-        ]
-        ihc = [
-            _section_record_from_json(item) for item in payload.get("ihc", [])
-        ]
-        annotations = [
-            AtlasAnnotationRecord(**item)
-            for item in payload.get("atlas_annotations", [])
-        ]
-        if nissl or ihc:
-            LOGGER.info("Loaded cached metadata from %s", paths.metadata_json)
-            return nissl, ihc, annotations
-
-    if paths.metadata_mat.exists():
-        mat = loadmat(paths.metadata_mat, squeeze_me=True)
-        nissl_ids = np.atleast_1d(mat.get("secIDNissl", [])).astype(int)
-        nissl_numbers = np.atleast_1d(mat.get("secNumberNissl", [])).astype(int)
-        nissl_annotated = np.atleast_1d(mat.get("annotatedNissl", [])).astype(bool)
-        ihc_ids = np.atleast_1d(mat.get("secIDIHC", [])).astype(int)
-        ihc_numbers = np.atleast_1d(mat.get("secNumberIHC", [])).astype(int)
-        nissl_resolutions = np.atleast_1d(
-            mat.get("resolutionNisslUmPerPixel", np.full(len(nissl_ids), np.nan))
-        ).astype(float)
-        ihc_resolutions = np.atleast_1d(
-            mat.get("resolutionIHCUmPerPixel", np.full(len(ihc_ids), np.nan))
-        ).astype(float)
-        nissl_widths = np.atleast_1d(
-            mat.get("widthNisslPx", np.full(len(nissl_ids), -1))
-        ).astype(int)
-        nissl_heights = np.atleast_1d(
-            mat.get("heightNisslPx", np.full(len(nissl_ids), -1))
-        ).astype(int)
-        ihc_widths = np.atleast_1d(
-            mat.get("widthIHCPx", np.full(len(ihc_ids), -1))
-        ).astype(int)
-        ihc_heights = np.atleast_1d(
-            mat.get("heightIHCPx", np.full(len(ihc_ids), -1))
-        ).astype(int)
-        atlas_image_ids = np.atleast_1d(mat.get("atlasImageID", [])).astype(int)
-        atlas_section_numbers = np.atleast_1d(
-            mat.get("atlasSectionNumber", [])
-        ).astype(int)
-
-        if not (
-            len(nissl_ids)
-            == len(nissl_numbers)
-            == len(nissl_annotated)
-            == len(nissl_resolutions)
-            == len(nissl_widths)
-            == len(nissl_heights)
-        ):
-            raise RuntimeError(f"Inconsistent Nissl arrays in {paths.metadata_mat}")
-        if not (
-            len(ihc_ids)
-            == len(ihc_numbers)
-            == len(ihc_resolutions)
-            == len(ihc_widths)
-            == len(ihc_heights)
-        ):
-            raise RuntimeError(f"Inconsistent IHC arrays in {paths.metadata_mat}")
-        if len(atlas_image_ids) != len(atlas_section_numbers):
-            raise RuntimeError(
-                f"Inconsistent atlas annotation arrays in {paths.metadata_mat}"
-            )
-
-        nissl = [
-            SectionRecord(
-                "nissl",
-                int(section_id),
-                int(section_number),
-                bool(annotated),
-                None if np.isnan(resolution) else float(resolution),
-                None if width < 0 else int(width),
-                None if height < 0 else int(height),
-            )
-            for section_id, section_number, annotated, resolution, width, height in zip(
-                nissl_ids,
-                nissl_numbers,
-                nissl_annotated,
-                nissl_resolutions,
-                nissl_widths,
-                nissl_heights,
-                strict=True,
-            )
-        ]
-        ihc = [
-            SectionRecord(
-                "ihc",
-                int(section_id),
-                int(section_number),
-                False,
-                None if np.isnan(resolution) else float(resolution),
-                None if width < 0 else int(width),
-                None if height < 0 else int(height),
-            )
-            for section_id, section_number, resolution, width, height in zip(
-                ihc_ids,
-                ihc_numbers,
-                ihc_resolutions,
-                ihc_widths,
-                ihc_heights,
-                strict=True,
-            )
-        ]
-        annotations = [
-            AtlasAnnotationRecord(int(image_id), int(section_number))
-            for image_id, section_number in zip(
-                atlas_image_ids, atlas_section_numbers, strict=True
-            )
-        ]
-        LOGGER.info("Loaded cached metadata from %s", paths.metadata_mat)
-        return nissl, ihc, annotations
-
-    raise FileNotFoundError("No cached secInfo.json or secInfo.mat exists")
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    _atomic_write_bytes(path, text.encode("utf-8"))
-
-
-def _atomic_save_pil(image: Image.Image, path: Path, **save_kwargs: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = path.suffix or ".tmp"
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.stem}.", suffix=suffix, dir=path.parent
-    )
-    os.close(fd)
-    try:
-        image.save(temporary_name, **save_kwargs)
-        os.replace(temporary_name, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def download_image(
+def acquire_image(
     session: requests.Session,
-    record: SectionRecord,
-    destination: Path,
-    *,
-    data_dir: Path,
+    paths: Paths,
+    section: Section,
+    manifest: Mapping[str, Artifact],
     downsample: int,
-    image_download_mode: str,
+    mode: str,
     overwrite: bool,
-    verify_existing: bool,
-    prior_record: ImageFileRecord | None,
-    timeout: tuple[float, float] = (20.0, 300.0),
-) -> ImageFileRecord:
-    """Download or inspect one image and return observed per-file provenance."""
-
-    processing = _image_processing_parameters(
-        downsample=downsample, image_download_mode=image_download_mode
-    )
-    server_level = int(processing["server_downsample_level"])
-    url = f"{API_BASE}/image_download/{record.section_id}"
-    source_url = f"{url}?downsample={server_level}&quality=100"
-
-    if destination.exists() and not overwrite:
-        current_sha256 = _sha256_file(destination)
-        if (
-            prior_record is not None
-            and prior_record.sha256 == current_sha256
-            and prior_record.verified_mode is not None
-        ):
-            LOGGER.info(
-                "Image exists with verified manifest provenance (%s); skipping %s",
-                prior_record.verified_mode,
-                destination,
-            )
-            return _image_file_record(
-                record=record,
-                destination=destination,
-                data_dir=data_dir,
-                requested_mode=image_download_mode,
-                status="manifest-verified-existing",
-                verified_mode=prior_record.verified_mode,
-                source_url=prior_record.source_url,
-            )
-
-        if prior_record is not None and prior_record.sha256 != current_sha256:
-            LOGGER.warning(
-                "Existing image no longer matches its manifest checksum: %s", destination
-            )
-
-        if verify_existing:
-            if image_download_mode != "allen-direct":
-                raise ValueError(
-                    "--verify-existing currently supports only --image-download-mode "
-                    "allen-direct"
-                )
-            LOGGER.info(
-                "Verifying existing %s section %d against Allen direct bytes",
-                record.stain.upper(),
-                record.section_number,
-            )
-            response = session.get(
-                url,
-                params={"downsample": server_level, "quality": 100},
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            try:
-                with Image.open(io.BytesIO(response.content)) as source:
-                    source.load()
-            except UnidentifiedImageError as exc:
-                content_type = response.headers.get("Content-Type", "unknown")
-                raise RuntimeError(
-                    f"Image endpoint returned unreadable data for section "
-                    f"{record.section_id} (Content-Type: {content_type})"
-                ) from exc
-
-            if current_sha256 == _sha256_bytes(response.content):
-                LOGGER.info("Existing image exactly matches Allen direct response: %s", destination)
-                return _image_file_record(
-                    record=record,
-                    destination=destination,
-                    data_dir=data_dir,
-                    requested_mode=image_download_mode,
-                    status="verified-existing",
-                    verified_mode="allen-direct",
-                    source_url=source_url,
-                )
-
-            LOGGER.warning(
-                "Existing image differs from Allen direct response; leaving it unchanged: %s",
-                destination,
-            )
-            return _image_file_record(
-                record=record,
-                destination=destination,
-                data_dir=data_dir,
-                requested_mode=image_download_mode,
-                status="existing-mismatch",
-                verified_mode=None,
-                source_url=source_url,
-            )
-
-        LOGGER.warning(
-            "Image exists without verified provenance; skipping %s. Use "
-            "--verify-existing or --overwrite before treating it as %s.",
-            destination,
-            image_download_mode,
+    run_id: str,
+) -> Artifact:
+    path = image_path(paths, section)
+    relative = path.relative_to(paths.root).as_posix()
+    prior = manifest.get(relative)
+    if (
+        path.is_file()
+        and not overwrite
+        and prior
+        and prior.status in VERIFIED
+        and sha_file(path) == prior.sha256
+    ):
+        return artifact_image(
+            paths, section, path, "manifest-verified-existing", downsample
         )
-        return _image_file_record(
-            record=record,
-            destination=destination,
-            data_dir=data_dir,
-            requested_mode=image_download_mode,
-            status="existing-unverified",
-            verified_mode=None,
-            source_url=source_url,
-        )
-
-    LOGGER.info(
-        "Downloading %s section %d (image ID %d; mode=%s, server downsample=%d)",
-        record.stain.upper(),
-        record.section_number,
-        record.section_id,
-        image_download_mode,
-        server_level,
-    )
+    level = downsample if mode == "allen-direct" else downsample - 1
     response = session.get(
-        url,
-        params={"downsample": server_level, "quality": 100},
-        timeout=timeout,
+        f"{API_BASE}/image_download/{section.section_id}",
+        params={"downsample": level, "quality": 100},
+        timeout=(20, 300),
     )
     response.raise_for_status()
-
     try:
-        with Image.open(io.BytesIO(response.content)) as source:
-            source.load()
-            server_size = source.size
-            if image_download_mode == "matlab-compatible":
-                image = source.convert("RGB")
+        with Image.open(io.BytesIO(response.content)) as image:
+            image.load()
+            if mode == "allen-direct":
+                output = response.content
             else:
-                image = None
-    except UnidentifiedImageError as exc:
-        content_type = response.headers.get("Content-Type", "unknown")
-        raise RuntimeError(
-            f"Image endpoint returned unreadable data for section {record.section_id} "
-            f"(Content-Type: {content_type})"
-        ) from exc
-
-    if image_download_mode == "allen-direct":
-        _atomic_write_bytes(destination, response.content)
-        output_size = server_size
+                resized = image.convert("RGB").resize(
+                    (max(1, image.width // 2), max(1, image.height // 2)),
+                    Image.Resampling.BICUBIC,
+                )
+                buffer = io.BytesIO()
+                resized.save(buffer, format="JPEG", quality=100, subsampling=0)
+                output = buffer.getvalue()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise RuntimeError("Allen returned unreadable JPEG") from exc
+    digest, status = sha_bytes(output), "downloaded"
+    if path.is_file() and not overwrite:
+        if sha_file(path) == digest:
+            status = "verified-existing"
+        else:
+            quarantine(path, paths, run_id)
+            atomic_bytes(path, output)
+            status = "redownloaded-after-quarantine"
     else:
-        assert image is not None
-        output_size = (max(1, image.width // 2), max(1, image.height // 2))
-        image = image.resize(output_size, resample=Image.Resampling.BICUBIC)
-        _atomic_save_pil(
-            image, destination, format="JPEG", quality=100, subsampling=0
-        )
-
-    if record.resolution_um_per_pixel is not None:
-        LOGGER.debug(
-            "Saved %s at %s pixels; effective pixel size %.6g µm",
-            destination,
-            output_size,
-            record.resolution_um_per_pixel * (2**downsample),
-        )
-
-    return _image_file_record(
-        record=record,
-        destination=destination,
-        data_dir=data_dir,
-        requested_mode=image_download_mode,
-        status="downloaded",
-        verified_mode=image_download_mode,
-        source_url=source_url,
-    )
+        atomic_bytes(path, output)
+    return artifact_image(paths, section, path, status, downsample)
 
 
-def download_atlas_svg(
+def acquire_svg(
     session: requests.Session,
-    record: AtlasAnnotationRecord,
-    destination: Path,
-    *,
-    groups: Sequence[int],
+    paths: Paths,
+    plate: AtlasPlate,
+    manifest: Mapping[str, Artifact],
     overwrite: bool,
-    timeout: tuple[float, float] = (20.0, 180.0),
-) -> None:
-    """Download one atlas plate's anatomical drawings as SVG."""
-
-    if destination.exists() and not overwrite:
-        LOGGER.info("SVG exists; skipping %s", destination)
-        return
-
-    LOGGER.info(
-        "Downloading atlas SVG for section %d (AtlasImage ID %d)",
-        record.section_number,
-        record.atlas_image_id,
-    )
-    url = f"{API_BASE}/svg_download/{record.atlas_image_id}"
-    response = session.get(
-        url,
-        params={"groups": ",".join(str(group) for group in groups)},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    content = response.content
-    if b"<svg" not in content[:4096].lower():
-        content_type = response.headers.get("Content-Type", "unknown")
-        raise RuntimeError(
-            "SVG endpoint returned unexpected data for AtlasImage "
-            f"{record.atlas_image_id} (section {record.section_number}) "
-            f"(Content-Type: {content_type})"
+    run_id: str,
+) -> Artifact:
+    path = paths.svg_dir / f"seg_{plate.section_number:04d}.svg"
+    relative = path.relative_to(paths.root).as_posix()
+    prior = manifest.get(relative)
+    group_query = ",".join(map(str, GROUPS))
+    if (
+        path.is_file()
+        and not overwrite
+        and prior
+        and prior.status in VERIFIED
+        and sha_file(path) == prior.sha256
+    ):
+        present, _, _ = inspect_svg(path.read_bytes())
+        status = "manifest-verified-existing"
+    else:
+        response = session.get(
+            f"{API_BASE}/svg_download/{plate.atlas_image_id}",
+            params={"groups": group_query},
+            timeout=(20, 300),
         )
-    _atomic_write_bytes(destination, content)
+        response.raise_for_status()
+        content = response.content
+        present, _, _ = inspect_svg(content)
+        digest = sha_bytes(content)
+        status = "downloaded"
+        if path.is_file() and not overwrite:
+            if sha_file(path) == digest:
+                status = "verified-existing"
+            else:
+                quarantine(path, paths, run_id)
+                atomic_bytes(path, content)
+                status = "redownloaded-after-quarantine"
+        else:
+            atomic_bytes(path, content)
+    return Artifact(
+        "annotation_svg",
+        "atlas",
+        plate.section_number,
+        None,
+        plate.atlas_image_id,
+        relative,
+        plate.width,
+        plate.height,
+        plate.resolution,
+        sha_file(path),
+        f"{API_BASE}/svg_download/{plate.atlas_image_id}?groups={group_query}",
+        status,
+        AllenAtlasPlateProvider.name,
+        graphic_groups_present=";".join(map(str, present)) or None,
+        matching_nissl_section_image_id=plate.nissl_id,
+        mapping_status=plate.mapping_status,
+    )
 
 
-def _zero_border(mask: np.ndarray, width: int = 10) -> np.ndarray:
-    result = mask.copy()
-    if result.ndim != 2:
-        raise ValueError(f"Expected a 2-D mask, got shape {result.shape}")
-    width = min(width, result.shape[0] // 2, result.shape[1] // 2)
-    if width <= 0:
-        return result
-    result[:width, :] = False
-    result[-width:, :] = False
-    result[:, :width] = False
-    result[:, -width:] = False
+def acquire_ontology(
+    provider: AllenStructureGraphProvider,
+    paths: Paths,
+    manifest: Mapping[str, Artifact],
+    overwrite: bool,
+    run_id: str,
+) -> Artifact:
+    path = paths.ontology
+    relative = path.relative_to(paths.root).as_posix()
+    prior = manifest.get(relative)
+    if (
+        path.is_file()
+        and not overwrite
+        and prior
+        and prior.status in VERIFIED
+        and sha_file(path) == prior.sha256
+    ):
+        parse_ontology(path.read_bytes())
+        status = "manifest-verified-existing"
+    else:
+        content = provider.fetch()
+        digest = sha_bytes(content)
+        status = "downloaded"
+        if path.is_file() and not overwrite:
+            if sha_file(path) == digest:
+                status = "verified-existing"
+            else:
+                quarantine(path, paths, run_id)
+                atomic_bytes(path, content)
+                status = "redownloaded-after-quarantine"
+        else:
+            atomic_bytes(path, content)
+    return Artifact(
+        "ontology_json",
+        "structure_graph_16",
+        None,
+        None,
+        None,
+        relative,
+        None,
+        None,
+        None,
+        sha_file(path),
+        provider.url,
+        status,
+        provider.name,
+    )
+
+
+def legacy_provenance(paths: Paths) -> dict[str, dict[str, str]]:
+    """Load the old image provenance only as migration evidence."""
+    source = paths.metadata / "image_files.tsv"
+    if not source.is_file():
+        return {}
+    with source.open(newline="") as stream:
+        return {
+            row["relative_output_path"]: row
+            for row in csv.DictReader(stream, delimiter="\t")
+        }
+
+
+def legacy_plate_mappings(paths: Paths) -> dict[int, int]:
+    result: dict[int, int] = {}
+    source = paths.metadata / "atlas_annotations.tsv"
+    if source.is_file():
+        with source.open(newline="") as stream:
+            for row in csv.DictReader(stream, delimiter="\t"):
+                atlas_id = opt_int(row.get("atlas_image_id"))
+                nissl_id = opt_int(row.get("matching_nissl_section_image_id"))
+                if atlas_id is not None and nissl_id is not None:
+                    result[atlas_id] = nissl_id
+    if paths.secjson.is_file():
+        try:
+            payload = json.loads(paths.secjson.read_text())
+            for row in values(payload.get("atlas_annotations")):
+                if not isinstance(row, Mapping):
+                    continue
+                atlas_id = opt_int(row.get("atlas_image_id"))
+                nissl_id = opt_int(row.get("matching_nissl_section_image_id"))
+                if atlas_id is not None and nissl_id is not None:
+                    prior = result.get(atlas_id)
+                    if prior is not None and prior != nissl_id:
+                        raise RuntimeError(
+                            f"Conflicting cached mappings for AtlasImage {atlas_id}"
+                        )
+                    result[atlas_id] = nissl_id
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Cannot read legacy mapping evidence: {paths.secjson}"
+            ) from exc
     return result
 
 
-def _retain_large_components(mask: np.ndarray, min_size: int) -> np.ndarray:
-    """Keep 8-connected components containing more than ``min_size`` pixels."""
-
-    labels, count = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
-    if count == 0:
-        return np.zeros_like(mask, dtype=bool)
-    sizes = np.bincount(labels.ravel())
-    keep = sizes > min_size
-    keep[0] = False
-    return keep[labels]
-
-
-def _mean_filter(image: np.ndarray, size: int) -> np.ndarray:
-    kernel = np.full((size, size), 1.0 / (size * size), dtype=np.float32)
-    return ndimage.correlate(image, kernel, mode="constant", cval=0.0)
-
-
-def generate_nissl_mask(image: Image.Image, ordinal: int) -> np.ndarray:
-    """Reproduce the Nissl mask logic; ``ordinal`` is one-based."""
-
-    gray = np.asarray(image.convert("L"), dtype=np.float32)
-    median = ndimage.median_filter(gray, size=3, mode="constant", cval=0.0)
-    average = _mean_filter(median, size=3)
-
-    threshold = 240.0 if ordinal in {166, 222} else 248.0
-    coarse = _zero_border(average < threshold, width=10)
-    coarse = _retain_large_components(coarse, min_size=30_000)
-
-    gx = ndimage.correlate(
-        average, np.asarray([[-1.0], [0.0], [1.0]], dtype=np.float32),
-        mode="constant", cval=0.0,
-    )
-    gy = ndimage.correlate(
-        average, np.asarray([[-1.0, 0.0, 1.0]], dtype=np.float32),
-        mode="constant", cval=0.0,
-    )
-    gradient_mask = np.hypot(gx, gy) > 1.0
-
-    combined = coarse & gradient_mask
-    filled = ndimage.binary_fill_holes(combined)
-    opened = ndimage.binary_opening(
-        filled, structure=np.ones((10, 10), dtype=bool)
-    )
-    return _retain_large_components(opened, min_size=30_000)
-
-
-def generate_ihc_mask(image: Image.Image, ordinal: int) -> np.ndarray:
-    """Reproduce the IHC mask logic; ``ordinal`` is one-based."""
-
-    if ordinal < 10:
-        min_size = 10_000
-    elif ordinal < 150:
-        min_size = 60_000
-    else:
-        min_size = 30_000
-
-    gray = np.asarray(image.convert("L"), dtype=np.float32)
-    median = ndimage.median_filter(gray, size=3, mode="constant", cval=0.0)
-    if ordinal < 148:
-        average = _mean_filter(median, size=3)
-        threshold = 250.0
-    else:
-        average = _mean_filter(median, size=10)
-        threshold = 245.0
-
-    mask = _zero_border(average < threshold, width=10)
-    filled = ndimage.binary_fill_holes(mask)
-    opened = ndimage.binary_opening(
-        filled, structure=np.ones((5, 5), dtype=bool)
-    )
-    retained = _retain_large_components(opened, min_size=min_size)
-    return ndimage.binary_opening(
-        retained, structure=np.ones((5, 5), dtype=bool)
-    )
-
-
-def save_mask(mask: np.ndarray, destination: Path) -> None:
-    image = Image.fromarray(mask.astype(np.uint8) * 255)
-    _atomic_save_pil(image, destination, format="PNG", optimize=True)
-
-
-def generate_masks(
-    records: Sequence[SectionRecord],
-    *,
-    image_dir: Path,
-    mask_dir: Path,
-    stain: str,
-    overwrite: bool,
-) -> None:
-    """Generate masks for all downloaded sections of one stain."""
-
-    total = len(records)
-    for ordinal, record in enumerate(records, start=1):
-        image_path = image_dir / f"image_{record.section_number:04d}.jpg"
-        if stain == "nissl":
-            mask_path = mask_dir / f"image_{record.section_number:04d}.png"
-        elif stain == "ihc":
-            mask_path = mask_dir / f"slice_{record.section_number:03d}.png"
-        else:
-            raise ValueError(f"Unsupported stain: {stain}")
-
-        LOGGER.info("Generating %s mask %d/%d", stain.upper(), ordinal, total)
-        if mask_path.exists() and not overwrite:
-            LOGGER.info("Mask exists; skipping %s", mask_path)
+def scan_existing(
+    paths: Paths,
+    sections: Mapping[str, Sequence[Section]],
+    plates: Sequence[AtlasPlate],
+    downsample: int,
+) -> dict[str, Artifact]:
+    """Build a complete manifest view without letting limited runs truncate it."""
+    try:
+        result = load_manifest(paths.manifest)
+    except RuntimeError:
+        result = {}
+    provenance = legacy_provenance(paths)
+    for series, records in sections.items():
+        for section in records:
+            path = image_path(paths, section)
+            if not path.is_file():
+                continue
+            relative = path.relative_to(paths.root).as_posix()
+            prior = result.get(relative)
+            legacy = provenance.get(relative, {})
+            digest = sha_file(path)
+            verified = (
+                prior is not None
+                and prior.sha256 == digest
+                and prior.status in VERIFIED
+            ) or (
+                legacy.get("sha256") == digest
+                and legacy.get("verified_mode") == "allen-direct"
+                and legacy.get("status")
+                in {
+                    "downloaded",
+                    "verified-existing",
+                    "manifest-verified-existing",
+                }
+            )
+            status = "manifest-verified-existing" if verified else "existing-unverified"
+            result[relative] = artifact_image(paths, section, path, status, downsample)
+    by_section = {plate.section_number: plate for plate in plates}
+    for path in sorted(paths.svg_dir.glob("*.svg")) if paths.svg_dir.is_dir() else []:
+        number = opt_int(path.stem.rsplit("_", 1)[-1])
+        plate = by_section.get(number) if number is not None else None
+        if plate is None:
             continue
-        if not image_path.exists():
-            raise FileNotFoundError(
-                f"Cannot generate mask because image is missing: {image_path}"
+        present, _, _ = inspect_svg(path.read_bytes())
+        relative = path.relative_to(paths.root).as_posix()
+        prior = result.get(relative)
+        status = (
+            "manifest-verified-existing"
+            if prior and prior.sha256 == sha_file(path) and prior.status in VERIFIED
+            else "existing-unverified"
+        )
+        result[relative] = Artifact(
+            "annotation_svg",
+            "atlas",
+            plate.section_number,
+            None,
+            plate.atlas_image_id,
+            relative,
+            plate.width,
+            plate.height,
+            plate.resolution,
+            sha_file(path),
+            f"{API_BASE}/svg_download/{plate.atlas_image_id}?groups={','.join(map(str, GROUPS))}",
+            status,
+            AllenAtlasPlateProvider.name,
+            graphic_groups_present=";".join(map(str, present)) or None,
+            matching_nissl_section_image_id=plate.nissl_id,
+            mapping_status=plate.mapping_status,
+        )
+    if paths.ontology.is_file():
+        parse_ontology(paths.ontology.read_bytes())
+        relative = paths.ontology.relative_to(paths.root).as_posix()
+        prior = result.get(relative)
+        status = (
+            "manifest-verified-existing"
+            if prior
+            and prior.sha256 == sha_file(paths.ontology)
+            and prior.status in VERIFIED
+            else "existing-unverified"
+        )
+        result[relative] = Artifact(
+            "ontology_json",
+            "structure_graph_16",
+            None,
+            None,
+            None,
+            relative,
+            None,
+            None,
+            None,
+            sha_file(paths.ontology),
+            AllenStructureGraphProvider.url,
+            status,
+            AllenStructureGraphProvider.name,
+        )
+    for series in ("nissl", "pv"):
+        mask_dir = paths.root / SERIES_ROOTS[series] / "masks_orig"
+        if not mask_dir.is_dir():
+            continue
+        for path in sorted(mask_dir.glob("*.png")):
+            relative = path.relative_to(paths.root).as_posix()
+            width, height = image_dimensions(path)
+            result[relative] = Artifact(
+                "tissue_mask",
+                series,
+                opt_int(path.stem.rsplit("_", 1)[-1]),
+                None,
+                None,
+                relative,
+                width,
+                height,
+                None,
+                sha_file(path),
+                None,
+                "existing",
+                "download_allen mask helper",
+            )
+    allowed = {
+        "histology_jpeg",
+        "annotation_svg",
+        "ontology_json",
+        "tissue_mask",
+        "derivative",
+    }
+    return {key: value for key, value in result.items() if value.kind in allowed}
+
+
+def save_structures(path: Path, structures: Sequence[Structure]) -> None:
+    atomic_tsv(path, STRUCTURE_FIELDS, (asdict(item) for item in structures))
+
+
+def load_structures(path: Path) -> list[Structure]:
+    if not path.is_file():
+        raise RuntimeError(f"Missing canonical structure table: {path}")
+    result: list[Structure] = []
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != STRUCTURE_FIELDS:
+            raise RuntimeError("Noncanonical structures.tsv columns")
+        for row in reader:
+            result.append(
+                Structure(
+                    int(row["structure_id"]),
+                    row["acronym"],
+                    row["name"],
+                    opt_int(row["parent_structure_id"]),
+                    None if row["color_hex"] == "n/a" else row["color_hex"],
+                    int(row["structure_graph_id"]),
+                    (
+                        None
+                        if row["structure_id_path"] == "n/a"
+                        else row["structure_id_path"]
+                    ),
+                )
+            )
+    return result
+
+
+def write_legacy_exports(
+    paths: Paths,
+    sections: Mapping[str, Sequence[Section]],
+    plates: Sequence[AtlasPlate],
+    downsample: int,
+    mode: str,
+) -> None:
+    def section_row(item: Section, stain: str) -> dict[str, Any]:
+        return {
+            "stain": stain,
+            "section_id": item.section_id,
+            "section_number": item.section_number,
+            "annotated": item.annotated,
+            "resolution_um_per_pixel": item.resolution,
+            "width_px": item.width,
+            "height_px": item.height,
+        }
+
+    annotation_rows = [
+        {
+            "atlas_image_id": item.atlas_image_id,
+            "section_number": item.section_number,
+            "matching_nissl_section_image_id": item.nissl_id,
+            "mapping_status": item.mapping_status,
+        }
+        for item in plates
+    ]
+    payload = {
+        "specimen_id": SPECIMEN_ID,
+        "atlas_id": ATLAS_ID,
+        "atlas_image_type": ATLAS_IMAGE_TYPE,
+        "groups": list(GROUPS),
+        "downsample": downsample,
+        "image_download_mode": mode,
+        "histology_sampling": {
+            "paper_nominal_scan_resolution_um_per_pixel": 1.0,
+            "physical_section_thickness_um": 50.0,
+            "nissl_nominal_section_spacing_um": 200.0,
+            "pv_nominal_section_spacing_um": 400.0,
+            "server_downsample_level": downsample,
+            "server_linear_downsample_factor": 2**downsample,
+            "nominal_effective_resolution_um_per_pixel": float(2**downsample),
+        },
+        "nissl": [section_row(item, "nissl") for item in sections["nissl"]],
+        # Legacy IHC means parvalbumin, never SMI-32.
+        "ihc": [section_row(item, "ihc") for item in sections["pv"]],
+        "atlas_annotations": annotation_rows,
+    }
+    atomic_json(paths.secjson, payload)
+    mat_payload = {
+        "specimen_id": SPECIMEN_ID,
+        "atlas_id": ATLAS_ID,
+        "nissl_section_id": np.asarray(
+            [item.section_id for item in sections["nissl"]], dtype=np.int64
+        ),
+        "nissl_section_number": np.asarray(
+            [item.section_number for item in sections["nissl"]], dtype=np.int64
+        ),
+        "ihc_section_id": np.asarray(
+            [item.section_id for item in sections["pv"]], dtype=np.int64
+        ),
+        "ihc_section_number": np.asarray(
+            [item.section_number for item in sections["pv"]], dtype=np.int64
+        ),
+        "atlas_image_id": np.asarray(
+            [item.atlas_image_id for item in plates], dtype=np.int64
+        ),
+        "atlas_section_number": np.asarray(
+            [item.section_number for item in plates], dtype=np.int64
+        ),
+        "matching_nissl_section_image_id": np.asarray(
+            [item.nissl_id or -1 for item in plates], dtype=np.int64
+        ),
+    }
+    paths.secmat.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{paths.secmat.name}.", dir=paths.secmat.parent
+    )
+    os.close(descriptor)
+    try:
+        savemat(temporary, mat_payload, appendmat=False)
+        os.replace(temporary, paths.secmat)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def dataset_payload(
+    accepted_inventory: Mapping[str, Any],
+    atlas_info: Mapping[str, Any],
+    mode: str,
+    downsample: int,
+    artifacts: Mapping[str, Artifact],
+) -> dict[str, Any]:
+    acquired = Counter(
+        item.series_or_layer
+        for item in artifacts.values()
+        if item.kind == "histology_jpeg" and item.status in VERIFIED
+    )
+    coverage = {
+        series: {
+            "acquired": acquired[series],
+            "published": PUBLISHED[series],
+            "unavailable": max(0, PUBLISHED[series] - acquired[series]),
+        }
+        for series in SERIES_LABELS
+    }
+    return {
+        "dataset_title": "Allen/Ding et al. 2016 single-donor human brain atlas raw acquisition",
+        "citation": "Ding et al., A comprehensive human brain reference atlas, 2016",
+        "doi": "10.1002/cne.24080",
+        "allen_specimen_id": SPECIMEN_ID,
+        "allen_donor_id": DONOR_ID,
+        "allen_atlas_id": ATLAS_ID,
+        "allen_structure_graph_id": GRAPH_ID,
+        "allen_structure_graph_name": atlas_info.get("structure_graph_name"),
+        "allen_api_base": API_BASE,
+        "accepted_api_inventory": dict(accepted_inventory),
+        "published_corpus": {
+            "counts": {**PUBLISHED, "total": sum(PUBLISHED.values())},
+            "coverage": {
+                **coverage,
+                "total": {
+                    "acquired": sum(acquired.values()),
+                    "published": 1356,
+                    "unavailable": max(0, 1356 - sum(acquired.values())),
+                },
+            },
+        },
+        "providers": {
+            "nissl": {
+                "provider": AllenSectionDataSetProvider.name,
+                "available": bool(accepted_inventory["series"]["nissl"]["image_count"]),
+            },
+            "pv": {
+                "provider": AllenSectionDataSetProvider.name,
+                "available": bool(accepted_inventory["series"]["pv"]["image_count"]),
+                "legacy_directory": "ihc/",
+            },
+            "smi32": {
+                "provider": (
+                    AllenSectionDataSetProvider.name
+                    if accepted_inventory["series"]["smi32"]["image_count"]
+                    else None
+                ),
+                "available": bool(accepted_inventory["series"]["smi32"]["image_count"]),
+                "published_denominator": 338,
+                "finding": f"No qualifying official provider found in bounded search on {DISCOVERY_DATE}; reassess when sources change.",
+            },
+        },
+        "source_discovery": {
+            "searched_on": DISCOVERY_DATE,
+            "scope": "bounded official-source search",
+            "smi32_result": "no qualifying provider found",
+            "permanent_unavailability_claim": False,
+        },
+        "graphic_groups": atlas_info["graphic_groups"],
+        "nominal_native_pixel_size_um": 1.0,
+        "downloaded_nominal_pixel_size_um": float(2**downsample),
+        "physical_section_thickness_um": 50.0,
+        "nominal_series_spacing_um": {"nissl": 200.0, "pv": 400.0, "smi32": 400.0},
+        "annotated_atlas_plate_spacing": "variable, approximately 0.4–3.4 mm; distinct from section thickness and series spacing",
+        "image_download_mode": mode,
+        "server_downsample_level": downsample,
+        "coordinate_space": "Raw histology JPEGs and SVG annotations use local 2-D section-image coordinates; no origin, 3-D orientation, AP coordinate, or MRI affine is asserted.",
+        "reuse_terms_url": "https://alleninstitute.org/legal/terms-use/",
+        "software": {"name": "download_allen.py", "version": VERSION},
+        "updated_at_utc": now(),
+    }
+
+
+def create_masks(
+    paths: Paths, artifacts: dict[str, Artifact], series: Sequence[str]
+) -> None:
+    for name in series:
+        if name == "smi32":
+            continue
+        generator = generate_nissl_mask if name == "nissl" else generate_ihc_mask
+        for item in [
+            x
+            for x in artifacts.values()
+            if x.kind == "histology_jpeg" and x.series_or_layer == name
+        ]:
+            source = paths.root / item.path
+            destination = (
+                paths.root
+                / SERIES_ROOTS[name]
+                / "masks_orig"
+                / f"mask_{item.section_number:04d}.png"
+            )
+            if not destination.is_file():
+                with Image.open(source) as image:
+                    mask = generator(np.asarray(image.convert("RGB")))
+                _atomic_save_pil(Image.fromarray(mask), destination, format="PNG")
+            width, height = image_dimensions(destination)
+            relative = destination.relative_to(paths.root).as_posix()
+            artifacts[relative] = Artifact(
+                "tissue_mask",
+                name,
+                item.section_number,
+                item.allen_section_image_id,
+                None,
+                relative,
+                width,
+                height,
+                item.pixel_size_um,
+                sha_file(destination),
+                item.path,
+                "generated",
+                "download_allen mask helper",
+                item.allen_data_set_id,
+                item.treatment_id,
             )
 
-        with Image.open(image_path) as image:
-            image.load()
-            if stain == "nissl":
-                mask = generate_nissl_mask(image, ordinal)
-            else:
-                mask = generate_ihc_mask(image, ordinal)
-        save_mask(mask, mask_path)
+
+def failure(
+    category: str, affected: str, expected: Any, observed: Any, action: str
+) -> dict[str, Any]:
+    return {
+        "category": category,
+        "affected": affected,
+        "expected": expected,
+        "observed": observed,
+        "corrective_action": action,
+    }
 
 
-def _limited(records: Sequence[SectionRecord], limit: int | None) -> Sequence[SectionRecord]:
-    return records if limit is None else records[:limit]
-
-
-def run(args: argparse.Namespace) -> None:
-    paths = OutputPaths.from_data_dir(args.data_dir)
-    paths.create()
-    session = build_session(retries=args.retries, backoff_factor=args.backoff)
-    image_files = load_image_file_manifest(paths)
-
-    if args.refresh_metadata:
-        nissl, ihc = query_section_metadata(session, specimen_id=args.specimen_id)
-        annotations = query_atlas_annotation_metadata(
-            session,
-            atlas_id=args.atlas_id,
-            atlas_image_type=args.atlas_image_type,
+def validate_dataset(paths: Paths, allow_superseded: bool = False) -> dict[str, Any]:
+    """Validate entirely from disk. The caller controls whether the JSON report is written."""
+    failures: list[dict[str, Any]] = []
+    try:
+        dataset = json.loads(paths.dataset.read_text())
+    except (OSError, ValueError) as exc:
+        return {
+            "status": "FAIL",
+            "failures": [
+                failure(
+                    "metadata",
+                    str(paths.dataset),
+                    "readable JSON",
+                    str(exc),
+                    "run acquisition to create dataset.json",
+                )
+            ],
+        }
+    try:
+        manifest = load_manifest(paths.manifest)
+    except (OSError, RuntimeError) as exc:
+        return {
+            "status": "FAIL",
+            "failures": [
+                failure(
+                    "metadata",
+                    str(paths.manifest),
+                    "canonical manifest",
+                    str(exc),
+                    "regenerate manifest.tsv",
+                )
+            ],
+        }
+    try:
+        structures = load_structures(paths.structures)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "status": "FAIL",
+            "failures": [
+                failure(
+                    "ontology",
+                    str(paths.structures),
+                    "graph-16 table",
+                    str(exc),
+                    "reacquire ontology",
+                )
+            ],
+        }
+    canonical = {"dataset.json", "manifest.tsv", "structures.tsv"}
+    actual_metadata = {item.name for item in paths.metadata.iterdir() if item.is_file()}
+    extras = sorted(actual_metadata - canonical)
+    if extras and not allow_superseded:
+        failures.append(
+            failure(
+                "metadata",
+                "metadata/",
+                sorted(canonical),
+                sorted(actual_metadata),
+                "complete metadata migration",
+            )
         )
-        save_metadata(
-            paths,
-            nissl,
-            ihc,
-            annotations,
-            specimen_id=args.specimen_id,
-            atlas_id=args.atlas_id,
-            atlas_image_type=args.atlas_image_type,
-            groups=args.groups,
-            downsample=args.downsample,
-            image_download_mode=args.image_download_mode,
-            image_files=image_files,
+    for forbidden in (
+        "metadata/dataset.json",
+        "metadata/manifest.tsv",
+        "metadata/structures.tsv",
+        "secInfo.json",
+        "secInfo.mat",
+    ):
+        if forbidden in manifest:
+            failures.append(
+                failure(
+                    "manifest",
+                    forbidden,
+                    "excluded",
+                    "present",
+                    "remove metadata/compatibility rows",
+                )
+            )
+    accepted = dataset.get("accepted_api_inventory", {})
+    accepted_series = (
+        accepted.get("series", {}) if isinstance(accepted, Mapping) else {}
+    )
+    if (
+        dataset.get("allen_specimen_id") != SPECIMEN_ID
+        or dataset.get("allen_atlas_id") != ATLAS_ID
+        or dataset.get("allen_structure_graph_id") != GRAPH_ID
+    ):
+        failures.append(
+            failure(
+                "metadata_identity",
+                "dataset.json",
+                {"specimen": SPECIMEN_ID, "atlas": ATLAS_ID, "graph": GRAPH_ID},
+                {
+                    "specimen": dataset.get("allen_specimen_id"),
+                    "atlas": dataset.get("allen_atlas_id"),
+                    "graph": dataset.get("allen_structure_graph_id"),
+                },
+                "review and regenerate canonical metadata",
+            )
+        )
+    expected_groups = [{"id": gid, "name": GROUP_LABELS[gid]} for gid in GROUPS]
+    if dataset.get("graphic_groups") != expected_groups:
+        failures.append(
+            failure(
+                "graphic_group_catalog",
+                "dataset.json",
+                expected_groups,
+                dataset.get("graphic_groups"),
+                "re-query the selected atlas and regenerate dataset.json",
+            )
+        )
+    try:
+        digest = sha_bytes(
+            json.dumps(
+                inventory_core(accepted), sort_keys=True, separators=(",", ":")
+            ).encode()
+        )
+        if accepted.get("inventory_sha256") != digest:
+            failures.append(
+                failure(
+                    "inventory_digest",
+                    "dataset.json accepted_api_inventory",
+                    digest,
+                    accepted.get("inventory_sha256"),
+                    "review the accepted inventory and regenerate dataset.json",
+                )
+            )
+    except (AttributeError, TypeError, ValueError) as exc:
+        failures.append(
+            failure(
+                "inventory_schema",
+                "dataset.json accepted_api_inventory",
+                "canonical inventory object",
+                str(exc),
+                "regenerate dataset.json from reviewed inventory",
+            )
+        )
+    count = Counter()
+    checksum_failures = 0
+    unreadable = 0
+    svg_rows: list[tuple[Artifact, bytes]] = []
+    section_ids: dict[str, set[int]] = {series: set() for series in SERIES_LABELS}
+    section_numbers: dict[str, set[int]] = {series: set() for series in SERIES_LABELS}
+    nissl_by_id: dict[int, Artifact] = {}
+    atlas_ids: set[int] = set()
+    for item in manifest.values():
+        path = (paths.root / item.path).resolve()
+        try:
+            path.relative_to(paths.root)
+        except ValueError:
+            failures.append(
+                failure(
+                    "manifest_path",
+                    item.path,
+                    "path within dataset root",
+                    str(path),
+                    "remove unsafe manifest row",
+                )
+            )
+            continue
+        if not path.is_file():
+            failures.append(
+                failure(
+                    "artifact",
+                    item.path,
+                    "file exists",
+                    "missing",
+                    "resume acquisition",
+                )
+            )
+            continue
+        observed_hash = sha_file(path)
+        if observed_hash != item.sha256:
+            checksum_failures += 1
+            failures.append(
+                failure(
+                    "checksum",
+                    item.path,
+                    item.sha256,
+                    observed_hash,
+                    "review, quarantine, and redownload",
+                )
+            )
+        if item.kind in {"histology_jpeg", "tissue_mask"}:
+            try:
+                dimensions = image_dimensions(path)
+                if item.width_px is not None and dimensions != (
+                    item.width_px,
+                    item.height_px,
+                ):
+                    failures.append(
+                        failure(
+                            "dimensions",
+                            item.path,
+                            (item.width_px, item.height_px),
+                            dimensions,
+                            "regenerate manifest or reacquire",
+                        )
+                    )
+            except RuntimeError as exc:
+                unreadable += 1
+                failures.append(
+                    failure(
+                        "readability",
+                        item.path,
+                        "decodable image",
+                        str(exc),
+                        "redownload or regenerate",
+                    )
+                )
+        if item.kind == "histology_jpeg" and item.status in VERIFIED:
+            count[item.series_or_layer] += 1
+            series = item.series_or_layer
+            identity = accepted_series.get(series, {})
+            if series not in SERIES_LABELS:
+                failures.append(
+                    failure(
+                        "series",
+                        item.path,
+                        sorted(SERIES_LABELS),
+                        series,
+                        "repair manifest series",
+                    )
+                )
+            else:
+                if item.allen_section_image_id in section_ids[series]:
+                    failures.append(
+                        failure(
+                            "duplicate_section_id",
+                            item.path,
+                            "unique ID",
+                            item.allen_section_image_id,
+                            "repair manifest",
+                        )
+                    )
+                if item.section_number in section_numbers[series]:
+                    failures.append(
+                        failure(
+                            "duplicate_section_number",
+                            item.path,
+                            "unique number",
+                            item.section_number,
+                            "review API inventory",
+                        )
+                    )
+                section_ids[series].add(item.allen_section_image_id)
+                section_numbers[series].add(item.section_number)
+                if item.treatment_id != opt_int(
+                    identity.get("treatment_id")
+                ) or item.allen_data_set_id not in set(
+                    identity.get("data_set_ids", [])
+                ):
+                    failures.append(
+                        failure(
+                            "histology_identity",
+                            item.path,
+                            {
+                                "treatment_id": identity.get("treatment_id"),
+                                "data_set_ids": identity.get("data_set_ids"),
+                            },
+                            {
+                                "treatment_id": item.treatment_id,
+                                "data_set_id": item.allen_data_set_id,
+                            },
+                            "reconcile manifest with the accepted API inventory",
+                        )
+                    )
+                if series == "nissl" and item.allen_section_image_id is not None:
+                    nissl_by_id[item.allen_section_image_id] = item
+        if item.kind == "annotation_svg":
+            if item.allen_atlas_image_id in atlas_ids:
+                failures.append(
+                    failure(
+                        "duplicate_atlas_id",
+                        item.path,
+                        "unique AtlasImage ID",
+                        item.allen_atlas_image_id,
+                        "repair manifest",
+                    )
+                )
+            atlas_ids.add(item.allen_atlas_image_id)
+            try:
+                svg_rows.append((item, path.read_bytes()))
+            except OSError as exc:
+                unreadable += 1
+                failures.append(
+                    failure(
+                        "readability", item.path, "readable SVG", str(exc), "redownload"
+                    )
+                )
+    inventoried = set(manifest)
+    discovered: set[str] = set()
+    for directory, pattern in (
+        (paths.image_dir("nissl"), "*.jpg"),
+        (paths.image_dir("pv"), "*.jpg"),
+        (paths.image_dir("smi32"), "*.jpg"),
+        (paths.svg_dir, "*.svg"),
+        (paths.root / "nissl/masks_orig", "*.png"),
+        (paths.root / "ihc/masks_orig", "*.png"),
+        (paths.root / "smi32/masks_orig", "*.png"),
+    ):
+        if directory.is_dir():
+            discovered.update(
+                path.relative_to(paths.root).as_posix()
+                for path in directory.glob(pattern)
+            )
+    if paths.ontology.is_file():
+        discovered.add(paths.ontology.relative_to(paths.root).as_posix())
+    for relative in sorted(discovered - inventoried):
+        failures.append(
+            failure(
+                "unmanifested_artifact",
+                relative,
+                "manifest row",
+                "absent",
+                "verify and add artifact to manifest",
+            )
+        )
+    expected = {
+        series: int(accepted_series.get(series, {}).get("image_count", -1))
+        for series in SERIES_LABELS
+    }
+    for series in SERIES_LABELS:
+        if count[series] != expected[series]:
+            failures.append(
+                failure(
+                    "api_count",
+                    series,
+                    expected[series],
+                    count[series],
+                    "resume acquisition and verify files",
+                )
+            )
+    ontology_rows = [item for item in manifest.values() if item.kind == "ontology_json"]
+    if (
+        len(ontology_rows) != 1
+        or ontology_rows[0].path != "ontology/structure_graph_16.json"
+    ):
+        failures.append(
+            failure(
+                "ontology",
+                "manifest",
+                "one graph-16 raw ontology",
+                [x.path for x in ontology_rows],
+                "reacquire ontology",
+            )
+        )
+    if any(item.structure_graph_id != GRAPH_ID for item in structures):
+        failures.append(
+            failure(
+                "ontology",
+                "structures.tsv",
+                GRAPH_ID,
+                "other graph ID",
+                "regenerate strictly from graph 16",
+            )
+        )
+    structure_ids = {item.structure_id for item in structures}
+    if len(structure_ids) != len(structures):
+        failures.append(
+            failure(
+                "ontology",
+                "structures.tsv",
+                "unique structure IDs",
+                "duplicates",
+                "regenerate structures.tsv",
+            )
+        )
+    if paths.ontology.is_file():
+        try:
+            raw_structures = flatten_ontology(
+                parse_ontology(paths.ontology.read_bytes())
+            )
+            if raw_structures != structures:
+                failures.append(
+                    failure(
+                        "ontology",
+                        "structures.tsv",
+                        "exact flattening of raw graph 16",
+                        "different rows",
+                        "regenerate structures.tsv",
+                    )
+                )
+        except RuntimeError as exc:
+            failures.append(
+                failure(
+                    "ontology",
+                    str(paths.ontology),
+                    "valid graph-16 JSON",
+                    str(exc),
+                    "redownload ontology",
+                )
+            )
+    group_stats = {
+        str(gid): {"plates_present": 0, "structure_paths": 0, "unique_structure_ids": 0}
+        for gid in GROUPS
+    }
+    group_ids: dict[int, set[int]] = {gid: set() for gid in GROUPS}
+    unresolved_ids: set[int] = set()
+    mappings = 0
+    for item, content in svg_rows:
+        try:
+            present, path_counts, ids = inspect_svg(content)
+        except RuntimeError as exc:
+            unreadable += 1
+            failures.append(
+                failure(
+                    "svg_parse", item.path, "parseable SVG", str(exc), "redownload SVG"
+                )
+            )
+            continue
+        expected_present = ";".join(map(str, present)) or None
+        if item.graphic_groups_present != expected_present:
+            failures.append(
+                failure(
+                    "svg_groups",
+                    item.path,
+                    expected_present,
+                    item.graphic_groups_present,
+                    "regenerate manifest",
+                )
+            )
+        for gid in GROUPS:
+            if gid in present:
+                group_stats[str(gid)]["plates_present"] += 1
+            group_stats[str(gid)]["structure_paths"] += path_counts.get(gid, 0)
+            group_ids[gid].update(ids.get(gid, set()))
+            unresolved = sorted(ids.get(gid, set()) - structure_ids)
+            unresolved_ids.update(unresolved)
+            for sid in unresolved:
+                failures.append(
+                    failure(
+                        "unresolved_structure_id",
+                        f"{item.path}:{sid}",
+                        "ID in graph 16",
+                        sid,
+                        "review ontology or source SVG",
+                    )
+                )
+        if (
+            item.matching_nissl_section_image_id is not None
+            and item.mapping_status in {"exact_id", "repaired_unique_section"}
+        ):
+            matched = nissl_by_id.get(item.matching_nissl_section_image_id)
+            if matched is None or matched.section_number != item.section_number:
+                failures.append(
+                    failure(
+                        "plate_mapping",
+                        item.path,
+                        "Nissl manifest row with the same section number",
+                        item.matching_nissl_section_image_id,
+                        "repair the atlas-to-Nissl mapping",
+                    )
+                )
+            else:
+                mappings += 1
+        elif item.mapping_status == "filename_only":
+            failures.append(
+                failure(
+                    "plate_mapping",
+                    item.path,
+                    "metadata-derived Nissl ID",
+                    "filename_only",
+                    "review section metadata",
+                )
+            )
+        else:
+            failures.append(
+                failure(
+                    "plate_mapping",
+                    item.path,
+                    "resolved Nissl ID",
+                    item.mapping_status,
+                    "repair mapping from Allen metadata",
+                )
+            )
+    for gid in GROUPS:
+        group_stats[str(gid)]["unique_structure_ids"] = len(group_ids[gid])
+    if len(svg_rows) != EXPECTED_SVGS:
+        failures.append(
+            failure(
+                "svg_count",
+                "annotation SVGs",
+                EXPECTED_SVGS,
+                len(svg_rows),
+                "resume SVG acquisition",
+            )
+        )
+    if mappings != EXPECTED_SVGS:
+        failures.append(
+            failure(
+                "plate_mapping",
+                "all atlas plates",
+                EXPECTED_SVGS,
+                mappings,
+                "repair canonical mappings",
+            )
+        )
+    if not paths.secjson.is_file() or not paths.secmat.is_file():
+        failures.append(
+            failure(
+                "legacy_exports",
+                "secInfo.json/secInfo.mat",
+                "both present",
+                "missing",
+                "regenerate compatibility exports",
+            )
         )
     else:
         try:
-            nissl, ihc, annotations = load_cached_metadata(paths)
-        except FileNotFoundError:
-            nissl, ihc = query_section_metadata(session, specimen_id=args.specimen_id)
-            annotations = query_atlas_annotation_metadata(
-                session,
-                atlas_id=args.atlas_id,
-                atlas_image_type=args.atlas_image_type,
+            legacy = json.loads(paths.secjson.read_text())
+            mat = loadmat(paths.secmat)
+            legacy_counts = (
+                len(values(legacy.get("nissl"))),
+                len(values(legacy.get("ihc"))),
+                len(values(legacy.get("atlas_annotations"))),
             )
-            save_metadata(
-                paths,
-                nissl,
-                ihc,
-                annotations,
-                specimen_id=args.specimen_id,
-                atlas_id=args.atlas_id,
-                atlas_image_type=args.atlas_image_type,
-                groups=args.groups,
-                downsample=args.downsample,
-                image_download_mode=args.image_download_mode,
-                image_files=image_files,
+            mat_counts = (
+                np.asarray(mat["nissl_section_id"]).size,
+                np.asarray(mat["ihc_section_id"]).size,
+                np.asarray(mat["atlas_image_id"]).size,
             )
-        else:
-            if not annotations:
-                LOGGER.info(
-                    "Cached metadata predates atlas-specific SVG metadata; "
-                    "querying atlas %d",
-                    args.atlas_id,
+            target_counts = (expected["nissl"], expected["pv"], EXPECTED_SVGS)
+            if legacy_counts != target_counts or mat_counts != target_counts:
+                failures.append(
+                    failure(
+                        "legacy_exports",
+                        "secInfo exports",
+                        target_counts,
+                        {"json": legacy_counts, "mat": mat_counts},
+                        "regenerate compatibility exports",
+                    )
                 )
-                annotations = query_atlas_annotation_metadata(
-                    session,
-                    atlas_id=args.atlas_id,
-                    atlas_image_type=args.atlas_image_type,
+            expected_nissl_ids = sorted(section_ids["nissl"])
+            expected_pv_ids = sorted(section_ids["pv"])
+            json_nissl_ids = sorted(
+                opt_int(row.get("section_id")) for row in values(legacy.get("nissl"))
+            )
+            json_pv_ids = sorted(
+                opt_int(row.get("section_id")) for row in values(legacy.get("ihc"))
+            )
+            mat_nissl_ids = sorted(np.asarray(mat["nissl_section_id"]).ravel().tolist())
+            mat_pv_ids = sorted(np.asarray(mat["ihc_section_id"]).ravel().tolist())
+            if (
+                json_nissl_ids != expected_nissl_ids
+                or json_pv_ids != expected_pv_ids
+                or mat_nissl_ids != expected_nissl_ids
+                or mat_pv_ids != expected_pv_ids
+            ):
+                failures.append(
+                    failure(
+                        "legacy_exports",
+                        "secInfo section identities",
+                        {"nissl": expected_nissl_ids, "pv": expected_pv_ids},
+                        "JSON or MAT identity arrays differ",
+                        "regenerate compatibility exports from canonical metadata",
+                    )
                 )
-                save_metadata(
-                    paths,
-                    nissl,
-                    ihc,
-                    annotations,
-                    specimen_id=args.specimen_id,
-                    atlas_id=args.atlas_id,
-                    atlas_image_type=args.atlas_image_type,
-                    groups=args.groups,
-                    downsample=args.downsample,
-                    image_download_mode=args.image_download_mode,
-                    image_files=image_files,
+        except (OSError, ValueError, KeyError) as exc:
+            failures.append(
+                failure(
+                    "legacy_exports",
+                    "secInfo exports",
+                    "readable and consistent",
+                    str(exc),
+                    "regenerate compatibility exports",
                 )
+            )
+    acquired_total = sum(count.values())
+    published = {
+        series: {
+            "acquired": count[series],
+            "published": PUBLISHED[series],
+            "unavailable": max(0, PUBLISHED[series] - count[series]),
+        }
+        for series in SERIES_LABELS
+    }
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "api_acquisition": {
+            **{
+                series: {"observed": count[series], "expected": expected[series]}
+                for series in SERIES_LABELS
+            },
+            "total": {"observed": acquired_total, "expected": sum(expected.values())},
+        },
+        "published_coverage": {
+            **published,
+            "total": {
+                "acquired": acquired_total,
+                "published": 1356,
+                "unavailable": max(0, 1356 - acquired_total),
+            },
+            "status": "INCOMPLETE" if acquired_total < 1356 else "COMPLETE",
+        },
+        "atlas_svgs": {"observed": len(svg_rows), "expected": EXPECTED_SVGS},
+        "graphic_groups": group_stats,
+        "ontology": {
+            "structures": len(structures),
+            "svg_unique_structure_ids": len(set().union(*group_ids.values())),
+            "unresolved_references": len(unresolved_ids),
+        },
+        "plate_mappings": {"observed": mappings, "expected": EXPECTED_SVGS},
+        "checksum_failures": checksum_failures,
+        "unreadable_files": unreadable,
+        "failures": failures,
+    }
 
-    save_standard_metadata(
-        paths,
-        nissl,
-        ihc,
-        annotations,
-        specimen_id=args.specimen_id,
-        atlas_id=args.atlas_id,
-        atlas_image_type=args.atlas_image_type,
-        groups=args.groups,
-        downsample=args.downsample,
-        image_download_mode=args.image_download_mode,
-        image_files=image_files,
-    )
 
-    nissl = list(_limited(nissl, args.limit))
-    ihc = list(_limited(ihc, args.limit))
-    annotations = list(_limited(annotations, args.limit))
+def print_validation(report: Mapping[str, Any]) -> None:
+    api = report.get("api_acquisition", {})
+    if api:
+        print("API acquisition")
+        for series in SERIES_LABELS:
+            row = api[series]
+            print(
+                f"{SERIES_LABELS[series]:<24}{row['observed']:>5} / {row['expected']}"
+            )
+        row = api["total"]
+        print(f"{'API histology total':<24}{row['observed']:>5} / {row['expected']}")
+        print(
+            f"{'Status':<24}{'PASS' if all(api[s]['observed'] == api[s]['expected'] for s in SERIES_LABELS) else 'FAIL'}"
+        )
+        print("\nPublished coverage")
+        coverage = report["published_coverage"]
+        for series in SERIES_LABELS:
+            row = coverage[series]
+            print(
+                f"{SERIES_LABELS[series]:<24}{row['acquired']:>5} / {row['published']:<4} unavailable {row['unavailable']}"
+            )
+        row = coverage["total"]
+        print(
+            f"{'Published total':<24}{row['acquired']:>5} / {row['published']:<4} unavailable {row['unavailable']}"
+        )
+        print(f"{'Status':<24}{coverage['status']}")
+        print(
+            f"\n{'Atlas SVGs':<24}{report['atlas_svgs']['observed']:>5} / {report['atlas_svgs']['expected']}"
+        )
+        for gid in GROUPS:
+            stats = report["graphic_groups"][str(gid)]
+            print(
+                f"Group {gid:<17}{stats['plates_present']:>5} plates, {stats['structure_paths']} paths, {stats['unique_structure_ids']} IDs"
+            )
+        ontology = report["ontology"]
+        print(
+            f"{'Ontology IDs resolved':<24}{ontology['svg_unique_structure_ids'] - ontology['unresolved_references']:>5} / {ontology['svg_unique_structure_ids']}"
+        )
+        print(
+            f"{'Plate mappings':<24}{report['plate_mappings']['observed']:>5} / {report['plate_mappings']['expected']}"
+        )
+        print(f"{'Checksum failures':<24}{report['checksum_failures']:>5}")
+        print(f"{'Unreadable files':<24}{report['unreadable_files']:>5}")
+    for item in report.get("failures", []):
+        print(f"FAIL [{item['category']}] {item['affected']}")
+        print(f"  expected: {item['expected']}")
+        print(f"  observed: {item['observed']}")
+        print(f"  corrective action: {item['corrective_action']}")
+    print(f"{'Status':<24}{report['status']}")
 
-    if args.metadata_only:
+
+def migrate_superseded_metadata(paths: Paths, run_id: str) -> None:
+    sources = [
+        paths.metadata / name
+        for name in ("sections.tsv", "atlas_annotations.tsv", "image_files.tsv")
+    ]
+    sources = [path for path in sources if path.exists()]
+    if not sources:
         return
+    destination = paths.root / "quarantine" / run_id / "superseded_metadata"
+    destination.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        os.replace(source, destination / source.name)
 
+
+def selected_series(
+    args: argparse.Namespace, records: Mapping[str, Sequence[Section]]
+) -> list[str]:
+    requested = args.series
+    if args.stains:
+        if requested:
+            raise RuntimeError(
+                "Use either --series or the deprecated --stains alias, not both"
+            )
+        requested = ["pv" if value == "ihc" else value for value in args.stains]
+        LOG.warning("--stains is deprecated; use --series nissl pv")
+    available = [series for series in SERIES_LABELS if records[series]]
+    chosen = available if not requested else list(dict.fromkeys(requested))
+    unavailable = [series for series in chosen if not records[series]]
+    if unavailable:
+        if unavailable == ["smi32"]:
+            raise RuntimeError(
+                f"SMI-32 is unavailable from accepted providers: no qualifying official source was found in the bounded search on {DISCOVERY_DATE}. "
+                "Provide and review an authoritative donor/treatment/section-identified source before acquisition."
+            )
+        raise RuntimeError(f"Unavailable requested series: {', '.join(unavailable)}")
+    return chosen
+
+
+def run_acquisition(args: argparse.Namespace) -> int:
+    paths = Paths.make(args.data_dir)
+    if args.validate_only:
+        report = validate_dataset(paths)
+        print_validation(report)
+        if args.validation_json:
+            text = json.dumps(report, indent=2) + "\n"
+            if str(args.validation_json) == "-":
+                print(text, end="")
+            else:
+                atomic_text(Path(args.validation_json).expanduser().resolve(), text)
+        return 0 if report["status"] == "PASS" else 1
+
+    session = build_session(retries=args.retries, backoff_factor=args.retry_backoff)
+    records, observed = AllenSectionDataSetProvider(session).discover(SPECIMEN_ID)
+    stored = load_stored_inventory(paths)
+    gate_inventory(
+        stored, observed, args.inventory_json, args.accept_api_inventory_sha256
+    )
+    accepted = observed if args.accept_api_inventory_sha256 else stored
+    chosen = selected_series(args, records)
+    atlas_info, raw_plates = AllenAtlasPlateProvider(session).discover()
+    cached = legacy_plate_mappings(paths)
+    filenames = (
+        {
+            opt_int(path.stem.rsplit("_", 1)[-1])
+            for path in paths.image_dir("nissl").glob("*.jpg")
+        }
+        if paths.image_dir("nissl").is_dir()
+        else set()
+    )
+    plates = resolve_mappings(
+        raw_plates, records["nissl"], cached, {x for x in filenames if x is not None}
+    )
+    if any(item.mapping_status in {"filename_only", "unresolved"} for item in plates):
+        raise RuntimeError(
+            "One or more atlas plates lack a metadata-derived Nissl mapping"
+        )
+
+    paths.create(series for series in SERIES_LABELS if records[series])
+    artifacts = scan_existing(paths, records, plates, args.downsample)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    provider = AllenStructureGraphProvider(session)
     if not args.skip_downloads:
-        if "nissl" in args.stains:
-            if not args.annotations_only:
-                for ordinal, record in enumerate(nissl, start=1):
-                    LOGGER.info("NISSL section %d/%d", ordinal, len(nissl))
-                    destination = (
-                        paths.nissl_images / f"image_{record.section_number:04d}.jpg"
-                    )
-                    relative_path = destination.relative_to(paths.data_dir).as_posix()
-                    observed = download_image(
-                        session,
-                        record,
-                        destination,
-                        data_dir=paths.data_dir,
-                        downsample=args.downsample,
-                        image_download_mode=args.image_download_mode,
-                        overwrite=args.overwrite,
-                        verify_existing=args.verify_existing,
-                        prior_record=image_files.get(relative_path),
-                    )
-                    image_files[relative_path] = observed
-                    save_image_file_manifest(paths, image_files)
+        ontology = acquire_ontology(provider, paths, artifacts, args.overwrite, run_id)
+        artifacts[ontology.path] = ontology
+    elif not paths.ontology.is_file():
+        raise RuntimeError("--skip-downloads requires an existing raw ontology")
+    structures = flatten_ontology(parse_ontology(paths.ontology.read_bytes()))
 
-            for ordinal, record in enumerate(annotations, start=1):
-                LOGGER.info("ATLAS SVG %d/%d", ordinal, len(annotations))
-                download_atlas_svg(
-                    session,
-                    record,
-                    paths.nissl_labels / f"seg_{record.section_number:04d}.svg",
-                    groups=args.groups,
-                    overwrite=args.overwrite,
-                )
+    if not args.skip_downloads and not args.metadata_only and not args.annotations_only:
+        work = [item for series in chosen for item in records[series]]
+        if args.limit is not None:
+            work = work[: args.limit]
+        for index, section in enumerate(work, 1):
+            artifact = acquire_image(
+                session,
+                paths,
+                section,
+                artifacts,
+                args.downsample,
+                args.image_download_mode,
+                args.overwrite,
+                run_id,
+            )
+            artifacts[artifact.path] = artifact
+            if index % 25 == 0:
+                save_manifest(paths.manifest, artifacts)
+        svg_work = list(plates)
+        if args.limit is not None:
+            svg_work = svg_work[: args.limit]
+        for index, plate in enumerate(svg_work, 1):
+            artifact = acquire_svg(
+                session, paths, plate, artifacts, args.overwrite, run_id
+            )
+            artifacts[artifact.path] = artifact
+            if index % 25 == 0:
+                save_manifest(paths.manifest, artifacts)
+    elif args.annotations_only and not args.skip_downloads:
+        svg_work = (
+            list(plates)[: args.limit] if args.limit is not None else list(plates)
+        )
+        for plate in svg_work:
+            artifact = acquire_svg(
+                session, paths, plate, artifacts, args.overwrite, run_id
+            )
+            artifacts[artifact.path] = artifact
 
-        if "ihc" in args.stains and not args.annotations_only:
-            for ordinal, record in enumerate(ihc, start=1):
-                LOGGER.info("IHC section %d/%d", ordinal, len(ihc))
-                destination = (
-                    paths.ihc_images / f"image_{record.section_number:04d}.jpg"
-                )
-                relative_path = destination.relative_to(paths.data_dir).as_posix()
-                observed = download_image(
-                    session,
-                    record,
-                    destination,
-                    data_dir=paths.data_dir,
-                    downsample=args.downsample,
-                    image_download_mode=args.image_download_mode,
-                    overwrite=args.overwrite,
-                    verify_existing=args.verify_existing,
-                    prior_record=image_files.get(relative_path),
-                )
-                image_files[relative_path] = observed
-                save_image_file_manifest(paths, image_files)
-
-    save_standard_metadata(
-        paths,
-        nissl,
-        ihc,
-        annotations,
-        specimen_id=args.specimen_id,
-        atlas_id=args.atlas_id,
-        atlas_image_type=args.atlas_image_type,
-        groups=args.groups,
-        downsample=args.downsample,
-        image_download_mode=args.image_download_mode,
-        image_files=image_files,
+    save_structures(paths.structures, structures)
+    write_legacy_exports(
+        paths, records, plates, args.downsample, args.image_download_mode
     )
-
-    if args.annotations_only:
-        return
-
     if not args.skip_masks:
-        if "nissl" in args.stains:
-            generate_masks(
-                nissl,
-                image_dir=paths.nissl_images,
-                mask_dir=paths.nissl_masks,
-                stain="nissl",
-                overwrite=args.overwrite,
-            )
-        if "ihc" in args.stains:
-            generate_masks(
-                ihc,
-                image_dir=paths.ihc_images,
-                mask_dir=paths.ihc_masks,
-                stain="ihc",
-                overwrite=args.overwrite,
-            )
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Download Allen specimen 708424 Nissl/IHC sections, annotations, "
-            "and MATLAB-equivalent tissue masks."
-        )
-    )
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=Path("./allen_downloads"),
-        help="Output root (default: ./allen_downloads).",
-    )
-    parser.add_argument(
-        "--specimen-id",
-        type=int,
-        default=DEFAULT_SPECIMEN_ID,
-        help=f"Allen specimen ID (default: {DEFAULT_SPECIMEN_ID}).",
-    )
-    parser.add_argument(
-        "--atlas-id",
-        type=int,
-        default=DEFAULT_ATLAS_ID,
-        help=(
-            "2-D Allen atlas whose AtlasImage SVG annotations are downloaded "
-            f"(default: {DEFAULT_ATLAS_ID}, Modified Brodmann)."
+        create_masks(paths, artifacts, chosen)
+    save_manifest(paths.manifest, artifacts)
+    atomic_json(
+        paths.dataset,
+        dataset_payload(
+            accepted, atlas_info, args.image_download_mode, args.downsample, artifacts
         ),
     )
-    parser.add_argument(
-        "--atlas-image-type",
-        default=DEFAULT_ATLAS_IMAGE_TYPE,
-        help=(
-            "Allen AlternateImage.image_type used to select the atlas's annotated "
-            f"plates (default: {DEFAULT_ATLAS_IMAGE_TYPE!r}). Change this together "
-            "with --atlas-id and --groups when selecting another 2-D atlas."
-        ),
+    if args.limit is None:
+        preliminary = validate_dataset(paths, allow_superseded=True)
+        if preliminary["status"] != "PASS":
+            print_validation(preliminary)
+            return 1
+        migrate_superseded_metadata(paths, run_id)
+        report = validate_dataset(paths)
+        print_validation(report)
+        return 0 if report["status"] == "PASS" else 1
+    print(
+        "Limited run complete; canonical expected counts were not truncated. Run --validate-only after completing acquisition."
     )
-    parser.add_argument(
-        "--groups",
-        type=lambda text: tuple(int(item) for item in text.split(",") if item),
-        default=DEFAULT_GROUPS,
-        help="Comma-separated SVG graphic-group IDs.",
-    )
-    parser.add_argument(
-        "--downsample",
-        type=int,
-        default=DEFAULT_DOWNSAMPLE,
-        help=(
-            "Effective -log2 image downsample (default: 5, nominally 32 µm/pixel "
-            "for 1 µm/pixel source images)."
-        ),
-    )
-    parser.add_argument(
-        "--image-download-mode",
-        choices=("allen-direct", "matlab-compatible"),
-        default=DEFAULT_IMAGE_DOWNLOAD_MODE,
-        help=(
-            "allen-direct requests the final Allen pyramid level and preserves the "
-            "returned JPEG bytes; matlab-compatible reproduces the original "
-            "3DHiResT request-one-level-higher plus local bicubic resize "
-            f"(default: {DEFAULT_IMAGE_DOWNLOAD_MODE})."
-        ),
-    )
-    parser.add_argument(
-        "--stains",
-        nargs="+",
-        choices=("nissl", "ihc"),
-        default=("nissl", "ihc"),
-        help="Stains to process (default: nissl ihc).",
-    )
-    parser.add_argument(
-        "--refresh-metadata",
-        action="store_true",
-        help="Ignore cached secInfo.json/secInfo.mat and query the API again.",
-    )
-    parser.add_argument(
-        "--metadata-only",
-        action="store_true",
-        help="Query/load and save metadata, but do not download images or make masks.",
-    )
-    parser.add_argument(
-        "--annotations-only",
-        action="store_true",
-        help=(
-            "Download only the selected atlas's SVG annotations. Section JPEGs "
-            "and tissue masks are not processed."
-        ),
-    )
-    parser.add_argument(
-        "--skip-downloads",
-        action="store_true",
-        help="Do not download images/SVGs; useful when files already exist.",
-    )
-    parser.add_argument(
-        "--skip-masks",
-        action="store_true",
-        help="Do not generate masks.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace existing images, SVGs, and masks.",
-    )
-    parser.add_argument(
-        "--verify-existing",
-        action="store_true",
-        help=(
-            "For existing JPEGs in allen-direct mode, redownload the corresponding "
-            "Allen response and verify an exact byte match without replacing the file. "
-            "This is intended for adopting a small number of pre-existing files into "
-            "the provenance manifest."
-        ),
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help=(
-            "Process only the first N Nissl sections, IHC sections, and atlas "
-            "annotation plates (testing aid)."
-        ),
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=5,
-        help="HTTP retries for transient errors (default: 5).",
-    )
-    parser.add_argument(
-        "--backoff",
-        type=float,
-        default=1.0,
-        help="HTTP retry backoff factor in seconds (default: 1.0).",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        default="INFO",
-        help="Logging verbosity (default: INFO).",
-    )
-    args = parser.parse_args(argv)
-    if args.downsample < 0:
-        parser.error("--downsample must be non-negative")
-    if args.verify_existing and args.overwrite:
-        parser.error("--verify-existing and --overwrite are mutually exclusive")
-    if args.verify_existing and args.image_download_mode != "allen-direct":
-        parser.error("--verify-existing currently requires --image-download-mode allen-direct")
-    if args.image_download_mode == "matlab-compatible" and args.downsample < 1:
-        parser.error(
-            "--image-download-mode matlab-compatible requires --downsample >= 1"
-        )
-    if args.limit is not None and args.limit < 1:
-        parser.error("--limit must be positive")
-    if not args.groups:
-        parser.error("--groups must contain at least one integer")
-    if args.metadata_only and args.annotations_only:
-        parser.error("--metadata-only and --annotations-only cannot be combined")
-    if args.annotations_only and args.skip_downloads:
-        parser.error("--annotations-only and --skip-downloads cannot be combined")
-    if args.annotations_only and "nissl" not in args.stains:
-        parser.error("--annotations-only requires nissl in --stains")
-    return args
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-    try:
-        run(args)
-    except KeyboardInterrupt:
-        LOGGER.error("Interrupted")
-        return 130
-    except Exception:
-        LOGGER.exception("Failed")
-        return 1
     return 0
 
 
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--data-dir", type=Path, required=True)
+    result.add_argument("--series", nargs="+", choices=tuple(SERIES_LABELS))
+    result.add_argument(
+        "--stains", nargs="+", choices=("nissl", "ihc"), help=argparse.SUPPRESS
+    )
+    result.add_argument("--downsample", type=int, default=5)
+    result.add_argument(
+        "--image-download-mode",
+        choices=("allen-direct", "matlab-compatible"),
+        default="allen-direct",
+    )
+    result.add_argument("--metadata-only", action="store_true")
+    result.add_argument("--annotations-only", action="store_true")
+    result.add_argument("--skip-downloads", action="store_true")
+    result.add_argument("--skip-masks", action="store_true")
+    result.add_argument("--overwrite", action="store_true")
+    result.add_argument(
+        "--verify-existing", action="store_true", help=argparse.SUPPRESS
+    )
+    result.add_argument("--limit", type=int)
+    result.add_argument("--inventory-json", type=Path)
+    result.add_argument("--accept-api-inventory-sha256")
+    result.add_argument("--validate-only", action="store_true")
+    result.add_argument("--validation-json")
+    result.add_argument("--retries", type=int, default=5)
+    result.add_argument("--retry-backoff", type=float, default=0.75)
+    result.add_argument(
+        "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO"
+    )
+    return result
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    if args.limit is not None and args.limit < 1:
+        raise SystemExit("--limit must be positive")
+    if args.validate_only and any(
+        (
+            args.series,
+            args.stains,
+            args.accept_api_inventory_sha256,
+            args.metadata_only,
+            args.annotations_only,
+            args.skip_downloads,
+            args.overwrite,
+        )
+    ):
+        raise SystemExit("--validate-only cannot be combined with acquisition options")
+    try:
+        return run_acquisition(args)
+    except APIInventoryChanged:
+        return 3
+    except (OSError, RuntimeError, requests.RequestException) as exc:
+        LOG.error("%s", exc)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
