@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "logical_edge": {
+    "source_space": "HIST_SYMMETRIC",
+    "source_view": "HIST_ALL",
+    "target_space": "MRI_7T_WHOLE",
+    "target_contrast": "7T_T1",
+    "direction": "source_to_target"
+  },
+  "algorithm_adapter": {
+    "I": "MRI_7T_WHOLE/7T_T1",
+    "I_role": "graph_target",
+    "J": "HIST_SYMMETRIC/HIST_ALL",
+    "J_role": "graph_source"
+  },
+  "algorithm_coordinate_units": "micrometer",
+  "mri_coordinate_adapter": "provenance_affine_mm_to_separable_EM-LDDMM_um",
+  "inputs": {
+    "prepared_histology": "data/derivatives/allen/specimen_708424/emlddmm_7t_symmetric",
+    "mri_provenance": "data/derivatives/allen/specimen_708424/mri_7t_whole/mri_provenance.json",
+    "mri_template": "data/derivatives/allen/specimen_708424/mri_7t_whole/T1_rot_space-MRI_7T_WHOLE_desc-header-corrected.nii",
+    "mri_template_sha256": "0328d701118cd4c60616cea67dba413e82b28b7c0d41e55b7bfda655d989177d"
+  },
+  "initial_transform": {
+    "type": "similitude",
+    "path": null,
+    "status": "required_before_registration",
+    "physical_coordinate_initialization": true,
+    "initial_midlines_must_coincide": false
+  },
+  "emlddmm_parameter_file": "configs/emlddmm/allen_708424_mri7t_to_hist_all_full.json",
+  "multiscale_sequence": [
+    "physical_coordinate_initialization",
+    "rigid_or_similitude_alignment",
+    "sectionwise_rigid_correction",
+    "diffeomorphic_refinement"
+  ],
+  "missing_data_background_model": {
+    "physical_lattice_rows": 2846,
+    "absent_sections_retained": true,
+    "valid_image_support": "pinned_EM-LDDMM_W0",
+    "hemisphere_origin_mask": "retained_provenance_not_default_exclusion",
+    "bilateral_intensities_contribute_by_default": true,
+    "reflected_right_is_independent_biological_evidence": false
+  },
+  "output_directory": "results/allen/specimen_708424/emlddmm/HIST_SYMMETRIC_to_MRI_7T_WHOLE/7T_T1",
+  "reconstruction_requests": [
+    {
+      "payload": "HIST_ALL",
+      "source_space": "HIST_SYMMETRIC",
+      "target_space": "MRI_7T_WHOLE",
+      "sampling": "continuous"
+    },
+    {
+      "payload": "bilateral_annotations",
+      "source_space": "HIST_SYMMETRIC",
+      "target_space": "MRI_7T_WHOLE",
+      "sampling": "categorical_nearest_neighbor",
+      "preserve_hemisphere_origin": true
+    },
+    {
+      "payload": "hemisphere_origin_mask",
+      "source_space": "HIST_SYMMETRIC",
+      "target_space": "MRI_7T_WHOLE",
+      "sampling": "categorical_nearest_neighbor"
+    }
+  ],
+  "additional_histology_views": [
+    "HIST_NISSL",
+    "HIST_PV"
+  ],
+  "annotations_drive_registration": false,
+  "synthetic_mri_required": false,
+  "registration_execution_enabled": false
+}

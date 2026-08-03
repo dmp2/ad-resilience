@@ -1,0 +1,358 @@
+# Allen 708424 direct-7T mixed-stain EM-LDDMM audit
+
+## Current verdict
+
+Input preparation passes. Registration remains blocked.
+
+The implemented primary formulation is:
+
+```text
+MRI7T/<verified-source-basename>
+    ->
+HIST_ALL/mixed
+```
+
+`HIST_ALL` contains 641 Nissl and 287 PV/parvalbumin sections on one
+physical cutting lattice. The registration has one global 3-D deformation,
+one rigid transform per serial-section slot, and per-section linear contrast
+prediction. Nissl and PV will be reconstructed as separate MRI-space
+intensity products.
+
+The direct MRI gate is still closed. The archive is present and the
+acquisition literature reports 200-um isotropic 7T multi-echo FLASH, but the
+MGZ and LTA headers report 1-mm voxels. No archive member is authorized as the
+registration target until that discrepancy and any raw-to-rotated transform
+are verified with provenance.
+
+External tissue masks are intentionally omitted. The pinned loader supplies
+`W0` for image support versus padding, and EM-LDDMM internally estimates the
+matching, artifact, and background responsibilities (`WM`, `WA`, and `WB`).
+
+## Frozen sources and implementation pins
+
+| Source | Pin or digest | Role |
+|---|---|---|
+| Frozen Allen manifest | `85332e61122dbfc0eeb38023338b86996b9aedbfc9bf1316d81f4a8c5e6d3de58` | Section identity, dimensions, spacing, URLs, and source hashes |
+| Allen structures | `b12afeed3e1f11b7ee6aced03cd7f7875b103d5984d168c0fcca50235fa6da57` | Later Nissl annotation interpretation |
+| EM-LDDMM | `864990e0619fcdfb3e22e05298291f439f1b6f3d` | Loader, support, mixture model, optimization, and output writers |
+| WSI tissue pipeline | `d4d118a47d08700c8c30cf852b855e14e411bbdf` | Preparation/registration orchestration patterns |
+
+The runtime fails if the adjacent EM-LDDMM checkout differs from the pinned
+commit.
+
+## Raw histology inventory
+
+The frozen manifest contains:
+
+| Stain | Images | Section-number range | Typical retained interval |
+|---|---:|---:|---:|
+| Nissl | 641 | 39-2881 | 200 um |
+| PV/parvalbumin (`ihc/images_orig`) | 287 | 36-2880 | 400 um |
+
+Nissl and PV occupy 928 distinct section numbers; there are no same-slot
+collisions. Source in-plane spacings are approximately 31 um, with one Nissl
+outlier at 34.88 um. Source images and checksums remain unchanged.
+
+## Physical cutting lattice
+
+Allen `section_number` is the physical serial index. The official Allen API
+maps section number through dataset section thickness, and Ding et al. report
+50-um cutting with every fourth section normally retained for Nissl.
+
+The implemented z domain uses one centered serial cutting coordinate:
+
+```text
+minimum_slot   = 36
+maximum_slot   = 2881
+number_of_slots    = 2846
+physical_index     = allen_section_number - 36
+serial_z_center_mm = (allen_section_number - 1458.5) * 0.05
+```
+
+The first and last centers are -71,125 and +71,125 um. Absent observations do
+not compress the axis. The center span is 142.25 mm and the theoretical
+outer-face span is 142.30 mm. Full `samples.tsv` files and the z axis each
+contain exactly 2,846 positionally corresponding entries. The 200-um Nissl and
+400-um PV values are nominal observation-series intervals, not row pitch.
+
+The canonical table is the derivative's
+`metadata/physical_sections.tsv`; `prepare_allen_emlddmm_inputs` is its sole
+writer and `build_allen_emlddmm_lattice` is a read-only validator.
+
+## Implemented 200-um preparation
+
+The complete derivative is under:
+
+```text
+data/derivatives/allen/specimen_708424/emlddmm_7t/
+```
+
+The preparation command:
+
+```bash
+PYTHONPATH=src conda run -n pylddmm_env3.10 \
+  python -m preprocess.prepare_allen_emlddmm_inputs \
+  --data-dir data/raw/allen/specimen_708424 \
+  --series all
+```
+
+produced and reverified:
+
+| View | Rows | Present | Absent |
+|---|---:|---:|---:|
+| `HIST_ALL` | 2,846 | 928 | 1,918 |
+| `HIST_NISSL` | 2,846 | 641 | 2,205 |
+| `HIST_PV` | 2,846 | 287 | 2,559 |
+
+Images are antialiased, origin-preserving, lossless uint8 RGB TIFF derivatives
+at 200 um in plane. Every resampled section is placed at pixel `[0, 0]` of one
+shared canvas, preserving the source-frame displacement between adjacent
+sections. The canvas is translated once as a volume; sections are never
+translated to their individual centers. A per-image JSON records the exact
+prepared-to-source and source-to-prepared pixel transforms, the content shape,
+the common canvas shape, and the global translation. Raw JPEGs are never
+modified.
+
+Final `samples.tsv` files are written directly from the physical table. All
+retain the loader columns `sample_id`, `participant_id`, `species`, and `status`
+first; `HIST_ALL` appends canonical Allen section provenance and serial geometry.
+Participant is `708424`, species is `Homo sapiens`, and status is only
+`present` or `absent`. Absent rows have deterministic identifiers but no image
+or sidecar.
+
+Sidecars are generated by pinned `histsetup.generate_sidecars()` through an
+assertion-only adapter. Because every prepared TIFF has the same common canvas,
+every sidecar contains the same in-plane size and origin:
+
+```text
+Sizes           = [3, 365, 522, 1]
+SpaceUnits      = [um, um, um]
+SpaceDirections = [none, diag(200, 200, 50)]
+x origin        = -(365 - 1) * 200 / 2 = -36,400 um
+y origin        = -(522 - 1) * 200 / 2 = -52,100 um
+z origin        = centered canonical cutting coordinate
+```
+
+The adapter validates these values against the loader's reversed spatial-axis
+interpretation.
+
+## Common-canvas audit
+
+Pinned `load_slices()` uses:
+
+```python
+(quantile(section_sizes, 0.95, axis=0) * 1.01).astype(int)
+```
+
+rather than the maximum section dimensions. On the real 200-um preparation:
+
+| Domain | Height | Width |
+|---|---:|---:|
+| Loader automatic canvas | 478 | 340 |
+| Maximum prepared domain | 522 | 365 |
+| Accepted explicit canvas | 522 | 365 |
+
+The automatic domain fails: relative to the common pixel origin, the worst
+margins are -8,800 um in y and -5,000 um in x. The workflow therefore embeds
+every image in the explicit 522-by-365 common domain and passes its globally
+translated `xJ` through pinned upstream `load_slices()`. The pinned loader
+ignores per-image x/y `SpaceOrigin` and centers its input array; using one array
+shape and one content origin turns that behavior into a single volume-wide
+translation instead of 928 section-wise translations. Interpolation and `W0`
+remain upstream behavior.
+
+The real 30-slot pilot inputs use unchanged canonical coordinates for slots
+1448-1477. The pinned loader passed all three views with identical
+`3 x 30 x 461 x 353` image arrays and 30-entry z axes:
+
+| Pilot view | Present | Absent |
+|---|---:|---:|
+| `HIST_ALL` | 12 | 18 |
+| `HIST_NISSL` | 8 | 22 |
+| `HIST_PV` | 4 | 26 |
+
+The complete 2,846-row combined and stain-specific views also load through the
+pinned loader using the accepted explicit domain.
+
+## Exact support and mixture behavior
+
+`W0` is intended as technical support for loaded image content versus
+artificial padding. Operationally, at the pinned commit, `load_slices()` sets
+it from `first_loaded_channel > 0` after interpolation. This is not anatomical
+tissue segmentation.
+
+The preparation reports the fraction of valid prepared pixels whose first
+channel is exactly zero. For the current derivatives:
+
+| Stain | Valid prepared pixels | First-channel zeros | Fraction |
+|---|---:|---:|---:|
+| Nissl | 73,608,187 | 0 | 0 |
+| PV | 31,363,637 | 0 | 0 |
+| Combined | 104,971,824 | 0 | 0 |
+
+This is a diagnostic only. No positive offset, support replacement, tissue
+threshold, or external mask is applied.
+
+The core initializes and updates:
+
+```text
+WM  matching-class posterior responsibility
+WA  artifact-class posterior responsibility
+WB  background-class posterior responsibility
+```
+
+These are upstream Gaussian-mixture quantities. Project code only retains and
+checks their finite values in the short pilot.
+
+## Contrast and multiscale semantics
+
+For a direct `emlddmm()` call, per-section global linear contrast uses:
+
+```python
+slice_matching = True
+order = 1
+local_contrast = []
+```
+
+For `emlddmm_multiscale()`, the implemented argument is:
+
+```python
+slice_matching = True
+order = 1
+local_contrast = [[]]
+```
+
+The wrapper unwraps the one-element scale list and passes `[]` to the core.
+The pinned core reshapes the contrast basis by slice and solves independent
+coefficients with shape `slice x basis x target-channel`. The stock graph
+runner hard-codes `full_outputs=False`, so the bounded project runner calls the
+same core with `full_outputs=True` only for pilot inspection.
+
+The pilot schedule preserves z and evaluates approximately 800, 400, and
+200 um in plane:
+
+```text
+downI = [[4,4,4], [2,2,2], [1,1,1]]
+downJ = [[1,4,4], [1,2,2], [1,1,1]]
+n_iter = [100,50,25]
+```
+
+Full registration uses `full_outputs=False` and `n_draw=0`; voxelwise mixture
+arrays are not retained across the 2,846-slot stack.
+
+## Multiple modalities versus joint registration
+
+The EM-LDDMM core supports multichannel and multimodal contrast prediction.
+The transformation graph supports multiple named images per space. The stock
+graph runner nevertheless executes each registration tuple as a separate
+optimization and does not automatically define a joint multi-image objective.
+
+`HIST_ALL` obtains one joint geometric estimate by representing every observed
+Nissl and PV section as one serial dataset and using independent per-section
+contrast fitting. The official mouse example does not demonstrate this
+mixed-stain formulation, so the real bounded pilot remains mandatory.
+
+Fallback runs use distinct spaces and output roots:
+
+```text
+MRI7T/<source> -> HIST_NISSL/nissl
+MRI7T/<source> -> HIST_PV/pv
+```
+
+No graph edge may overwrite another registration.
+
+## Direct MRI audit and gate
+
+The direct archive contains:
+
+```text
+flash20, flash40, flash60, flash80
+PD, T1, T2star
+rotated variants, sequence LTAs, registration files, rotation.lta, mask.mgz
+```
+
+Basenames are identifiers only. The workflow does not label an image `T2w` or
+infer echo time, weighting, or quantitative contrast from a filename.
+
+Published evidence supports:
+
+```text
+acquisition_family      multi-echo FLASH
+field_strength_t        7
+reported_resolution_um  [200, 200, 200]
+```
+
+The raw MGZ volumes are `960 x 840 x 640`; rotated volumes are
+`948 x 1137 x 1019`. Their stored voxel sizes are 1 mm. The archived LTAs also
+describe 1-mm source/destination geometries. The implemented provenance file
+[`allen_708424_mri_source.json`](../configs/allen_708424_mri_source.json) is
+therefore deliberately `blocked`.
+
+Once verified, the MRI adapter will create exactly one input named:
+
+```text
+inputs/mri/<source-stem>_space-EMLDDMM.vtk
+```
+
+It preserves source identity and checksum, canonicalizes only axis
+permutation/flipping without an arbitrary landmark translation, assigns the
+verified 200-um spacing, centers every coordinate axis with the upstream
+convention, and records the source-to-derivative relationship. Oblique data
+are refused unless a verified resampling transform is supplied.
+
+## Registration and annotation gates
+
+| Gate | Status | Evidence/action |
+|---|---|---|
+| Mixed physical table and prepared inputs | Pass | 2,846 rows; 928 present; all hashes reverified |
+| Global-canvas translation and axis semantics | Pass | One shared canvas/origin; generated by pinned histsetup and asserted |
+| Canvas without cropping | Pass with explicit domain | Automatic domain fails; 522 x 365 maximum domain selected |
+| Full and bounded loader support | Pass | Present/absent `W0` behavior validated through pinned loader |
+| Direct MRI identity and 200-um geometry | **Fail/stop** | 1-mm archive metadata is not yet reconciled with acquisition provenance |
+| Centered MRI VTK derivative | Blocked | Requires the preceding verified source decision |
+| Coarse initialization | Blocked | Requires verified MRI derivative |
+| Mixed-stain optimization pilot | Blocked | Requires verified MRI and reviewed initialization |
+| Full registration | Not authorized | Requires accepted mixed pilot and memory preflight |
+
+Before label transport, a separate point/categorical direction test must
+verify source pixel to MRI physical coordinate, the inverse, transform filename
+semantics, nearest-neighbor uint32 preservation, and finite observed-section
+support. Annotation support code is isolated from intensity `W0`.
+
+The runner enforces the initialization gate with a finite 4x4 text matrix and
+a same-stem JSON record whose source basename, target view, matrix checksum,
+and `review_status=accepted` all agree. It also refuses nonempty registration
+output roots so a later run cannot overwrite an earlier graph edge.
+
+## Implemented commands
+
+```bash
+# Complete preparation
+bash scripts/run_allen_emlddmm.sh prepare
+
+# Bounded slots 1448-1477
+bash scripts/run_allen_emlddmm.sh prepare-pilot
+
+# Reverify hashes and TSVs
+PYTHONPATH=src conda run -n pylddmm_env3.10 \
+  python -m preprocess.prepare_allen_emlddmm_inputs --verify-existing
+
+# Verify the real pinned loader without registration
+PYTHONPATH=src conda run -n pylddmm_env3.10 \
+  python -m preprocess.audit_allen_emlddmm_loader \
+  --dataset data/derivatives/allen/specimen_708424/emlddmm_7t
+
+# Inspect direct archive inventory; this does not approve a target
+PYTHONPATH=src conda run -n pylddmm_env3.10 \
+  python -m preprocess.prepare_allen_7t_mri --inventory-only
+```
+
+The pilot/full commands require the path to a verified
+`*_space-EMLDDMM.vtk`. The blocked provenance record prevents accidental use
+of an unverified source.
+
+## References
+
+- [Allen API `SectionImage`](https://api.brain-map.org/doc/SectionImage.html)
+- [Ding et al., 2016](https://pmc.ncbi.nlm.nih.gov/articles/PMC5054943/)
+- [A multi-modal human brain atlas paper describing the 200-um 7T FLASH acquisition](https://discovery.ucl.ac.uk/10041977/7/1-s2.0-S1361841518306972-main.pdf)
