@@ -28,7 +28,7 @@ validation.
 From the repository root:
 
 ```bash
-python src/preprocessing/rasterize_allen_annotations.py \
+python src/preprocess/rasterize_allen_annotations.py \
   --data-dir data/raw/allen/specimen_708424
 ```
 
@@ -46,11 +46,11 @@ empty arrays.
 Useful bounded runs include:
 
 ```bash
-python src/preprocessing/rasterize_allen_annotations.py \
+python src/preprocess/rasterize_allen_annotations.py \
   --data-dir data/raw/allen/specimen_708424 \
   --section-number 111 --write-qc
 
-python src/preprocessing/rasterize_allen_annotations.py \
+python src/preprocess/rasterize_allen_annotations.py \
   --data-dir data/raw/allen/specimen_708424 \
   --workers 4
 ```
@@ -64,7 +64,7 @@ Any raw inventory, raw manifest, or structures-table drift requires a new
 ## Read-only validation
 
 ```bash
-python src/preprocessing/rasterize_allen_annotations.py \
+python src/preprocess/rasterize_allen_annotations.py \
   --data-dir data/raw/allen/specimen_708424 \
   --verify-existing
 ```
@@ -73,6 +73,60 @@ This reads the raw and derivative files, recomputes source and package hashes,
 opens every Zarr array, and validates NGFF metadata, dimensions, physical
 spacing, codecs, label IDs, ontology properties, and manifest rows. It does not
 render, repair, update metadata, generate QC, or write files.
+
+## Visualize one section
+
+Create a compact PNG montage containing the Nissl reference, every existing
+graphic-group view, a transient combined modified-Brodmann display composite,
+and the existing magenta boundaries over Nissl:
+
+```bash
+python src/preprocess/visualize_allen_annotations.py \
+  data/derivatives/allen/specimen_708424/annotations_ome_zarr/section-0111.ome.zarr
+```
+
+By default, this writes:
+
+```text
+data/derivatives/allen/specimen_708424/annotations_ome_zarr/thumbnails/section-0111.png
+```
+
+Choose a different destination or panel width when needed:
+
+```bash
+python src/preprocess/visualize_allen_annotations.py \
+  data/derivatives/allen/specimen_708424/annotations_ome_zarr/section-0111.ome.zarr \
+  --output /tmp/section-0111-labels.png \
+  --panel-width 600
+```
+
+Use `--overwrite` to replace an existing PNG. Individual graphic-group panels
+retain their visibility-preserving label projection and are explicitly captioned
+as not using exact categorical resampling. The combined preview instead resizes
+the transient categorical composite with nearest-neighbor sampling, then draws
+symmetric black boundaries only between unequal nonzero IDs. The Nissl overlay
+retains the established native-resolution magenta-edge calculation before RGB
+resizing. No combined categorical array is persisted. Outputs are always written
+outside the OME-Zarr package so its validated contents remain unchanged.
+
+### Visualize the bilateral derivative
+
+The same command can visualize one section from the symmetric TIFF derivative
+while retaining the source OME-Zarr group ordering, titles, colors, and ontology
+IDs:
+
+```bash
+python src/preprocess/visualize_allen_annotations.py \
+  --symmetric-dataset \
+    data/derivatives/allen/specimen_708424/histology_symmetric \
+  --section-number 1532 \
+  --output results/qc/allen_symmetric_section_1532_annotations.png
+```
+
+The bilateral image and label pixels come only from `histology_symmetric`; the
+matching OME-Zarr package supplies display metadata and is opened read-only.
+Use `--annotations-zarr` only when that source derivative is in a nondefault
+location.
 
 ## Boundary and overlap semantics
 
@@ -94,7 +148,7 @@ Run this development-only gate before a full-corpus production run:
 
 ```bash
 ALLEN_SECTION111_VALIDATION=1 \
-PYTHONPATH=src/preprocessing \
+PYTHONPATH=src/preprocess \
 pytest -q src/tests/test_rasterize_allen_annotations.py \
   -k section_111_independent_cairosvg
 ```
