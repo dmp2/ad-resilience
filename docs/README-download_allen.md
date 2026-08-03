@@ -142,3 +142,22 @@ Without `--validation-json`, validation performs no network calls, directory
 creation, repair, quarantine, or timestamp update. API acquisition can pass at
 928/928 while published coverage is correctly reported as incomplete at
 928/1,356 (38 Nissl, 52 PV, and 338 SMI-32 unavailable).
+
+## Annotated-section paper audit
+
+Print a read-only terminal audit of the 106 officially acquired
+modified-Brodmann SVG plates. Local acquisition counts and the Ding et al.
+publication totals are reported as separate counting populations:
+
+```bash
+python src/preprocess/audit_allen_annotations.py \
+  --data-dir data/raw/allen/specimen_708424
+```
+
+The report verifies canonical checksums, SVG-to-Nissl mappings, graphic-group
+metadata, and every structure reference before printing aggregate, per-group,
+and per-section counts. Use `--summary-only` to omit the 106-row section table.
+It reports the local 801 distinct drawn structure IDs and 16,491 SVG `<path>`
+elements independently from the publication's 862 annotated structures and
+11,398 polygons. Comparability between those counting units is not established,
+so the audit does not calculate misleading deltas.

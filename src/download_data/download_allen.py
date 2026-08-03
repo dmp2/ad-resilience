@@ -1369,11 +1369,15 @@ def create_masks(
         if name == "smi32":
             continue
         generator = generate_nissl_mask if name == "nissl" else generate_ihc_mask
-        for item in [
-            x
-            for x in artifacts.values()
-            if x.kind == "histology_jpeg" and x.series_or_layer == name
-        ]:
+        images = sorted(
+            (
+                item
+                for item in artifacts.values()
+                if item.kind == "histology_jpeg" and item.series_or_layer == name
+            ),
+            key=lambda item: int(item.section_number or -1),
+        )
+        for ordinal, item in enumerate(images, 1):
             source = paths.root / item.path
             destination = (
                 paths.root
@@ -1383,7 +1387,8 @@ def create_masks(
             )
             if not destination.is_file():
                 with Image.open(source) as image:
-                    mask = generator(np.asarray(image.convert("RGB")))
+                    image.load()
+                    mask = generator(image, ordinal)
                 _atomic_save_pil(Image.fromarray(mask), destination, format="PNG")
             width, height = image_dimensions(destination)
             relative = destination.relative_to(paths.root).as_posix()
