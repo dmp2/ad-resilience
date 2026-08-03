@@ -38,7 +38,7 @@ from particle_utils import (
     save_particle_archive,
     summarize_nifti_geometry,
 )
-from project_config import get_named, load_config, resolve_path
+from config_setup.project_config import get_named, load_config, resolve_path
 from xmodmap_compat import (
     categorical_particles_xmodmap_native,
     entropy_numpy,

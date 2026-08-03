@@ -64,9 +64,9 @@ matplotlib.use("Agg")
 import numpy as np
 import torch
 
-from particle_utils import load_particle_archive
-from project_config import load_config, resolve_path, write_resolved_config
-from xmodmap_compat import (
+from preprocess.particle_utils import load_particle_archive
+from config_setup.project_config import load_config, resolve_path, write_resolved_config
+from preprocess.xmodmap_compat import (
     load_xmodmap,
     write_particle_vtk_xyz,
     write_vtk_xyz,
