@@ -1366,6 +1366,32 @@ def refresh_metadata(*, data_dir: Path, output_dir: Path) -> dict[str, Any]:
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def _validated_preserved_reflection_plane(
+    symmetry: dict[str, Any],
+    shape_yx: tuple[int, int],
+    origin_xy_um: tuple[float, float],
+    spacing_um: float,
+) -> float:
+    plane = symmetry.get("reflection_plane", {})
+    width = shape_yx[1]
+    expected_adjacent = [width // 2 - 1, width // 2]
+    try:
+        coordinate = float(plane["coordinate_um"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Canonical reflection coordinate is invalid") from exc
+    grid_coordinate = origin_xy_um[0] + (width / 2.0 - 0.5) * spacing_um
+    if (
+        width % 2
+        or plane.get("axis") != "x"
+        or plane.get("location") != "between_columns"
+        or plane.get("adjacent_column_indices") != expected_adjacent
+        or not np.isfinite(coordinate)
+        or not np.isclose(coordinate, grid_coordinate, atol=1e-6, rtol=0.0)
+    ):
+        raise ValueError("Canonical reflection plane is inconsistent with its grid")
+    return coordinate
+
+
 def prepare_preserved_source_grid(
     *,
     source_dataset: Path,
@@ -1406,13 +1432,9 @@ def prepare_preserved_source_grid(
         float(value) for value in symmetry["bilateral_origin_xy_um"]
     )
     expected_spacing = float(symmetry["pixel_size_um"])
-    if symmetry["reflection_plane"] != {
-        "axis": "x",
-        "coordinate_um": 0.0,
-        "location": "between_columns",
-        "adjacent_column_indices": [expected_shape[1] // 2 - 1, expected_shape[1] // 2],
-    }:
-        raise ValueError("Canonical reflection plane is inconsistent with its grid")
+    reflection_coordinate = _validated_preserved_reflection_plane(
+        symmetry, expected_shape, expected_origin, expected_spacing
+    )
 
     physical_path = source_dataset / "metadata" / "physical_sections.tsv"
     with physical_path.open(encoding="utf-8", newline="") as stream:
@@ -1426,10 +1448,22 @@ def prepare_preserved_source_grid(
         for row in source_rows
         if row["image_present"] == "true"
     )
-    if counts != Counter(EXPECTED_PRESENT):
-        raise ValueError(f"Symmetric source observation counts differ: {counts}")
-    if any(float(row["serial_pitch_um"]) != 50.0 for row in source_rows):
-        raise ValueError("Symmetric source serial pitch differs from 50 um")
+    metadata_counts = Counter(
+        {
+            stain: int(source_metadata.get(f"{stain}_count", 0))
+            for stain in EXPECTED_PRESENT
+        }
+    )
+    metadata_counts += Counter()
+    if counts != metadata_counts:
+        raise ValueError(
+            f"Symmetric source rows {counts} differ from dataset metadata "
+            f"{metadata_counts}"
+        )
+    source_coordinates = [float(row["serial_z_center_mm"]) for row in source_rows]
+    source_pitches = [float(row["serial_pitch_um"]) for row in source_rows]
+    if not np.all(np.isfinite(source_coordinates + source_pitches)):
+        raise ValueError("Symmetric source serial metadata is nonfinite")
 
     if output_dir.exists() and not overwrite:
         raise FileExistsError(
@@ -1512,11 +1546,14 @@ def prepare_preserved_source_grid(
                 stains,
                 include_provenance=view_name == "HIST_ALL",
             )
-        if view_counts != {
-            "HIST_ALL": {"present": 928, "absent": 1918},
-            "HIST_NISSL": {"present": 641, "absent": 2205},
-            "HIST_PV": {"present": 287, "absent": 2559},
-        }:
+        expected_view_counts = {}
+        for view_name, stains in VIEW_STAINS.items():
+            present = sum(counts[stain] for stain in stains)
+            expected_view_counts[view_name] = {
+                "present": present,
+                "absent": NUMBER_OF_SLOTS - present,
+            }
+        if view_counts != expected_view_counts:
             raise ValueError(f"Preserved view counts differ: {view_counts}")
 
         _write_tsv(metadata_dir / "physical_sections.tsv", rows)
@@ -1539,7 +1576,7 @@ def prepare_preserved_source_grid(
             "in_plane_placement_model": "preserved_canonical_symmetric_source_grid",
             "sectionwise_centering": False,
             "preserve_source_grid": True,
-            "reflection_plane_coordinate_um": 0.0,
+            "reflection_plane_coordinate_um": reflection_coordinate,
             "pixel_operations": [],
         }
         _atomic_json(metadata_dir / "loader_canvas_audit.json", canvas_audit)
@@ -1570,6 +1607,25 @@ def prepare_preserved_source_grid(
         raise
 
 
+def _required_preserved_view_counts(
+    rows: list[dict[str, str]],
+) -> dict[str, dict[str, int]]:
+    present_stains = Counter(
+        row["stain"] for row in rows if row["image_present"] == "true"
+    )
+    if present_stains.get("nissl", 0) != 641:
+        raise ValueError("Preserved symmetric source must contain 641 Nissl sections")
+    return {
+        view_name: {
+            "present": sum(present_stains.get(stain, 0) for stain in stains),
+            "absent": len(rows)
+            - sum(present_stains.get(stain, 0) for stain in stains),
+        }
+        for view_name, stains in VIEW_STAINS.items()
+        if any(present_stains.get(stain, 0) for stain in stains)
+    }
+
+
 def verify_preserved_source_grid(output_dir: Path) -> dict[str, Any]:
     dataset = json.loads((output_dir / "dataset.json").read_text(encoding="utf-8"))
     if dataset.get("preparation_mode") != "preserve_source_grid":
@@ -1579,6 +1635,24 @@ def verify_preserved_source_grid(output_dir: Path) -> dict[str, Any]:
         raise ValueError("Prepared reflection metadata differs from canonical source")
     symmetry = json.loads(symmetry_path.read_text(encoding="utf-8"))
     expected_shape = symmetry["bilateral_shape_yx"]
+    audit = json.loads(
+        (output_dir / "metadata" / "loader_canvas_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reflection_coordinate = _validated_preserved_reflection_plane(
+        symmetry,
+        tuple(int(value) for value in expected_shape),
+        tuple(float(value) for value in audit["global_translation_xy_um"]),
+        float(audit["target_spacing_um"]),
+    )
+    if not np.isclose(
+        float(audit["reflection_plane_coordinate_um"]),
+        reflection_coordinate,
+        atol=1e-6,
+        rtol=0.0,
+    ):
+        raise ValueError("Prepared loader audit changed the reflection coordinate")
     rows_path = output_dir / "metadata" / "physical_sections.tsv"
     with rows_path.open(encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream, delimiter="\t"))
@@ -1593,13 +1667,45 @@ def verify_preserved_source_grid(output_dir: Path) -> dict[str, Any]:
         with Image.open(path) as image:
             if list(image.size[::-1]) != expected_shape:
                 raise ValueError(f"Prepared symmetric image dimensions changed: {path}")
-    for view_name, expected in dataset["view_counts"].items():
+    required_views = _required_preserved_view_counts(rows)
+    declared_views = dataset.get("view_counts", {})
+    for view_name, expected in required_views.items():
+        if declared_views.get(view_name) != expected:
+            raise ValueError(
+                f"Prepared symmetric {view_name} declaration changed"
+            )
         samples = output_dir / "inputs" / "views" / view_name / "samples.tsv"
         with samples.open(encoding="utf-8", newline="") as stream:
-            counts = Counter(
-                row["status"] for row in csv.DictReader(stream, delimiter="\t")
+            reader = csv.DictReader(stream, delimiter="\t")
+            sample_rows = list(reader)
+            fields = list(reader.fieldnames or ())
+        if fields[:4] != ["sample_id", "participant_id", "species", "status"]:
+            raise ValueError(f"Invalid samples.tsv loader prefix for {view_name}")
+        if len(sample_rows) != len(rows):
+            raise ValueError(f"TSV/z row mismatch for {view_name}")
+        stains = VIEW_STAINS[view_name]
+        actual_counts = {"present": 0, "absent": 0}
+        for source_row, sample_row in zip(rows, sample_rows, strict=True):
+            present = (
+                source_row["image_present"] == "true"
+                and source_row["stain"] in stains
             )
-        if dict(counts) != expected:
+            expected_status = "present" if present else "absent"
+            if sample_row["status"] != expected_status:
+                raise ValueError(f"Prepared symmetric {view_name} inventory changed")
+            actual_counts[expected_status] += 1
+            if present:
+                expected_name = Path(source_row["prepared_relative_path"]).name
+                if sample_row["sample_id"] != expected_name:
+                    raise ValueError(
+                        f"Prepared symmetric {view_name} sample identity changed"
+                    )
+                view_image = samples.parent / expected_name
+                if not view_image.is_file() or not view_image.with_suffix(".json").is_file():
+                    raise FileNotFoundError(
+                        f"Missing prepared symmetric {view_name} sample: {view_image}"
+                    )
+        if actual_counts != expected:
             raise ValueError(f"Prepared symmetric {view_name} counts changed")
     return dataset
 

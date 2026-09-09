@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-import zarr
+try:
+    import zarr
+except ModuleNotFoundError:  # Pure metadata/render helpers do not require Zarr.
+    zarr = None
 from PIL import Image, ImageDraw, ImageFont
 
 

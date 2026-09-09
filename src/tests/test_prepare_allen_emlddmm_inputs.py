@@ -10,6 +10,7 @@ import pytest
 from PIL import Image
 
 from preprocess.build_allen_symmetric_histology import (
+    _registered_left_half_space,
     _symmetric_geometry,
     apply_tissue_mask,
     bilateral_union,
@@ -30,6 +31,8 @@ from preprocess.prepare_allen_emlddmm_inputs import (
     SERIAL_CENTER_EXTENT_MM,
     SERIAL_OUTER_FACE_EXTENT_MM,
     _generate_and_validate_sidecars,
+    _required_preserved_view_counts,
+    _validated_preserved_reflection_plane,
     _write_samples,
     _write_tsv,
     accepted_loader_axes,
@@ -172,6 +175,80 @@ def test_bilateral_union_is_one_observation_with_exact_reflection() -> None:
     np.testing.assert_array_equal(mask[:, :3], 1)
     np.testing.assert_array_equal(mask[:, 3:], 2)
 
+
+
+
+
+def test_nissl_only_preserved_views_are_source_derived() -> None:
+    rows = [
+        {
+            "image_present": "true" if index < 641 else "false",
+            "stain": "nissl" if index < 641 else "",
+        }
+        for index in range(NUMBER_OF_SLOTS)
+    ]
+    assert _required_preserved_view_counts(rows) == {
+        "HIST_ALL": {"present": 641, "absent": 2205},
+        "HIST_NISSL": {"present": 641, "absent": 2205},
+    }
+
+
+def test_preserved_reflection_plane_retains_nonzero_source_axis() -> None:
+    symmetry = {
+        "reflection_plane": {
+            "axis": "x",
+            "coordinate_um": 480323.0,
+            "location": "between_columns",
+            "adjacent_column_indices": [53, 54],
+        }
+    }
+    coordinate = _validated_preserved_reflection_plane(
+        symmetry, (130, 108), (436779.5, -361346.5), 813.8971962616822
+    )
+    assert coordinate == 480323.0
+    axes = accepted_loader_axes(
+        [{"allen_section_number": "36"}],
+        {
+            "accepted_canvas_shape_yx": [130, 108],
+            "target_spacing_um": 813.8971962616822,
+            "global_translation_xy_um": [436779.5, -361346.5],
+        },
+    )
+    assert axes[2][0] == 436779.5
+    np.testing.assert_allclose(axes[2][54], 480729.94859813084)
+
+def test_registered_left_half_space_snaps_edge_and_preserves_pixels() -> None:
+    source = np.arange(2 * 6 * 3, dtype=np.uint8).reshape(2, 6, 3)
+    geometry = {
+        "directions": ["none", [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+        "origin_xy": [10.0, 20.0],
+    }
+    affine = np.array(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    half = _registered_left_half_space(
+        source.shape[:2], geometry, affine, mri_midline_um=15.99
+    )
+    assert half["first_column"] == 3
+    assert half["boundary_um"] == 15.0
+    assert abs(half["boundary_discrepancy_um"]) < 1.0
+    np.testing.assert_array_equal(
+        half["column_coordinates_um"], [16.0, 18.0, 20.0]
+    )
+    retained = source[:, half["first_column"] :, :]
+    bilateral = bilateral_union(retained)
+    np.testing.assert_array_equal(bilateral[:, retained.shape[1] :], retained)
+    np.testing.assert_array_equal(bilateral[:, : retained.shape[1]], retained[:, ::-1])
+
+    with pytest.raises(ValueError, match="within half a source column"):
+        _registered_left_half_space(
+            source.shape[:2], geometry, affine, mri_midline_um=16.0
+        )
 
 def test_symmetric_grid_and_plane_are_derived_from_source_geometry() -> None:
     geometry = _symmetric_geometry(

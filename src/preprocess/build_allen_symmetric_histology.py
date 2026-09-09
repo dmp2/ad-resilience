@@ -24,15 +24,19 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-
 LOG = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_LEFT_DATASET = Path("data/derivatives/allen/specimen_708424/emlddmm_7t")
+DEFAULT_LEFT_DATASET = Path(
+    "data/derivatives/allen/specimen_708424/histology_linear_nissl"
+)
 DEFAULT_ANNOTATIONS = Path(
     "data/derivatives/allen/specimen_708424/annotations_ome_zarr"
 )
 DEFAULT_OUTPUT = Path("data/derivatives/allen/specimen_708424/histology_symmetric")
 DEFAULT_MASK_ROOT = Path("data/raw/allen/specimen_708424")
+MRI_PROVENANCE = Path(
+    "data/derivatives/allen/specimen_708424/mri_7t_whole/mri_provenance.json"
+)
 RAW_STRUCTURES = Path("data/raw/allen/specimen_708424/metadata/structures.tsv")
 EXPECTED_COUNTS = {"nissl": 641, "pv": 287}
 EXPECTED_ROWS = 2846
@@ -466,6 +470,53 @@ def _sidecar_geometry(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _registered_left_half_space(
+    source_shape_yx: tuple[int, int],
+    source_geometry: dict[str, Any],
+    affine: np.ndarray,
+    mri_midline_um: float,
+) -> dict[str, Any]:
+    """Select the established observed-left side of the registered grid."""
+
+    height, width = source_shape_yx
+    directions = source_geometry["directions"]
+    spacing = float(np.linalg.norm(directions[1]))
+    transform = np.asarray(affine, dtype=np.float64)
+    if (
+        transform.shape != (4, 4)
+        or not np.allclose(transform[2, 1:3], 0.0, atol=1e-6)
+    ):
+        raise ValueError("MRI midsagittal plane is not column-aligned in the restack")
+    if spacing <= 0.0 or not np.allclose(
+        directions[1], [spacing, 0.0, 0.0]
+    ):
+        raise ValueError("Corrected restack column direction is not increasing")
+    origin = float(source_geometry["origin_xy"][0])
+    centers = origin + np.arange(width, dtype=np.float64) * spacing
+    edges = origin + (np.arange(width + 1, dtype=np.float64) - 0.5) * spacing
+    midline = float(transform[2, 0] * mri_midline_um + transform[2, 3])
+    boundary_index = int(np.argmin(np.abs(edges - midline)))
+    discrepancy = float(edges[boundary_index] - midline)
+    if abs(discrepancy) >= spacing / 2.0:
+        raise ValueError(
+            "MRI midline is not within half a source column of a cell edge: "
+            f"{discrepancy:.6g} um ({discrepancy / spacing:.6g} pixels)"
+        )
+    if not 0 < boundary_index < width:
+        raise ValueError("MRI midline leaves no valid bilateral source half")
+    # Existing Allen/bilateral_union convention retains the source unchanged in
+    # the increasing-column half and prepends its exact reflected copy.
+    retained = centers[boundary_index:]
+    return {
+        "first_column": boundary_index,
+        "column_coordinates_um": retained,
+        "boundary_um": float(edges[boundary_index]),
+        "midline_um": midline,
+        "boundary_discrepancy_um": discrepancy,
+        "source_shape_yx": (height, len(retained)),
+    }
+
+
 def _validate_left_source(
     left_dataset: Path,
 ) -> tuple[list[dict[str, str]], list[str], dict[str, Any]]:
@@ -473,13 +524,17 @@ def _validate_left_source(
     rows, fields = _read_rows(left_dataset / "metadata" / "physical_sections.tsv")
     if len(rows) != EXPECTED_ROWS:
         raise ValueError(f"Observed derivative has {len(rows)} positions")
+    corrected = dataset.get("space_name") == "HIST_LINEAR_NISSL"
     present = [row for row in rows if row["image_present"] == "true"]
     counts = Counter(row["stain"] for row in present)
-    if counts != Counter(EXPECTED_COUNTS):
+    expected_counts = (
+        {"nissl": EXPECTED_COUNTS["nissl"]} if corrected else EXPECTED_COUNTS
+    )
+    if counts != Counter(expected_counts):
         raise ValueError(f"Observed derivative stain counts differ: {counts}")
     if [int(row["allen_section_number"]) for row in rows] != list(range(36, 2882)):
         raise ValueError("Observed derivative does not use the 2,846-row lattice")
-    if any(float(row["serial_pitch_um"]) != 50.0 for row in rows):
+    if not corrected and any(float(row["serial_pitch_um"]) != 50.0 for row in rows):
         raise ValueError("Observed derivative does not use 50-um serial pitch")
 
     expected_shape = tuple(dataset["prepared_canvas_shape_yx"])
@@ -504,11 +559,42 @@ def _validate_left_source(
             raise ValueError(f"Observed sidecar grid differs: {image_path}")
     if reference is None:
         raise ValueError("Observed derivative contains no images")
-    return rows, fields, {"dataset": dataset, "geometry": reference}
+    if corrected:
+        directions = reference["directions"]
+        spacing = float(np.linalg.norm(directions[1]))
+        if (
+            not np.allclose(directions[1], [spacing, 0.0, 0.0])
+            or not np.allclose(directions[2], [0.0, spacing, 0.0])
+        ):
+            raise ValueError("Corrected restack is not on an LR-aligned section grid")
+        audit = json.loads(
+            (left_dataset / "metadata" / "linear_restack.json").read_text()
+        )
+        affine = np.asarray(
+            audit["global_affine_mri_um_to_histology_um"], dtype=float
+        )
+        mri = json.loads((PROJECT_ROOT / MRI_PROVENANCE).read_text())
+        half_space = _registered_left_half_space(
+            expected_shape,
+            reference,
+            affine,
+            float(mri["physical_center_mm"][0]) * 1000.0,
+        )
+    else:
+        half_space = None
+    return rows, fields, {
+        "dataset": dataset,
+        "geometry": reference,
+        "corrected": corrected,
+        "half_space": half_space,
+    }
 
 
 def _symmetric_geometry(
-    source_shape_yx: tuple[int, int], source_geometry: dict[str, Any]
+    source_shape_yx: tuple[int, int],
+    source_geometry: dict[str, Any],
+    *,
+    reflection_plane_um: float = 0.0,
 ) -> dict[str, Any]:
     height, half_width = source_shape_yx
     x_direction = source_geometry["directions"][1]
@@ -518,7 +604,7 @@ def _symmetric_geometry(
     if not np.isclose(spacing_x, spacing_y) or spacing_x <= 0:
         raise ValueError("Observed source requires an isotropic valid in-plane grid")
     width = 2 * half_width
-    origin_x = -(half_width - 0.5) * spacing_x
+    origin_x = reflection_plane_um - (half_width - 0.5) * spacing_x
     return {
         "source_shape_yx": [height, half_width],
         "bilateral_shape_yx": [height, width],
@@ -529,14 +615,14 @@ def _symmetric_geometry(
         ],
         "reflection_plane": {
             "axis": "x",
-            "coordinate_um": 0.0,
+            "coordinate_um": reflection_plane_um,
             "location": "between_columns",
             "adjacent_column_indices": [half_width - 1, half_width],
         },
         "source_space": "HIST_OBSERVED_PREPARED_LEFT",
         "symmetric_space": "HIST_SYMMETRIC",
         "reflection_matrix_um": [
-            [-1.0, 0.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 2.0 * reflection_plane_um],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
@@ -772,19 +858,40 @@ def build_symmetric_histology(
     left_dataset = left_dataset.resolve()
     output_dir = output_dir.resolve()
     rows, fields, source = _validate_left_source(left_dataset)
-    source_shape = tuple(source["dataset"]["prepared_canvas_shape_yx"])
+    corrected = source["corrected"]
+    full_source_shape = tuple(source["dataset"]["prepared_canvas_shape_yx"])
+    half_space = source["half_space"]
+    source_shape = (
+        tuple(half_space["source_shape_yx"])
+        if corrected else full_source_shape
+    )
+    source_geometry = dict(source["geometry"])
+    if corrected:
+        source_geometry["origin_xy"] = [
+            float(half_space["column_coordinates_um"][0]),
+            float(source_geometry["origin_xy"][1]),
+        ]
     rows_by_section = {int(row["allen_section_number"]): row for row in rows}
-    nissl_edges_by_block = _nissl_edges_by_block(
+    nissl_edges_by_block = {} if corrected else _nissl_edges_by_block(
         rows=rows, left_dataset=left_dataset, canvas_shape_yx=source_shape
     )
-    symmetry = _symmetric_geometry(source_shape, source["geometry"])
+    symmetry = _symmetric_geometry(
+        source_shape,
+        source_geometry,
+        reflection_plane_um=(
+            float(half_space["boundary_um"]) if corrected else 0.0
+        ),
+    )
     bilateral_shape = tuple(symmetry["bilateral_shape_yx"])
     pv_sections = [
         int(row["allen_section_number"])
         for row in rows
         if row["image_present"] == "true" and row["stain"] == "pv"
     ]
-    qc_sections = {pv_sections[0], pv_sections[len(pv_sections) // 2], pv_sections[-1]}
+    qc_sections = (
+        {pv_sections[0], pv_sections[len(pv_sections) // 2], pv_sections[-1]}
+        if pv_sections else set()
+    )
     if output_dir.exists() and not overwrite:
         raise FileExistsError(f"Symmetric source exists: {output_dir}")
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -811,9 +918,17 @@ def build_symmetric_histology(
                 source_path = left_dataset / row["prepared_relative_path"]
                 with Image.open(source_path) as image:
                     observed = np.asarray(image.convert("RGB"))
+                if corrected:
+                    observed = observed[:, half_space["first_column"] :, :]
+                    if observed.shape[:2] != source_shape:
+                        raise ValueError("Corrected half-space slice changed grid shape")
                 section = int(row["allen_section_number"])
                 pv_result: PVMaskResult | None = None
-                if row["stain"] == "pv":
+                if corrected:
+                    cleaned = observed
+                    shift_px = 0
+                    tissue_mask = np.any(observed != 0, axis=2)
+                elif row["stain"] == "pv":
                     unconstrained = generate_pv_mask(observed, section=section)
                     lower_bound = _pv_nissl_lower_bound(
                         section=section,
@@ -837,9 +952,10 @@ def build_symmetric_histology(
                         left_dataset=left_dataset,
                         canvas_shape_yx=source_shape,
                     )
-                cleaned = apply_tissue_mask(
-                    observed, tissue_mask, background=0
-                )
+                if not corrected:
+                    cleaned = apply_tissue_mask(
+                        observed, tissue_mask, background=0
+                    )
                 if pv_result is not None:
                     cleaned, removed_components = remove_pv_fiducial_rgb(
                         cleaned, tissue_mask
@@ -849,11 +965,13 @@ def build_symmetric_histology(
                         cleaned, tissue_mask
                     )
                     pv_fiducial_sections_after += int(remaining_components > 0)
-                shifted = shift_to_medial_edge(cleaned, shift_px, background=0)
-                shifted_mask = shift_to_medial_edge(
+                shifted = cleaned if corrected else shift_to_medial_edge(
+                    cleaned, shift_px, background=0
+                )
+                shifted_mask = tissue_mask if corrected else shift_to_medial_edge(
                     tissue_mask, shift_px, background=0
                 )
-                if (
+                if not corrected and (
                     np.count_nonzero(shifted_mask) != np.count_nonzero(tissue_mask)
                     or not np.any(shifted_mask[:, 0])
                     or np.any(shifted[~shifted_mask] != 0)
@@ -865,6 +983,10 @@ def build_symmetric_histology(
                 bilateral = bilateral_union(shifted)
                 if bilateral.shape[:2] != bilateral_shape:
                     raise ValueError("Derived bilateral image shape is inconsistent")
+                if corrected and not np.array_equal(
+                    bilateral[:, source_shape[1]:], observed
+                ):
+                    raise ValueError("Corrected observed pixels changed during union")
                 if pv_result is not None and section in qc_sections:
                     pv_qc_samples.append((section, observed, pv_result, bilateral))
                 stain_dir = images_root / row["stain"]
@@ -891,33 +1013,34 @@ def build_symmetric_histology(
                 row["prepared_sha256"] = sha256_file(output_path)
             output_rows.append(row)
 
-        LOG.info(
-            "Section medial shifts: min=%d px max=%d px n=%d",
-            min(section_shifts_px.values()),
-            max(section_shifts_px.values()),
-            len(section_shifts_px),
-        )
-        LOG.info(
-            "PV medial shifts before=%d..%d px after=%d..%d px; "
-            "column-0 masks before=%d after=%d",
-            min(pv_before_shifts),
-            max(pv_before_shifts),
-            min(pv_after_shifts),
-            max(pv_after_shifts),
-            sum(value == 0 for value in pv_before_shifts),
-            sum(value == 0 for value in pv_after_shifts),
-        )
-        LOG.info(
-            "PV retained-mask area removed=%d of %d pixels (%.6f)",
-            sum(pv_removed_areas),
-            sum(pv_before_areas),
-            sum(pv_removed_areas) / sum(pv_before_areas),
-        )
-        LOG.info(
-            "PV sections with fiducial-like RGB components before=%d after=%d",
-            pv_fiducial_sections_before,
-            pv_fiducial_sections_after,
-        )
+        if not corrected:
+            LOG.info(
+                "Section medial shifts: min=%d px max=%d px n=%d",
+                min(section_shifts_px.values()),
+                max(section_shifts_px.values()),
+                len(section_shifts_px),
+            )
+            LOG.info(
+                "PV medial shifts before=%d..%d px after=%d..%d px; "
+                "column-0 masks before=%d after=%d",
+                min(pv_before_shifts),
+                max(pv_before_shifts),
+                min(pv_after_shifts),
+                max(pv_after_shifts),
+                sum(value == 0 for value in pv_before_shifts),
+                sum(value == 0 for value in pv_after_shifts),
+            )
+            LOG.info(
+                "PV retained-mask area removed=%d of %d pixels (%.6f)",
+                sum(pv_removed_areas),
+                sum(pv_before_areas),
+                sum(pv_removed_areas) / sum(pv_before_areas),
+            )
+            LOG.info(
+                "PV sections with fiducial-like RGB components before=%d after=%d",
+                pv_fiducial_sections_before,
+                pv_fiducial_sections_after,
+            )
 
         _write_rows(staging / "metadata" / "physical_sections.tsv", output_rows, fields)
         mask = hemisphere_origin_mask(bilateral_shape)
@@ -926,40 +1049,42 @@ def build_symmetric_histology(
             format="TIFF",
             compression="tiff_deflate",
         )
-        qc_root = staging / "qc"
-        qc_root.mkdir()
-        qc_path = qc_root / "pv_segmentation_montage.png"
-        pv_qc_samples.sort(key=lambda item: item[0])
-        if [item[0] for item in pv_qc_samples] != sorted(qc_sections):
-            raise ValueError("PV QC representatives were not generated")
-        _write_pv_qc_montage(qc_path, pv_qc_samples)
-        pv_segmentation = {
-            "method": "prepared_grid_local_entropy_and_darkness_otsu",
-            "nissl_mask_method_changed": False,
-            "parameters": {
-                "exclude_exact_black_canvas": True,
-                "entropy_radius": PV_ENTROPY_RADIUS,
-                "closing_radius": PV_CLOSING_RADIUS,
-                "hole_area_threshold": PV_HOLE_AREA,
-                "component_fraction_of_largest": PV_COMPONENT_FRACTION,
-                "component_area_floor": PV_COMPONENT_FLOOR,
-                "minimum_mask_area_fraction": PV_MIN_AREA_FRACTION,
-                "maximum_mask_area_fraction": PV_MAX_AREA_FRACTION,
-                "fiducial_saturation_threshold": PV_FIDUCIAL_SATURATION,
-                "fiducial_saturated_fraction": PV_FIDUCIAL_SATURATED_FRACTION,
-            },
-            "section_metrics": pv_section_metrics,
-            "qc_montage": {
-                "path": qc_path.relative_to(staging).as_posix(),
-                "sha256": sha256_file(qc_path),
-                "section_numbers": sorted(qc_sections),
-                "panels": [
-                    "original_pv", "entropy_image", "entropy_threshold",
-                    "darkness_threshold", "combined_mask", "cleaned_mask_over_rgb",
-                    "final_symmetric_image",
-                ],
-            },
-        }
+        pv_segmentation = None
+        if pv_sections:
+            qc_root = staging / "qc"
+            qc_root.mkdir()
+            qc_path = qc_root / "pv_segmentation_montage.png"
+            pv_qc_samples.sort(key=lambda item: item[0])
+            if [item[0] for item in pv_qc_samples] != sorted(qc_sections):
+                raise ValueError("PV QC representatives were not generated")
+            _write_pv_qc_montage(qc_path, pv_qc_samples)
+            pv_segmentation = {
+                "method": "prepared_grid_local_entropy_and_darkness_otsu",
+                "nissl_mask_method_changed": False,
+                "parameters": {
+                    "exclude_exact_black_canvas": True,
+                    "entropy_radius": PV_ENTROPY_RADIUS,
+                    "closing_radius": PV_CLOSING_RADIUS,
+                    "hole_area_threshold": PV_HOLE_AREA,
+                    "component_fraction_of_largest": PV_COMPONENT_FRACTION,
+                    "component_area_floor": PV_COMPONENT_FLOOR,
+                    "minimum_mask_area_fraction": PV_MIN_AREA_FRACTION,
+                    "maximum_mask_area_fraction": PV_MAX_AREA_FRACTION,
+                    "fiducial_saturation_threshold": PV_FIDUCIAL_SATURATION,
+                    "fiducial_saturated_fraction": PV_FIDUCIAL_SATURATED_FRACTION,
+                },
+                "section_metrics": pv_section_metrics,
+                "qc_montage": {
+                    "path": qc_path.relative_to(staging).as_posix(),
+                    "sha256": sha256_file(qc_path),
+                    "section_numbers": sorted(qc_sections),
+                    "panels": [
+                        "original_pv", "entropy_image", "entropy_threshold",
+                        "darkness_threshold", "combined_mask",
+                        "cleaned_mask_over_rgb", "final_symmetric_image",
+                    ],
+                },
+            }
         symmetry.update(
             {
                 "schema_version": 1,
@@ -990,7 +1115,7 @@ def build_symmetric_histology(
                 canvas_shape_yx=source_shape,
                 section_shifts_px=section_shifts_px,
             )
-            if annotation_source is not None
+            if annotation_source is not None and not corrected
             else {"annotations_cogridded": False}
         )
         compatibility = {
@@ -1002,8 +1127,14 @@ def build_symmetric_histology(
             "present_image_count": sum(
                 row["image_present"] == "true" for row in output_rows
             ),
-            "nissl_count": EXPECTED_COUNTS["nissl"],
-            "pv_count": EXPECTED_COUNTS["pv"],
+            "nissl_count": sum(
+                row["stain"] == "nissl" and row["image_present"] == "true"
+                for row in output_rows
+            ),
+            "pv_count": sum(
+                row["stain"] == "pv" and row["image_present"] == "true"
+                for row in output_rows
+            ),
             "common_bilateral_grid": True,
             "annotations_cogridded": annotation_summary["annotations_cogridded"],
             "intended_registration_source": "symmetric_whole_brain_histology",
@@ -1020,13 +1151,15 @@ def build_symmetric_histology(
             "space_name": "HIST_SYMMETRIC",
             "source_layer": _display_path(left_dataset),
             "physical_position_count": EXPECTED_ROWS,
-            "present_image_count": sum(EXPECTED_COUNTS.values()),
-            "nissl_count": EXPECTED_COUNTS["nissl"],
-            "pv_count": EXPECTED_COUNTS["pv"],
+            "present_image_count": sum(
+                row["image_present"] == "true" for row in output_rows
+            ),
+            "nissl_count": compatibility["nissl_count"],
+            "pv_count": compatibility["pv_count"],
             "serial_pitch_um": 50.0,
             "pixel_size_um": symmetry["pixel_size_um"],
             "bilateral_shape_yx": symmetry["bilateral_shape_yx"],
-            "reflection_plane_coordinate_um": 0.0,
+            "reflection_plane_coordinate_um": symmetry["reflection_plane"]["coordinate_um"],
             "pixels_resampled": False,
             "images_reflected_once": True,
             "annotation_summary": annotation_summary,
@@ -1059,7 +1192,8 @@ def verify_symmetric_histology(dataset_root: Path) -> dict[str, Any]:
     if (
         dataset.get("space_name") != "HIST_SYMMETRIC"
         or dataset.get("physical_position_count") != EXPECTED_ROWS
-        or dataset.get("present_image_count") != sum(EXPECTED_COUNTS.values())
+        or dataset.get("present_image_count")
+        != dataset.get("nissl_count", 0) + dataset.get("pv_count", 0)
         or compatibility.get("source_grid_preservable") is not True
         or compatibility.get("requires_preparation_resampling") is not False
     ):
@@ -1079,7 +1213,11 @@ def verify_symmetric_histology(dataset_root: Path) -> dict[str, Any]:
         with Image.open(path) as image:
             if image.size != (expected_shape[1], expected_shape[0]):
                 raise ValueError(f"Symmetric image is off-grid: {path}")
-    if counts != Counter(EXPECTED_COUNTS):
+    expected_counts = Counter(
+        nissl=dataset.get("nissl_count", 0), pv=dataset.get("pv_count", 0)
+    )
+    expected_counts += Counter()
+    if counts != expected_counts:
         raise ValueError(f"Symmetric source stain counts differ: {counts}")
     mask_path = dataset_root / symmetry["hemisphere_origin_mask"]
     if sha256_file(mask_path) != symmetry["hemisphere_origin_mask_sha256"]:
@@ -1088,23 +1226,25 @@ def verify_symmetric_histology(dataset_root: Path) -> dict[str, Any]:
         mask = np.asarray(image)
     if not np.array_equal(mask, hemisphere_origin_mask(expected_shape)):
         raise ValueError("Hemisphere-origin mask semantics changed")
-    pv_segmentation = symmetry.get("pv_segmentation")
-    if not isinstance(pv_segmentation, dict):
-        raise ValueError("PV segmentation metadata is missing")
-    qc = pv_segmentation.get("qc_montage", {})
-    qc_path = dataset_root / qc.get("path", "")
-    if not qc_path.is_file() or sha256_file(qc_path) != qc.get("sha256"):
-        raise ValueError("PV segmentation QC montage checksum mismatch")
-    if len(pv_segmentation.get("section_metrics", [])) != EXPECTED_COUNTS["pv"]:
-        raise ValueError("PV segmentation metrics do not cover every PV section")
+    if dataset.get("pv_count", 0):
+        pv_segmentation = symmetry.get("pv_segmentation")
+        if not isinstance(pv_segmentation, dict):
+            raise ValueError("PV segmentation metadata is missing")
+        qc = pv_segmentation.get("qc_montage", {})
+        qc_path = dataset_root / qc.get("path", "")
+        if not qc_path.is_file() or sha256_file(qc_path) != qc.get("sha256"):
+            raise ValueError("PV segmentation QC montage checksum mismatch")
+        if len(pv_segmentation.get("section_metrics", [])) != dataset["pv_count"]:
+            raise ValueError("PV segmentation metrics do not cover every PV section")
     inventory = dataset_root / "metadata" / "annotations.tsv"
-    annotation_rows, _ = _read_rows(inventory)
-    if len(annotation_rows) != dataset["annotation_summary"]["annotation_image_count"]:
-        raise ValueError("Symmetric annotation inventory count changed")
-    for row in annotation_rows:
-        path = dataset_root / row["path"]
-        if sha256_file(path) != row["sha256"]:
-            raise ValueError(f"Symmetric annotation checksum mismatch: {path}")
+    if inventory.is_file():
+        annotation_rows, _ = _read_rows(inventory)
+        if len(annotation_rows) != dataset["annotation_summary"]["annotation_image_count"]:
+            raise ValueError("Symmetric annotation inventory count changed")
+        for row in annotation_rows:
+            path = dataset_root / row["path"]
+            if sha256_file(path) != row["sha256"]:
+                raise ValueError(f"Symmetric annotation checksum mismatch: {path}")
     return compatibility
 
 
