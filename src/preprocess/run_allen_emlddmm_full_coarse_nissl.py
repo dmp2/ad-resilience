@@ -445,7 +445,13 @@ def read_section(sample: dict[str, str], em=None, spatial_axes=None, *, preserve
         source_x=np.arange(image.shape[2],dtype=np.float64)*200.0-(image.shape[2]-1)*100.0
         query=torch.stack(torch.meshgrid(torch.as_tensor(spatial_axes[0]),torch.as_tensor(spatial_axes[1]),indexing="ij"))
         image=em.interp([source_y,source_x],torch.as_tensor(image),query,interp2d=True,padding_mode="zeros").numpy()
-    support=(image[0]>0).astype(np.float32)
+    support_path = DATASET / "support/nissl" / path.name
+    if support_path.is_file():
+        support = tifffile.imread(support_path).astype(np.float32)
+        if support.shape != image.shape[1:]:
+            raise RuntimeError("Stored validity support differs from Nissl raster")
+    else:
+        support=(image[0]>0).astype(np.float32)
     return image.astype(np.float32),support
 def downsample_section(image: np.ndarray,support: np.ndarray,factor: int=4):
     c,h,w=image.shape; nh,nw=h//factor,w//factor; h4,w4=nh*factor,nw*factor
@@ -1291,8 +1297,10 @@ def _source_inventory(checkpoints: dict[str, Any]) -> tuple[dict[str, str], dict
     }
 
 
-def _coarse_affine(xI: list[np.ndarray]) -> tuple[np.ndarray, dict[str, Any]]:
-    if tuple(map(len, xI)) != (237, 284, 254):
+def _coarse_affine(
+    xI: list[np.ndarray], *, expected_shape: tuple[int, int, int] | None = (237, 284, 254)
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if expected_shape is not None and tuple(map(len, xI)) != expected_shape:
         raise RuntimeError(f"Unexpected coarse MRI axes: {tuple(map(len, xI))}")
     affine = np.eye(4, dtype=np.float64)
     spacings = []
@@ -1319,7 +1327,7 @@ def _coarse_affine(xI: list[np.ndarray]) -> tuple[np.ndarray, dict[str, Any]]:
     if max(errors) > 1e-6:
         raise RuntimeError("Coarse MRI affine coordinate audit failed")
     return affine, {
-        "shape": [237, 284, 254],
+        "shape": list(map(len, xI)),
         "axes_um": [
             {"first": float(axis[0]), "last": float(axis[-1]), "length": len(axis)}
             for axis in xI
@@ -2206,9 +2214,30 @@ def _validate_pngs(paths: list[Path]) -> dict[str, Any]:
     return report
 
 
-def postprocess():
+def postprocess(*, native_resolution: bool = False):
     start = time.monotonic()
     annotations_enabled = (DATASET / "metadata" / "annotations.tsv").is_file()
+    if native_resolution and annotations_enabled:
+        symmetry_path = DATASET / "metadata/symmetry.json"
+        if not symmetry_path.is_file():
+            annotations_enabled = False
+        else:
+            symmetry = json.loads(symmetry_path.read_text(encoding="utf-8"))
+            canvas = json.loads(
+                (DATASET / "metadata/loader_canvas_audit.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            annotations_enabled = (
+                symmetry.get("pixel_size_um") == 200.0
+                and symmetry.get("bilateral_shape_yx")
+                == canvas.get("accepted_canvas_shape_yx")
+                and symmetry.get("bilateral_origin_xy_um")
+                == [
+                    canvas.get("global_translation_xy_um", [None, None])[0],
+                    canvas.get("global_translation_xy_um", [None, None])[1],
+                ]
+            )
     if POST_DIR.exists() or (annotations_enabled and ANNOTATION_DIR.exists()):
         raise RuntimeError("Refusing to overwrite an existing postprocess output directory")
     POST_DIR.mkdir(parents=True)
@@ -2218,11 +2247,32 @@ def postprocess():
         "atlas-free": load_checkpoint("atlas-free"),
         "registration": load_checkpoint("registration"),
     }
-    before_hashes, native_validation = _source_inventory(checkpoints)
+    if native_resolution:
+        native_sources = [
+            CHECKPOINTS / "atlas-free.json",
+            CHECKPOINTS / "registration.json",
+            REG_DIR / "full_resolution_numerical_outputs.npz",
+            REG_DIR / "final_observed_effective_match_weight.npy",
+            *(REG_DIR / f"raw_Esave_level-{level}.npy" for level in range(1, 4)),
+        ]
+        before_hashes = {
+            str(path): checksum(path) for path in native_sources if path.is_file()
+        }
+        native_validation = {
+            "native_transform_count": 0,
+            "native_transform_manifest": None,
+            "native_manifest_verified": False,
+            "numerical_package_verified": True,
+        }
+    else:
+        before_hashes, native_validation = _source_inventory(checkpoints)
     em, rows, samples, axes, observed = load_context()
     if len(observed) != 641 or len(rows) - len(observed) != 2205:
         raise RuntimeError("Observed/unsupported Nissl counts changed")
-    numerical_path = REG_DIR / "full_coarse_numerical_outputs.npz"
+    numerical_path = REG_DIR / (
+        "full_resolution_numerical_outputs.npz"
+        if native_resolution else "full_coarse_numerical_outputs.npz"
+    )
     with np.load(numerical_path) as saved:
         required = {"A", "A2d", "v", "xv0", "xv1", "xv2",
                     "xI0", "xI1", "xI2", "xJ0", "xJ1", "xJ2", "observed"}
@@ -2240,12 +2290,20 @@ def postprocess():
     if not np.array_equal(saved_observed, observed):
         raise RuntimeError("Saved observed indices differ from canonical manifest")
     preserved = _preserves_source_grid()
-    expected_coarse_axes = coarse_spatial_axes(axes, preserve_source_grid=preserved)
+    expected_coarse_axes = (
+        tuple(np.asarray(axis) for axis in axes[1:])
+        if native_resolution
+        else coarse_spatial_axes(axes, preserve_source_grid=preserved)
+    )
     expected_xJ_shape = (2846, *(len(axis) for axis in expected_coarse_axes))
     if tuple(map(len, xJ)) != expected_xJ_shape:
         raise RuntimeError("Saved histology axes changed")
-    if not np.allclose([np.diff(axis).mean() for axis in xI], [800] * 3, atol=1e-3):
-        raise RuntimeError("Saved MRI working grid is not 800 um")
+    expected_mri_spacing = [200] * 3 if native_resolution else [800] * 3
+    if not np.allclose(
+        np.abs([np.diff(axis).mean() for axis in xI]),
+        expected_mri_spacing, atol=1e-3,
+    ):
+        raise RuntimeError("Saved MRI working-grid spacing changed")
     saved_histology_spacing = np.asarray(
         [np.diff(axis).mean() for axis in xJ], dtype=np.float64
     )
@@ -2262,7 +2320,9 @@ def postprocess():
         saved_histology_spacing, expected_histology_spacing, atol=1e-6, rtol=0.0
     ):
         raise RuntimeError("Saved histology working grid changed")
-    affine, geometry = _coarse_affine(xI)
+    affine, geometry = _coarse_affine(
+        xI, expected_shape=None if native_resolution else (237, 284, 254)
+    )
     baseline, residual_report, comparisons = _final_residual_diagnostics(
         rows, axes, observed, final
     )
@@ -2308,13 +2368,19 @@ def postprocess():
         A, phi, xv, xI, xJ, row_um, column_um, numerator, section_support,
         effective_match_weight,
     )
-    nissl_path = POST_DIR / "nissl_reconstruction_on_coarse_mri_grid.nii"
-    nissl_support_path = POST_DIR / "nissl_support_on_coarse_mri_grid.nii"
+    grid_name = "native" if native_resolution else "coarse"
+    nissl_path = POST_DIR / f"nissl_reconstruction_on_{grid_name}_mri_grid.nii"
+    nissl_support_path = POST_DIR / f"nissl_support_on_{grid_name}_mri_grid.nii"
     _atomic_nifti(nissl_path, reconstruction, affine, np.float32)
     _atomic_nifti(nissl_support_path, nissl_support, affine, np.float32)
     provenance = json.loads(MRI_PROV.read_text())
     native = load_pinned_mri_image(em, mri_path=MRI, provenance=provenance)
-    loaded_xI, mri = em.downsample_image_domain(native.x, native.data, [4, 4, 4])
+    if native_resolution:
+        loaded_xI, mri = native.x, native.data
+    else:
+        loaded_xI, mri = em.downsample_image_domain(
+            native.x, native.data, [4, 4, 4]
+        )
     loaded_xI = [np.asarray(axis) for axis in loaded_xI]
     mri = finite("coarse MRI", mri).astype(np.float32)
     del native
@@ -2376,11 +2442,11 @@ def postprocess():
         "native_transform_validation": native_validation,
         "geometry": geometry,
         "shapes": {
-            "coarse_mri": list(map(len, xI)),
+            f"{grid_name}_mri": list(map(len, xI)),
             "histology_working_stack": [3, *expected_xJ_shape],
             "histology_support": list(expected_xJ_shape),
         },
-        "spacings_um": {"coarse_mri": [float(np.diff(axis).mean()) for axis in xI],
+        "spacings_um": {f"{grid_name}_mri": [float(np.diff(axis).mean()) for axis in xI],
                         "histology": [float(np.diff(axis).mean()) for axis in xJ]},
         "deformation": deformation_report,
         "objective_histories": objective_report,
@@ -2418,11 +2484,22 @@ def postprocess():
     atomic_json(report_path, report)
     checkpoint = {**report, "report": str(report_path)}
     atomic_json(CHECKPOINTS / "postprocess.json", checkpoint)
-    atomic_json(OUTPUT / "full_coarse_summary.json", checkpoint)
+    atomic_json(
+        OUTPUT / (
+            "native_resolution_summary.json"
+            if native_resolution else "full_coarse_summary.json"
+        ),
+        checkpoint,
+    )
     print(json.dumps(checkpoint, indent=2), flush=True)
 
-def _warp_saved_section(image, support, transform, row_um, column_um):
+def _warp_saved_section(
+    image, support, transform, row_um, column_um,
+    *, source_row_um=None, source_column_um=None,
+):
     """Sample one prepared section into its baseline-factored registered frame."""
+    source_row_um = row_um if source_row_um is None else source_row_um
+    source_column_um = column_um if source_column_um is None else source_column_um
     rr, cc = np.meshgrid(row_um, column_um, indexing="ij")
     source_row = (
         transform[0, 0] * rr + transform[0, 1] * cc + transform[0, 2]
@@ -2430,15 +2507,17 @@ def _warp_saved_section(image, support, transform, row_um, column_um):
     source_column = (
         transform[1, 0] * rr + transform[1, 1] * cc + transform[1, 2]
     )
-    iy = (source_row - row_um[0]) / (row_um[1] - row_um[0])
-    ix = (source_column - column_um[0]) / (
-        column_um[1] - column_um[0]
+    iy = (source_row - source_row_um[0]) / (
+        source_row_um[1] - source_row_um[0]
+    )
+    ix = (source_column - source_column_um[0]) / (
+        source_column_um[1] - source_column_um[0]
     )
     transformed_support = ndi.map_coordinates(
         support, [iy, ix], order=1, mode="constant", cval=0.0,
         prefilter=False,
     ).astype(np.float32)
-    transformed = np.zeros_like(image, dtype=np.float32)
+    transformed = np.zeros((image.shape[0], *rr.shape), dtype=np.float32)
     positive = transformed_support > 0.0
     for channel in range(3):
         numerator = ndi.map_coordinates(
