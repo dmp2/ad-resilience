@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import copy
 import csv
+import hashlib
 import json
 import math
 import os
@@ -56,6 +57,7 @@ CLEAN_SYMMETRIC_DATASET = PROJECT / (
 SPACING_UM = 200.0
 HEMI_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-lc188-linear-no-v"
 FINAL_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-lc188"
+SCALE_CHECKPOINT_SCHEMA = "allen-native-emlddmm-scale-v1"
 
 
 def native_source_axes(shape_yx: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
@@ -247,6 +249,338 @@ def native_multiscale_configuration(
     return config
 
 
+def _scale_parameters(config: dict[str, Any], scale_index: int) -> dict[str, Any]:
+    """Select one scale exactly as pinned ``emlddmm_multiscale`` does."""
+    params: dict[str, Any] = {}
+    for key in config:
+        value = config[key]
+        if type(value) is list:
+            params[key] = value[scale_index] if len(value) > 1 else value[0]
+        else:
+            params[key] = value
+    if "sigmaM" not in params:
+        params["sigmaM"] = np.ones(config["J"].shape[0])
+    if "sigmaB" not in params:
+        params["sigmaB"] = np.ones(config["J"].shape[0]) * 2.0
+    if "sigmaA" not in params:
+        params["sigmaA"] = np.ones(config["J"].shape[0]) * 5.0
+    return params
+
+
+def _multiscale_count(config: dict[str, Any]) -> int:
+    downI = config["downI"]
+    return len(downI) if type(downI[0]) is list else 1
+
+
+def _json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _array_sha256(value: Any) -> str:
+    array = np.ascontiguousarray(np.asarray(value))
+    digest = hashlib.sha256()
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _configured_dtype_name(config: dict[str, Any]) -> str:
+    dtype = config.get("dtype")
+    if dtype is None:
+        dtype = torch.float32
+    if isinstance(dtype, str):
+        dtype = {"float": torch.float32, "float32": torch.float32,
+                 "float64": torch.float64}[dtype]
+    return torch.empty((), dtype=dtype).numpy().dtype.name
+
+
+def _scale_checkpoint_paths(
+    checkpoint_dir: Path, scale_index: int,
+) -> tuple[Path, Path]:
+    stem = f"registration_scale-{scale_index + 1:02d}"
+    return checkpoint_dir / f"{stem}.npz", checkpoint_dir / f"{stem}.json"
+
+
+def _effective_resolution(
+    lineage: dict[str, Any], params: dict[str, Any],
+) -> dict[str, list[float]]:
+    return {
+        name: [
+            float(spacing * factor)
+            for spacing, factor in zip(
+                lineage["native_spacings_um"][name], params[f"down{name}"],
+                strict=True,
+            )
+        ]
+        for name in ("I", "J")
+    }
+
+
+def _numpy_state(
+    output: dict[str, Any], history: np.ndarray, *, slice_matching: bool,
+) -> dict[str, np.ndarray]:
+    state = {
+        "A": coarse.finite("scale A", output["A"]),
+        "v": coarse.finite("scale v", output["v"]),
+        "xv0": coarse.finite("scale xv0", output["xv"][0]),
+        "xv1": coarse.finite("scale xv1", output["xv"][1]),
+        "xv2": coarse.finite("scale xv2", output["xv"][2]),
+        "Esave": coarse.finite("scale Esave", history),
+    }
+    if slice_matching:
+        state["A2d"] = coarse.finite("scale A2d", output["A2d"])
+    return {key: np.asarray(value) for key, value in state.items()}
+
+
+def _validate_scale_state(
+    state: dict[str, np.ndarray], *, params: dict[str, Any], config: dict[str, Any],
+) -> None:
+    required = {"A", "v", "xv0", "xv1", "xv2", "Esave"}
+    if params.get("slice_matching"):
+        required.add("A2d")
+    missing = required.difference(state)
+    if missing:
+        raise RuntimeError(f"scale state is missing {sorted(missing)}")
+    for name in required:
+        if not np.issubdtype(state[name].dtype, np.number):
+            raise RuntimeError(f"scale state {name} is not numerical")
+        if not np.all(np.isfinite(state[name])):
+            raise RuntimeError(f"scale state {name} contains nonfinite values")
+    if state["A"].shape != (4, 4):
+        raise RuntimeError(f"scale A shape is {state['A'].shape}")
+    velocity = state["v"]
+    if velocity.ndim != 5 or velocity.shape[1] != 3:
+        raise RuntimeError(f"scale velocity shape is {velocity.shape}")
+    for axis, expected in enumerate(velocity.shape[2:]):
+        xv = state[f"xv{axis}"]
+        if xv.ndim != 1 or len(xv) != expected:
+            raise RuntimeError(
+                f"scale xv{axis} shape {xv.shape} does not match velocity"
+            )
+        if len(xv) > 1 and not np.all(np.diff(xv) > 0):
+            raise RuntimeError(f"scale xv{axis} is not strictly increasing")
+    if params.get("slice_matching"):
+        expected = (config["J"].shape[1], 3, 3)
+        if state["A2d"].shape != expected:
+            raise RuntimeError(
+                f"scale A2d shape is {state['A2d'].shape}, expected {expected}"
+            )
+
+
+def _write_scale_checkpoint(
+    checkpoint_dir: Path, scale_index: int, state: dict[str, np.ndarray],
+    *, config: dict[str, Any], params: dict[str, Any], lineage: dict[str, Any],
+) -> None:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    state_path, manifest_path = _scale_checkpoint_paths(checkpoint_dir, scale_index)
+    _validate_scale_state(state, params=params, config=config)
+    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, **state)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, state_path)
+    manifest = {
+        "schema": SCALE_CHECKPOINT_SCHEMA,
+        "stage": lineage["stage"],
+        "status": "complete",
+        "profile_name": lineage["profile_name"],
+        "completed_scale_index": scale_index,
+        "completed_scale_number": scale_index + 1,
+        "total_scales": _multiscale_count(config),
+        "downI": params["downI"],
+        "downJ": params["downJ"],
+        "effective_resolution_um": _effective_resolution(lineage, params),
+        "source_dataset": lineage["source_dataset"],
+        "native_shapes": lineage["native_shapes"],
+        "native_spacings_um": lineage["native_spacings_um"],
+        "initializer_lineage_sha256": lineage["initializer_lineage_sha256"],
+        "initializer_checksums": lineage["initializer_checksums"],
+        "initial_A_sha256": lineage["initial_A_sha256"],
+        "emlddmm_commit": lineage["emlddmm_commit"],
+        "dtype": state["v"].dtype.name,
+        "state_file": state_path.name,
+        "state_file_sha256": coarse.checksum(state_path),
+        "state_shapes": {key: list(value.shape) for key, value in state.items()},
+        "state_dtypes": {key: value.dtype.name for key, value in state.items()},
+    }
+    coarse.atomic_json(manifest_path, manifest)
+
+
+def _load_scale_checkpoint(
+    checkpoint_dir: Path, scale_index: int, *, config: dict[str, Any],
+    lineage: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], np.ndarray]:
+    state_path, manifest_path = _scale_checkpoint_paths(checkpoint_dir, scale_index)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"scale manifest cannot be read: {manifest_path}") from exc
+    params = _scale_parameters(config, scale_index)
+    expected = {
+        "schema": SCALE_CHECKPOINT_SCHEMA,
+        "stage": lineage["stage"],
+        "status": "complete",
+        "profile_name": lineage["profile_name"],
+        "completed_scale_index": scale_index,
+        "completed_scale_number": scale_index + 1,
+        "total_scales": _multiscale_count(config),
+        "downI": params["downI"],
+        "downJ": params["downJ"],
+        "effective_resolution_um": _effective_resolution(lineage, params),
+        "source_dataset": lineage["source_dataset"],
+        "native_shapes": lineage["native_shapes"],
+        "native_spacings_um": lineage["native_spacings_um"],
+        "initializer_lineage_sha256": lineage["initializer_lineage_sha256"],
+        "initializer_checksums": lineage["initializer_checksums"],
+        "initial_A_sha256": lineage["initial_A_sha256"],
+        "emlddmm_commit": lineage["emlddmm_commit"],
+        "state_file": state_path.name,
+    }
+    for key, value in expected.items():
+        if manifest.get(key) != value:
+            raise RuntimeError(f"scale manifest {key} does not match this registration")
+    if not state_path.is_file():
+        raise RuntimeError(f"scale state is missing: {state_path}")
+    if manifest.get("state_file_sha256") != coarse.checksum(state_path):
+        raise RuntimeError(f"scale state checksum mismatch: {state_path}")
+    try:
+        with np.load(state_path, allow_pickle=False) as saved:
+            state = {key: np.asarray(saved[key]).copy() for key in saved.files}
+    except (OSError, ValueError, KeyError) as exc:
+        raise RuntimeError(f"scale state cannot be read: {state_path}") from exc
+    _validate_scale_state(state, params=params, config=config)
+    shapes = {key: list(value.shape) for key, value in state.items()}
+    dtypes = {key: value.dtype.name for key, value in state.items()}
+    if manifest.get("state_shapes") != shapes or manifest.get("state_dtypes") != dtypes:
+        raise RuntimeError("scale state shape/dtype inventory mismatch")
+    if manifest.get("dtype") != state["v"].dtype.name:
+        raise RuntimeError("scale velocity dtype mismatch")
+    if state["v"].dtype.name != _configured_dtype_name(config):
+        raise RuntimeError("scale velocity dtype does not match the registration dtype")
+    continuation = {
+        key: torch.from_numpy(state[key].copy()).cpu()
+        for key in ("A", "v", "A2d") if key in state
+    }
+    return continuation, state["Esave"]
+
+
+def _resume_scale_state(
+    checkpoint_dir: Path, *, config: dict[str, Any], lineage: dict[str, Any],
+) -> tuple[int, dict[str, torch.Tensor] | None, list[np.ndarray]]:
+    """Return the state after the highest contiguous safe non-final scale."""
+    continuation = None
+    histories: list[np.ndarray] = []
+    start_scale = 0
+    for scale_index in range(max(0, _multiscale_count(config) - 1)):
+        _, manifest_path = _scale_checkpoint_paths(checkpoint_dir, scale_index)
+        if not manifest_path.exists():
+            later = [
+                _scale_checkpoint_paths(checkpoint_dir, later_index)[1]
+                for later_index in range(scale_index + 1, _multiscale_count(config))
+                if _scale_checkpoint_paths(checkpoint_dir, later_index)[1].exists()
+            ]
+            if later:
+                print(
+                    f"Ignoring noncontiguous later scale checkpoints after missing "
+                    f"scale {scale_index + 1}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            break
+        try:
+            candidate, history = _load_scale_checkpoint(
+                checkpoint_dir, scale_index, config=config, lineage=lineage
+            )
+        except RuntimeError as exc:
+            print(
+                f"Ignoring ineligible scale checkpoint {scale_index + 1}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+        continuation = candidate
+        histories.append(history)
+        start_scale = scale_index + 1
+    return start_scale, continuation, histories
+
+
+def checkpointed_multiscale(
+    em: Any, *, config: dict[str, Any], checkpoint_dir: Path,
+    lineage: dict[str, Any], resume: bool,
+) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
+    """Expose pinned scale boundaries while preserving its call semantics."""
+    working = dict(config)
+    nscales = _multiscale_count(working)
+    print(f"Found {nscales} scales")
+    start_scale = 0
+    histories: list[np.ndarray] = []
+    if resume:
+        start_scale, continuation, histories = _resume_scale_state(
+            checkpoint_dir, config=working, lineage=lineage
+        )
+        if continuation is not None:
+            working.update(continuation)
+    outputs: list[dict[str, Any]] = []
+    for scale_index in range(start_scale, nscales):
+        params = _scale_parameters(working, scale_index)
+        captured: list[np.ndarray] = []
+        previous_profile = sys.getprofile()
+        sys.setprofile(coarse.profile_capture(em.emlddmm.__code__, captured))
+        try:
+            output = em.emlddmm(**params)
+        finally:
+            sys.setprofile(previous_profile)
+        if len(captured) != 1:
+            raise RuntimeError(
+                f"Expected one raw Esave history for scale {scale_index + 1}, "
+                f"captured {len(captured)}"
+            )
+        history = captured[0]
+        state = _numpy_state(
+            output, history, slice_matching=bool(params.get("slice_matching"))
+        )
+        _write_scale_checkpoint(
+            checkpoint_dir, scale_index, state,
+            config=config, params=params, lineage=lineage,
+        )
+        outputs.append(output)
+        histories.append(history)
+        working["A"] = output["A"]
+        working["v"] = output["v"]
+        if params.get("slice_matching"):
+            working["A2d"] = output["A2d"]
+    return outputs, histories
+
+
+def _registration_lineage(
+    *, stage: str, profile: str, dataset: Path, I: np.ndarray, J: np.ndarray,
+    W0: np.ndarray, initial_A: np.ndarray, initializer: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "profile_name": profile,
+        "source_dataset": str(dataset),
+        "native_shapes": {
+            "I": list(I.shape), "J": list(J.shape), "W0": list(W0.shape),
+        },
+        "native_spacings_um": {
+            "I": [200.0, 200.0, 200.0],
+            "J": [50.0, 200.0, 200.0],
+        },
+        "initializer_lineage_sha256": _json_sha256(initializer),
+        "initializer_checksums": initializer.get("checksums", {}),
+        "initial_A_sha256": _array_sha256(initial_A),
+        "emlddmm_commit": (
+            PROJECT / "configs/emlddmm-upstream-commit.txt"
+        ).read_text(encoding="utf-8").strip(),
+    }
+
+
 def _prepare_registration_output(
     output: Path, *, restart_interrupted: bool,
 ) -> None:
@@ -275,7 +609,12 @@ def _prepare_registration_output(
         )
 
     registration_files_present = reg.exists() and any(reg.iterdir())
-    interrupted = checkpoint.exists() or registration_files_present
+    scale_files_present = any(
+        (output / "checkpoints").glob("registration_scale-*")
+    )
+    interrupted = (
+        checkpoint.exists() or registration_files_present or scale_files_present
+    )
     if interrupted and not restart_interrupted:
         detail = (
             f"checkpoint status={checkpoint_status!r}"
@@ -293,11 +632,14 @@ def _prepare_registration_output(
             shutil.rmtree(reg)
         reg.mkdir(parents=True)
         checkpoint.unlink(missing_ok=True)
+        for temporary in (output / "checkpoints").glob("registration_scale-*.tmp"):
+            temporary.unlink()
 
 
 def _registration(
     dataset: Path, initializer_root: Path, output: Path,
-    *, profile: str, initial_A: np.ndarray, restart_interrupted: bool = False,
+    *, stage: str, profile: str, initial_A: np.ndarray,
+    restart_interrupted: bool = False,
 ) -> dict[str, Any]:
     _prepare_registration_output(
         output, restart_interrupted=restart_interrupted
@@ -309,26 +651,34 @@ def _registration(
         I=I, xI=xI, J=J, xJ=xJ, W0=W0,
         A=initial_A, A2d=A2d, profile=profile,
     )
+    lineage = _registration_lineage(
+        stage=stage, profile=profile, dataset=dataset, I=I, J=J, W0=W0,
+        initial_A=np.asarray(config["A"]), initializer=initializer,
+    )
     reg = output / "registration"
     checkpoints = output / "checkpoints"
     reg.mkdir(parents=True, exist_ok=True)
     checkpoints.mkdir(exist_ok=True)
     running = {
-        "stage": "registration", "status": "running", "profile": profile,
+        "stage": stage, "status": "running", "profile": profile,
         "source_dataset": str(dataset), "initializer": initializer,
         "external_pre_downsample": {"I": [1, 1, 1], "J": [1, 1, 1], "W0": [1, 1, 1]},
         "native_shapes": {"I": list(I.shape), "J": list(J.shape), "W0": list(W0.shape)},
         "native_spacings_um": {"I": [200.0] * 3, "J": [50.0, 200.0, 200.0]},
         "effective_inplane_um": [800.0, 400.0, 200.0],
         "initial_velocity": "implicit_zero",
+        "scale_checkpoint_schema": SCALE_CHECKPOINT_SCHEMA,
+        "initializer_lineage_sha256": lineage["initializer_lineage_sha256"],
+        "initial_A_sha256": lineage["initial_A_sha256"],
+        "emlddmm_commit": lineage["emlddmm_commit"],
     }
     coarse.atomic_json(checkpoints / "registration.json", running)
-    histories: list[np.ndarray] = []
-    sys.setprofile(coarse.profile_capture(em.emlddmm.__code__, histories))
-    try:
-        outputs = em.emlddmm_multiscale(**config)
-    finally:
-        sys.setprofile(None)
+    outputs, histories = checkpointed_multiscale(
+        em, config=config, checkpoint_dir=checkpoints, lineage=lineage,
+        resume=restart_interrupted,
+    )
+    if not outputs or len(histories) != _multiscale_count(config):
+        raise RuntimeError("Missing multiscale outputs or raw Esave histories")
     final = outputs[-1]
     A_final = coarse.finite("final A", final["A"])
     A2d_final = coarse.finite("final A2d", final["A2d"])
@@ -371,7 +721,8 @@ def hemisphere_registration(
 ) -> dict[str, Any]:
     return _registration(
         NATIVE_DATASET, HEMI_ROOT, HEMI_ROOT,
-        profile=HEMI_PROFILE, initial_A=np.loadtxt(INITIAL_A_HEMI),
+        stage="hemi-registration", profile=HEMI_PROFILE,
+        initial_A=np.loadtxt(INITIAL_A_HEMI),
         restart_interrupted=restart_interrupted,
     )
 
@@ -543,7 +894,8 @@ def symmetric_registration(
         A_hemi_final = np.asarray(saved["A"]).copy()
     return _registration(
         CLEAN_SYMMETRIC_DATASET, SYMMETRIC_ROOT, SYMMETRIC_ROOT,
-        profile=FINAL_PROFILE, initial_A=A_hemi_final,
+        stage="symmetric-registration", profile=FINAL_PROFILE,
+        initial_A=A_hemi_final,
         restart_interrupted=restart_interrupted,
     )
 
