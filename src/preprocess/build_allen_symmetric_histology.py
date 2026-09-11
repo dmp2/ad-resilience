@@ -34,9 +34,6 @@ DEFAULT_ANNOTATIONS = Path(
 )
 DEFAULT_OUTPUT = Path("data/derivatives/allen/specimen_708424/histology_symmetric")
 DEFAULT_MASK_ROOT = Path("data/raw/allen/specimen_708424")
-MRI_PROVENANCE = Path(
-    "data/derivatives/allen/specimen_708424/mri_7t_whole/mri_provenance.json"
-)
 RAW_STRUCTURES = Path("data/raw/allen/specimen_708424/metadata/structures.tsv")
 EXPECTED_COUNTS = {"nissl": 641, "pv": 287}
 EXPECTED_ROWS = 2846
@@ -189,7 +186,8 @@ def bilateral_union(shifted_left: np.ndarray) -> np.ndarray:
     array = np.asarray(shifted_left)
     if array.ndim not in (2, 3) or array.shape[1] < 1:
         raise ValueError(f"Unsupported section array shape: {array.shape}")
-    return np.concatenate((array[:, ::-1, ...], array), axis=1)
+    reflected = np.flip(array, axis=1)
+    return np.concatenate((reflected, array), axis=1)
 
 
 def hemisphere_origin_mask(shape_yx: tuple[int, int]) -> np.ndarray:
@@ -470,53 +468,6 @@ def _sidecar_geometry(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _registered_left_half_space(
-    source_shape_yx: tuple[int, int],
-    source_geometry: dict[str, Any],
-    affine: np.ndarray,
-    mri_midline_um: float,
-) -> dict[str, Any]:
-    """Select the established observed-left side of the registered grid."""
-
-    height, width = source_shape_yx
-    directions = source_geometry["directions"]
-    spacing = float(np.linalg.norm(directions[1]))
-    transform = np.asarray(affine, dtype=np.float64)
-    if (
-        transform.shape != (4, 4)
-        or not np.allclose(transform[2, 1:3], 0.0, atol=1e-6)
-    ):
-        raise ValueError("MRI midsagittal plane is not column-aligned in the restack")
-    if spacing <= 0.0 or not np.allclose(
-        directions[1], [spacing, 0.0, 0.0]
-    ):
-        raise ValueError("Corrected restack column direction is not increasing")
-    origin = float(source_geometry["origin_xy"][0])
-    centers = origin + np.arange(width, dtype=np.float64) * spacing
-    edges = origin + (np.arange(width + 1, dtype=np.float64) - 0.5) * spacing
-    midline = float(transform[2, 0] * mri_midline_um + transform[2, 3])
-    boundary_index = int(np.argmin(np.abs(edges - midline)))
-    discrepancy = float(edges[boundary_index] - midline)
-    if abs(discrepancy) >= spacing / 2.0:
-        raise ValueError(
-            "MRI midline is not within half a source column of a cell edge: "
-            f"{discrepancy:.6g} um ({discrepancy / spacing:.6g} pixels)"
-        )
-    if not 0 < boundary_index < width:
-        raise ValueError("MRI midline leaves no valid bilateral source half")
-    # Existing Allen/bilateral_union convention retains the source unchanged in
-    # the increasing-column half and prepends its exact reflected copy.
-    retained = centers[boundary_index:]
-    return {
-        "first_column": boundary_index,
-        "column_coordinates_um": retained,
-        "boundary_um": float(edges[boundary_index]),
-        "midline_um": midline,
-        "boundary_discrepancy_um": discrepancy,
-        "source_shape_yx": (height, len(retained)),
-    }
-
-
 def _validate_left_source(
     left_dataset: Path,
 ) -> tuple[list[dict[str, str]], list[str], dict[str, Any]]:
@@ -567,34 +518,16 @@ def _validate_left_source(
             or not np.allclose(directions[2], [0.0, spacing, 0.0])
         ):
             raise ValueError("Corrected restack is not on an LR-aligned section grid")
-        audit = json.loads(
-            (left_dataset / "metadata" / "linear_restack.json").read_text()
-        )
-        affine = np.asarray(
-            audit["global_affine_mri_um_to_histology_um"], dtype=float
-        )
-        mri = json.loads((PROJECT_ROOT / MRI_PROVENANCE).read_text())
-        half_space = _registered_left_half_space(
-            expected_shape,
-            reference,
-            affine,
-            float(mri["physical_center_mm"][0]) * 1000.0,
-        )
-    else:
-        half_space = None
     return rows, fields, {
         "dataset": dataset,
         "geometry": reference,
         "corrected": corrected,
-        "half_space": half_space,
     }
 
 
 def _symmetric_geometry(
     source_shape_yx: tuple[int, int],
     source_geometry: dict[str, Any],
-    *,
-    reflection_plane_um: float = 0.0,
 ) -> dict[str, Any]:
     height, half_width = source_shape_yx
     x_direction = source_geometry["directions"][1]
@@ -604,7 +537,7 @@ def _symmetric_geometry(
     if not np.isclose(spacing_x, spacing_y) or spacing_x <= 0:
         raise ValueError("Observed source requires an isotropic valid in-plane grid")
     width = 2 * half_width
-    origin_x = reflection_plane_um - (half_width - 0.5) * spacing_x
+    origin_x = -(half_width - 0.5) * spacing_x
     return {
         "source_shape_yx": [height, half_width],
         "bilateral_shape_yx": [height, width],
@@ -615,14 +548,14 @@ def _symmetric_geometry(
         ],
         "reflection_plane": {
             "axis": "x",
-            "coordinate_um": reflection_plane_um,
+            "coordinate_um": 0.0,
             "location": "between_columns",
             "adjacent_column_indices": [half_width - 1, half_width],
         },
         "source_space": "HIST_OBSERVED_PREPARED_LEFT",
         "symmetric_space": "HIST_SYMMETRIC",
         "reflection_matrix_um": [
-            [-1.0, 0.0, 0.0, 2.0 * reflection_plane_um],
+            [-1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
@@ -859,29 +792,12 @@ def build_symmetric_histology(
     output_dir = output_dir.resolve()
     rows, fields, source = _validate_left_source(left_dataset)
     corrected = source["corrected"]
-    full_source_shape = tuple(source["dataset"]["prepared_canvas_shape_yx"])
-    half_space = source["half_space"]
-    source_shape = (
-        tuple(half_space["source_shape_yx"])
-        if corrected else full_source_shape
-    )
-    source_geometry = dict(source["geometry"])
-    if corrected:
-        source_geometry["origin_xy"] = [
-            float(half_space["column_coordinates_um"][0]),
-            float(source_geometry["origin_xy"][1]),
-        ]
+    source_shape = tuple(source["dataset"]["prepared_canvas_shape_yx"])
     rows_by_section = {int(row["allen_section_number"]): row for row in rows}
     nissl_edges_by_block = {} if corrected else _nissl_edges_by_block(
         rows=rows, left_dataset=left_dataset, canvas_shape_yx=source_shape
     )
-    symmetry = _symmetric_geometry(
-        source_shape,
-        source_geometry,
-        reflection_plane_um=(
-            float(half_space["boundary_um"]) if corrected else 0.0
-        ),
-    )
+    symmetry = _symmetric_geometry(source_shape, source["geometry"])
     bilateral_shape = tuple(symmetry["bilateral_shape_yx"])
     pv_sections = [
         int(row["allen_section_number"])
@@ -918,16 +834,12 @@ def build_symmetric_histology(
                 source_path = left_dataset / row["prepared_relative_path"]
                 with Image.open(source_path) as image:
                     observed = np.asarray(image.convert("RGB"))
-                if corrected:
-                    observed = observed[:, half_space["first_column"] :, :]
-                    if observed.shape[:2] != source_shape:
-                        raise ValueError("Corrected half-space slice changed grid shape")
                 section = int(row["allen_section_number"])
                 pv_result: PVMaskResult | None = None
                 if corrected:
                     cleaned = observed
                     shift_px = 0
-                    tissue_mask = np.any(observed != 0, axis=2)
+                    tissue_mask = np.ones(observed.shape[:2], dtype=bool)
                 elif row["stain"] == "pv":
                     unconstrained = generate_pv_mask(observed, section=section)
                     lower_bound = _pv_nissl_lower_bound(
@@ -986,7 +898,7 @@ def build_symmetric_histology(
                 if corrected and not np.array_equal(
                     bilateral[:, source_shape[1]:], observed
                 ):
-                    raise ValueError("Corrected observed pixels changed during union")
+                    raise ValueError("Aligned unilateral pixels changed during union")
                 if pv_result is not None and section in qc_sections:
                     pv_qc_samples.append((section, observed, pv_result, bilateral))
                 stain_dir = images_root / row["stain"]

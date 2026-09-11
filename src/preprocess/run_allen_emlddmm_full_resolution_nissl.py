@@ -12,7 +12,6 @@ import copy
 import csv
 import hashlib
 import json
-import math
 import os
 import shutil
 import sys
@@ -26,7 +25,7 @@ import torch
 from PIL import Image
 
 from preprocess.build_allen_symmetric_histology import (
-    _json, _write_image_sidecar, _write_rows,
+    _json, _write_image_sidecar, _write_rows, bilateral_union,
 )
 from preprocess.run_allen_emlddmm import (
     load_pinned_mri_image, pinned_emlddmm,
@@ -44,16 +43,24 @@ MRI = PROJECT / (
 MRI_PROVENANCE = PROJECT / (
     "data/derivatives/allen/specimen_708424/mri_7t_whole/mri_provenance.json"
 )
-INITIAL_A_HEMI = PROJECT / (
+INITIAL_A_SYMMETRIC = PROJECT / (
     "results/qc/allen_708424_mri7t_to_symmetric_nissl_initial_similitude.txt"
 )
+INITIAL_A_REPORT = PROJECT / (
+    "results/qc/allen_708424_mri7t_to_symmetric_nissl_initialization_report.txt"
+)
+INITIAL_A_SHA256 = "3a03af802d8ddfb347801a934080e7db809960c57c00e67e8366f1ec6ffd17eb"
 CLEAN_ROOT = PROJECT / "results/allen/specimen_708424/emlddmm/native-200um-clean"
 HEMI_ROOT = CLEAN_ROOT / "HIST_NISSL_LEFT_to_MRI_7T_WHOLE"
-SYMMETRIC_ROOT = CLEAN_ROOT / "HIST_NISSL_SYMMETRIC_to_MRI_7T_WHOLE"
+SYMMETRIC_ROOT = CLEAN_ROOT / (
+    "HIST_NISSL_SYMMETRIC_SECTION_ALIGNED_to_MRI_7T_WHOLE"
+)
+ATLAS_FREE_MANIFEST = HEMI_ROOT / "checkpoints/atlas-free.json"
 CLEAN_SYMMETRIC_DATASET = PROJECT / (
     "data/derivatives/allen/specimen_708424/"
-    "histology_symmetric_nissl_native_200um_clean"
+    "histology_symmetric_nissl_native_200um_section_aligned"
 )
+THROUGH_SCALE_DIRECTORY = "registration_through_400um"
 SPACING_UM = 200.0
 HEMI_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-lc188-linear-no-v"
 FINAL_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-lc188"
@@ -120,10 +127,11 @@ def load_native_stack(
 ) -> tuple[Any, list[dict[str, str]], np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
     """Load native J/W0 without any preliminary downsampling."""
     em, rows, samples, axes, observed = _native_context(dataset)
+    serial_count = len(axes[0])
     if dataset.resolve() == NATIVE_DATASET.resolve():
         shape = tuple(map(len, axes[1:]))
-        J = np.zeros((3, 2846, *shape), np.float32)
-        W0 = np.zeros((2846, *shape), np.float32)
+        J = np.zeros((3, serial_count, *shape), np.float32)
+        W0 = np.zeros((serial_count, *shape), np.float32)
         for index in observed:
             image, support = _read_original(NATIVE_VIEW / samples[int(index)]["sample_id"])
             if image.shape[1:] != shape:
@@ -132,8 +140,8 @@ def load_native_stack(
     else:
         support_root = dataset / "support/nissl"
         shape = tuple(map(len, axes[1:]))
-        J = np.zeros((3, 2846, *shape), np.float32)
-        W0 = np.zeros((2846, *shape), np.float32)
+        J = np.zeros((3, serial_count, *shape), np.float32)
+        W0 = np.zeros((serial_count, *shape), np.float32)
         view = dataset / "inputs/views/HIST_NISSL"
         for index in observed:
             path = view / samples[int(index)]["sample_id"]
@@ -165,7 +173,7 @@ def estimate_slice_initializer(dataset: Path, output: Path) -> dict[str, Any]:
     )
     observed_A2d = coarse.finite("atlas-free A2d", result["A2d"]).astype(np.float64)
     baseline = coarse.rigid_frame(observed_A2d)
-    expanded = np.repeat(baseline[None], 2846, axis=0)
+    expanded = np.repeat(baseline[None], len(xJ[0]), axis=0)
     expanded[observed] = observed_A2d
     atlas = output / "section_alignment_atlas_free"
     checkpoints = output / "checkpoints"
@@ -511,11 +519,16 @@ def _resume_scale_state(
 
 def checkpointed_multiscale(
     em: Any, *, config: dict[str, Any], checkpoint_dir: Path,
-    lineage: dict[str, Any], resume: bool,
+    lineage: dict[str, Any], resume: bool, stop_after_scale: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
     """Expose pinned scale boundaries while preserving its call semantics."""
     working = dict(config)
     nscales = _multiscale_count(working)
+    if stop_after_scale is not None and not 1 <= stop_after_scale <= nscales:
+        raise ValueError(
+            f"stop_after_scale must be between 1 and {nscales}, "
+            f"got {stop_after_scale}"
+        )
     print(f"Found {nscales} scales")
     start_scale = 0
     histories: list[np.ndarray] = []
@@ -527,6 +540,8 @@ def checkpointed_multiscale(
             working.update(continuation)
     outputs: list[dict[str, Any]] = []
     for scale_index in range(start_scale, nscales):
+        if stop_after_scale is not None and scale_index >= stop_after_scale:
+            break
         params = _scale_parameters(working, scale_index)
         captured: list[np.ndarray] = []
         previous_profile = sys.getprofile()
@@ -555,6 +570,301 @@ def checkpointed_multiscale(
         if params.get("slice_matching"):
             working["A2d"] = output["A2d"]
     return outputs, histories
+
+
+def _load_validated_symmetric_initial_affine(
+    dataset: Path,
+    *,
+    affine_path: Path = INITIAL_A_SYMMETRIC,
+    report_path: Path = INITIAL_A_REPORT,
+    mri_provenance_path: Path = MRI_PROVENANCE,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Validate that the pinned similitude targets the corrected symmetric frame."""
+    if dataset.resolve() != CLEAN_SYMMETRIC_DATASET.resolve():
+        raise RuntimeError("Symmetric initial A is restricted to the corrected derivative")
+    symmetry = json.loads(
+        (dataset / "metadata/symmetry.json").read_text(encoding="utf-8")
+    )
+    transforms = dataset / "metadata/transforms"
+    axes = [
+        np.load(transforms / name)
+        for name in (
+            "serial_axis_um.npy",
+            "row_axis_um.npy",
+            "symmetric_lr_axis_um.npy",
+        )
+    ]
+    expected_axes = (
+        (2846, -71125.0, 71125.0, 50.0),
+        (522, -52100.0, 52100.0, 200.0),
+        (730, -72900.0, 72900.0, 200.0),
+    )
+    for axis, (size, first, last, spacing) in zip(
+        axes, expected_axes, strict=True
+    ):
+        if (
+            axis.shape != (size,)
+            or not np.isclose(axis[0], first, atol=1e-8, rtol=0.0)
+            or not np.isclose(axis[-1], last, atol=1e-8, rtol=0.0)
+            or not np.allclose(np.diff(axis), spacing, atol=1e-8, rtol=0.0)
+        ):
+            raise RuntimeError(
+                "Corrected symmetric axes differ from the initial-A coordinate frame"
+            )
+    if (
+        symmetry.get("bilateral_shape_yx") != [len(axes[1]), len(axes[2])]
+        or symmetry.get("reflection_plane_um") != 0.0
+        or symmetry.get("medial_centers_um") != [-100.0, 100.0]
+        or not np.isclose(axes[2][len(axes[2]) // 2 - 1], -100.0)
+        or not np.isclose(axes[2][len(axes[2]) // 2], 100.0)
+    ):
+        raise RuntimeError("Corrected symmetric reflection geometry is incompatible")
+
+    if coarse.checksum(affine_path) != INITIAL_A_SHA256:
+        raise RuntimeError("Symmetric initial-A checksum changed")
+    affine = coarse.finite("symmetric initial A", np.loadtxt(affine_path)).astype(
+        np.float64
+    )
+    expected_linear = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    if (
+        affine.shape != (4, 4)
+        or not np.array_equal(affine[:3, :3], expected_linear)
+        or not np.array_equal(affine[3], [0.0, 0.0, 0.0, 1.0])
+    ):
+        raise RuntimeError("Symmetric initial A has the wrong direction convention")
+
+    mri_provenance = json.loads(
+        mri_provenance_path.read_text(encoding="utf-8")
+    )
+    mri_center_um = np.asarray(
+        mri_provenance["physical_center_mm"], dtype=np.float64
+    ) * 1000.0
+    mapped_center = affine @ np.r_[mri_center_um, 1.0]
+    if not np.allclose(
+        mapped_center, [-100.0, -100.0, 100.0, 1.0],
+        atol=2e-3,
+        rtol=0.0,
+    ):
+        raise RuntimeError("Symmetric initial A no longer maps the MRI center as audited")
+
+    report = report_path.read_text(encoding="utf-8")
+    required_report_lines = (
+        "HIST axis 0: -71125.000000 .. 71125.000000; increasing",
+        "HIST axis 1: -52100.000000 .. 52100.000000; increasing",
+        "HIST axis 2: -72900.000000 .. 72900.000000; increasing",
+        "A maps pinned-loader MRI physical coordinates in um to registered histology",
+    )
+    if any(line not in report for line in required_report_lines):
+        raise RuntimeError("Initial-A audit report does not describe the corrected frame")
+
+    audit = {
+        "status": "compatible",
+        "source": str(affine_path),
+        "sha256": INITIAL_A_SHA256,
+        "audit_report": str(report_path),
+        "direction": "MRI physical um to histology [serial,row,LR] physical um",
+        "histology_axis_sha256": [_array_sha256(axis) for axis in axes],
+        "histology_axis_lengths": [len(axis) for axis in axes],
+        "histology_axis_ranges_um": [
+            [float(axis[0]), float(axis[-1])] for axis in axes
+        ],
+        "histology_spacings_um": [
+            float(np.diff(axis).mean()) for axis in axes
+        ],
+        "reflection_plane_x_um": 0.0,
+        "mapped_mri_center_histology_um": mapped_center[:3].tolist(),
+        "compatibility_basis": (
+            "exact audited axis ranges/spacings, signed anatomical permutation, "
+            "affine checksum, zero-centered LR seam, and MRI-center mapping"
+        ),
+    }
+    return affine, audit
+
+
+def _identity_section_initializer(
+    dataset: Path,
+    observed: np.ndarray,
+    xJ: list[np.ndarray],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Use explicit identity A2d because corrected pixels are already aligned."""
+    if dataset.resolve() != CLEAN_SYMMETRIC_DATASET.resolve():
+        raise RuntimeError("Identity section initialization requires corrected symmetry")
+    transforms = dataset / "metadata/transforms"
+    saved_axes = [
+        np.load(transforms / name)
+        for name in (
+            "serial_axis_um.npy",
+            "row_axis_um.npy",
+            "symmetric_lr_axis_um.npy",
+        )
+    ]
+    if len(xJ) != 3 or any(
+        not np.array_equal(np.asarray(actual), saved)
+        for actual, saved in zip(xJ, saved_axes, strict=True)
+    ):
+        raise RuntimeError("Corrected symmetric registration axes changed")
+    provenance_path = transforms / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if (
+        provenance.get("schema") != "allen-native-symmetric-section-aligned-v1"
+        or provenance.get("materialization", {}).get("native_pixels_upsampled")
+        is not False
+        or provenance.get("materialization", {}).get("serial_coordinates_modified")
+        is not False
+    ):
+        raise RuntimeError("Corrected section-materialization provenance is invalid")
+    identities = np.asarray(observed, dtype=np.int64)
+    if identities.ndim != 1 or np.any(identities < 0) or np.any(
+        identities >= len(xJ[0])
+    ):
+        raise RuntimeError("Corrected observed indices are invalid")
+    A2d = np.repeat(
+        np.eye(3, dtype=np.float64)[None], len(xJ[0]), axis=0
+    )
+    initializer = {
+        "status": "complete",
+        "type": "explicit_identity_per_physical_serial_position",
+        "purpose": "already_materialized_section_stack",
+        "source_dataset": str(dataset),
+        "source_provenance": str(provenance_path),
+        "source_provenance_sha256": coarse.checksum(provenance_path),
+        "physical_serial_positions": len(xJ[0]),
+        "observed_sections": len(identities),
+        "A2d_shape": list(A2d.shape),
+        "A2d_sha256": _array_sha256(A2d),
+        "pinned_semantics": (
+            "equivalent to pinned emlddmm A2d=None initialization when "
+            "slice_matching=True; explicit identity is recorded for auditability"
+        ),
+        "left_atlas_free_A2d_reapplied": False,
+        "checksums": {
+            str(provenance_path): coarse.checksum(provenance_path),
+        },
+    }
+    return A2d, initializer
+
+
+def _validate_loaded_axes_against_initial_a(
+    xJ: list[np.ndarray], initial_A_validation: dict[str, Any] | None,
+) -> None:
+    if initial_A_validation is None:
+        return
+    actual = [_array_sha256(axis) for axis in xJ]
+    if actual != initial_A_validation.get("histology_axis_sha256"):
+        raise RuntimeError("Loaded histology axes differ from initial-A validation")
+
+
+def _serialize_through_scale_product(
+    em: Any,
+    *,
+    output: Path,
+    final: dict[str, Any],
+    histories: list[np.ndarray],
+    mri: Any,
+    hist: Any,
+    xI: list[np.ndarray],
+    xJ: list[np.ndarray],
+    observed: np.ndarray,
+    config: dict[str, Any],
+    lineage: dict[str, Any],
+    running: dict[str, Any],
+    completed_scale_number: int,
+) -> dict[str, Any]:
+    """Publish a normal transform/numerical product for an intentional coarse stop."""
+    total_scales = _multiscale_count(config)
+    if not 1 <= completed_scale_number < total_scales:
+        raise RuntimeError("Through-scale publication requires a non-final scale")
+    product = output / THROUGH_SCALE_DIRECTORY
+    if product.exists():
+        raise FileExistsError(f"Refusing to overwrite through-scale product: {product}")
+    product.mkdir(parents=True)
+    em.write_transform_outputs(str(product), final, mri, hist)
+
+    A = coarse.finite("through-scale A", final["A"])
+    A2d = coarse.finite("through-scale A2d", final["A2d"])
+    v = coarse.finite("through-scale v", final["v"])
+    xv = [
+        coarse.finite(f"through-scale xv{axis}", value)
+        for axis, value in enumerate(final["xv"])
+    ]
+    numerical = product / "numerical_outputs.npz"
+    np.savez_compressed(
+        numerical,
+        A=A,
+        A2d=A2d,
+        v=v,
+        xv0=xv[0],
+        xv1=xv[1],
+        xv2=xv[2],
+        xI0=xI[0],
+        xI1=xI[1],
+        xI2=xI[2],
+        xJ0=xJ[0],
+        xJ1=xJ[1],
+        xJ2=xJ[2],
+        observed=observed,
+    )
+    energy_paths = []
+    for level, history in enumerate(histories, 1):
+        path = product / f"raw_Esave_level-{level}.npy"
+        np.save(path, coarse.finite(f"raw Esave level {level}", history))
+        energy_paths.append(str(path))
+    params = _scale_parameters(config, completed_scale_number - 1)
+    effective = _effective_resolution(lineage, params)
+    provenance_path = product / "provenance.json"
+    provenance = {
+        "schema": "allen-native-registration-through-scale-v1",
+        "status": "complete_through_scale",
+        "source_dataset": lineage["source_dataset"],
+        "profile_name": lineage["profile_name"],
+        "completed_scale_number": completed_scale_number,
+        "completed_scale_index": completed_scale_number - 1,
+        "total_configured_scales": total_scales,
+        "native_input_inplane_um": 200.0,
+        "native_input_spacings_um": lineage["native_spacings_um"],
+        "completed_effective_resolution_um": effective,
+        "effective_inplane_um": float(effective["J"][1]),
+        "configured_final_scale_executed": False,
+        "full_configured_profile_preserved": True,
+        "numerical": str(numerical),
+        "transform_output_root": str(product),
+        "raw_Esave": energy_paths,
+        "effective_match_weight": None,
+        "effective_match_weight_note": (
+            "not returned at scale 2 because the unchanged profile has "
+            "full_outputs=False for configured scale index 1"
+        ),
+        "initial_A_validation": running.get("initial_A_validation"),
+        "section_initializer": running["initializer"],
+        "lineage": lineage,
+        "checksums": {
+            str(numerical): coarse.checksum(numerical),
+            **{path: coarse.checksum(Path(path)) for path in energy_paths},
+        },
+    }
+    coarse.atomic_json(provenance_path, provenance)
+    return {
+        **running,
+        "status": "complete_through_scale",
+        "completed_scale_number": completed_scale_number,
+        "completed_scale_index": completed_scale_number - 1,
+        "total_configured_scales": total_scales,
+        "native_input_inplane_um": 200.0,
+        "effective_inplane_um": float(effective["J"][1]),
+        "final_configured_scale_executed": False,
+        "through_scale_product": str(product),
+        "numerical": str(numerical),
+        "transform_output_root": str(product),
+        "raw_Esave": energy_paths,
+        "provenance": str(provenance_path),
+        "effective_match_weight": None,
+    }
 
 
 def _registration_lineage(
@@ -637,15 +947,36 @@ def _prepare_registration_output(
 
 
 def _registration(
-    dataset: Path, initializer_root: Path, output: Path,
-    *, stage: str, profile: str, initial_A: np.ndarray,
+    dataset: Path,
+    initializer_root: Path | None,
+    output: Path,
+    *,
+    stage: str,
+    profile: str,
+    initial_A: np.ndarray,
+    a2d_initialization: str = "atlas_free",
+    initial_A_validation: dict[str, Any] | None = None,
     restart_interrupted: bool = False,
+    stop_after_scale: int | None = None,
 ) -> dict[str, Any]:
     _prepare_registration_output(
         output, restart_interrupted=restart_interrupted
     )
     em, rows, observed, xJ, J, W0 = load_native_stack(dataset)
-    A2d, initializer = _load_initializer(initializer_root, observed)
+    _validate_loaded_axes_against_initial_a(xJ, initial_A_validation)
+    if a2d_initialization == "identity":
+        if initializer_root is not None:
+            raise RuntimeError("Identity A2d initialization must not use atlas-free")
+        A2d, initializer = _identity_section_initializer(
+            dataset, observed, xJ
+        )
+    elif a2d_initialization == "atlas_free":
+        if initializer_root is None:
+            raise RuntimeError("Atlas-free A2d initialization requires its root")
+        A2d, initializer = _load_initializer(initializer_root, observed)
+    else:
+        raise ValueError(f"Unknown A2d initialization: {a2d_initialization}")
+
     mri, I, xI = _load_native_mri(em)
     config = native_multiscale_configuration(
         I=I, xI=xI, J=J, xJ=xJ, W0=W0,
@@ -660,11 +991,27 @@ def _registration(
     reg.mkdir(parents=True, exist_ok=True)
     checkpoints.mkdir(exist_ok=True)
     running = {
-        "stage": stage, "status": "running", "profile": profile,
-        "source_dataset": str(dataset), "initializer": initializer,
-        "external_pre_downsample": {"I": [1, 1, 1], "J": [1, 1, 1], "W0": [1, 1, 1]},
-        "native_shapes": {"I": list(I.shape), "J": list(J.shape), "W0": list(W0.shape)},
-        "native_spacings_um": {"I": [200.0] * 3, "J": [50.0, 200.0, 200.0]},
+        "stage": stage,
+        "status": "running",
+        "profile": profile,
+        "source_dataset": str(dataset),
+        "initializer": initializer,
+        "initial_A_validation": initial_A_validation,
+        "requested_stop_after_scale": stop_after_scale,
+        "external_pre_downsample": {
+            "I": [1, 1, 1],
+            "J": [1, 1, 1],
+            "W0": [1, 1, 1],
+        },
+        "native_shapes": {
+            "I": list(I.shape),
+            "J": list(J.shape),
+            "W0": list(W0.shape),
+        },
+        "native_spacings_um": {
+            "I": [200.0] * 3,
+            "J": [50.0, 200.0, 200.0],
+        },
         "effective_inplane_um": [800.0, 400.0, 200.0],
         "initial_velocity": "implicit_zero",
         "scale_checkpoint_schema": SCALE_CHECKPOINT_SCHEMA,
@@ -674,12 +1021,52 @@ def _registration(
     }
     coarse.atomic_json(checkpoints / "registration.json", running)
     outputs, histories = checkpointed_multiscale(
-        em, config=config, checkpoint_dir=checkpoints, lineage=lineage,
+        em,
+        config=config,
+        checkpoint_dir=checkpoints,
+        lineage=lineage,
         resume=restart_interrupted,
+        stop_after_scale=stop_after_scale,
     )
-    if not outputs or len(histories) != _multiscale_count(config):
-        raise RuntimeError("Missing multiscale outputs or raw Esave histories")
+    total_scales = _multiscale_count(config)
+    expected_completed = (
+        total_scales if stop_after_scale is None else stop_after_scale
+    )
+    if not outputs or len(histories) != expected_completed:
+        raise RuntimeError(
+            "Missing newly executed scale output or raw Esave histories: "
+            f"expected {expected_completed}, got outputs={len(outputs)}, "
+            f"histories={len(histories)}"
+        )
     final = outputs[-1]
+    hist = coarse.LightImage(
+        "HIST_NISSL",
+        "HIST_NISSL",
+        J,
+        xJ,
+        "slice_dataset",
+        [str(index) for index in range(len(rows))],
+    )
+
+    if expected_completed < total_scales:
+        done = _serialize_through_scale_product(
+            em,
+            output=output,
+            final=final,
+            histories=histories,
+            mri=mri,
+            hist=hist,
+            xI=xI,
+            xJ=xJ,
+            observed=observed,
+            config=config,
+            lineage=lineage,
+            running=running,
+            completed_scale_number=expected_completed,
+        )
+        coarse.atomic_json(checkpoints / "registration.json", done)
+        return done
+
     A_final = coarse.finite("final A", final["A"])
     A2d_final = coarse.finite("final A2d", final["A2d"])
     v = coarse.finite("final v", final["v"])
@@ -687,10 +1074,6 @@ def _registration(
     coarse._save_final_effective_match_weight(
         final, observed, tuple(W0.shape),
         reg / "final_observed_effective_match_weight.npy",
-    )
-    hist = coarse.LightImage(
-        "HIST_NISSL", "HIST_NISSL", J, xJ, "slice_dataset",
-        [str(index) for index in range(2846)],
     )
     em.write_transform_outputs(str(reg), final, mri, hist)
     numerical = reg / "full_resolution_numerical_outputs.npz"
@@ -722,86 +1105,291 @@ def hemisphere_registration(
     return _registration(
         NATIVE_DATASET, HEMI_ROOT, HEMI_ROOT,
         stage="hemi-registration", profile=HEMI_PROFILE,
-        initial_A=np.loadtxt(INITIAL_A_HEMI),
+        initial_A=np.loadtxt(INITIAL_A_SYMMETRIC),
         restart_interrupted=restart_interrupted,
     )
 
 
-def _snap_axis(axis: np.ndarray) -> np.ndarray:
-    first = math.floor((float(axis[0]) - 100.0) / 200.0) * 200.0 + 100.0
-    last = math.ceil((float(axis[-1]) + 100.0) / 200.0) * 200.0 - 100.0
-    return np.arange(first, last + 100.0, 200.0, dtype=np.float64)
-
-
-def _mri_midline(A: np.ndarray) -> float:
-    provenance = json.loads(MRI_PROVENANCE.read_text(encoding="utf-8"))
-    center = np.asarray(provenance["physical_center_mm"], dtype=np.float64) * 1000.0
-    return float((np.asarray(A) @ np.r_[center, 1.0])[2])
-
-
-def symmetric_lr_axis(midline_um: float, valid_observed_max_um: float) -> np.ndarray:
-    """Return p±(100+200k), retaining the increasing-column hemisphere."""
-    half_count = max(
-        1, math.ceil((valid_observed_max_um - (midline_um + 100.0)) / 200.0) + 1
+def symmetric_lr_axis(half_width: int, spacing_um: float) -> np.ndarray:
+    """Return the historical between-column axis for a complete unilateral raster."""
+    if half_width < 1 or spacing_um <= 0.0:
+        raise ValueError("Symmetric histology requires a nonempty positive-spacing grid")
+    return (
+        np.arange(2 * half_width, dtype=np.float64) * spacing_um
+        - (half_width - 0.5) * spacing_um
     )
-    observed = midline_um + 100.0 + np.arange(half_count) * 200.0
-    return np.concatenate((2.0 * midline_um - observed[::-1], observed))
 
 
 def reflect_observed_half(
     image: np.ndarray, support: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Reflect RGB and missing-data validity identically without a medial copy."""
-    return (
-        np.concatenate((image[:, :, ::-1], image), axis=2),
-        np.concatenate((support[:, ::-1], support), axis=1),
+    """Apply the historical column flip/union to aligned RGB and validity."""
+    aligned = np.asarray(image)
+    validity = np.asarray(support)
+    if aligned.ndim != 3 or validity.shape != aligned.shape[1:]:
+        raise ValueError(
+            f"Aligned image/support shapes differ: {aligned.shape} versus "
+            f"{validity.shape}"
+        )
+    reflected_rgb = bilateral_union(np.moveaxis(aligned, 0, -1))
+    return np.moveaxis(reflected_rgb, -1, 0), bilateral_union(validity)
+
+
+def _resolve_atlas_free_output(manifest_path: Path, recorded: str) -> Path:
+    path = Path(recorded)
+    if not path.is_absolute():
+        path = manifest_path.parent.parent / path
+    return path.resolve()
+
+
+def _load_completed_atlas_free_manifest(
+    manifest_path: Path,
+) -> tuple[dict[str, Any], dict[str, Path], dict[str, str]]:
+    """Resolve and checksum every transform output recorded by atlas-free.json."""
+    checkpoint = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        checkpoint.get("stage") != "atlas-free"
+        or checkpoint.get("status") != "complete"
+    ):
+        raise RuntimeError("Atlas-free section alignment checkpoint is incomplete")
+    recorded_outputs = checkpoint.get("outputs")
+    recorded_checksums = checkpoint.get("checksums")
+    if not isinstance(recorded_outputs, dict) or not isinstance(
+        recorded_checksums, dict
+    ):
+        raise RuntimeError("Atlas-free checkpoint has no output/checksum inventory")
+    required = {"expanded_A2d", "observed_indices", "bookkeeping_frame"}
+    if not required.issubset(recorded_outputs):
+        raise RuntimeError("Atlas-free checkpoint is missing materialization outputs")
+
+    paths: dict[str, Path] = {}
+    checksums: dict[str, str] = {}
+    for key, recorded in recorded_outputs.items():
+        if not isinstance(recorded, str):
+            raise RuntimeError(f"Atlas-free output path {key!r} is invalid")
+        path = _resolve_atlas_free_output(manifest_path, recorded)
+        if not path.is_file():
+            raise FileNotFoundError(f"Atlas-free output is missing: {path}")
+        expected = recorded_checksums.get(recorded)
+        if expected is None:
+            expected = recorded_checksums.get(str(path))
+        actual = coarse.checksum(path)
+        if expected != actual:
+            raise RuntimeError(f"Atlas-free output checksum mismatch: {path}")
+        paths[str(key)] = path
+        checksums[str(key)] = actual
+    return checkpoint, paths, checksums
+
+
+def _common_frame_residuals(
+    A2d: np.ndarray,
+    observed: np.ndarray,
+    common_frame_path: Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove the shared unsupported-row bookkeeping frame exactly once."""
+    transforms = coarse.finite("atlas-free expanded A2d", A2d).astype(np.float64)
+    identities = np.asarray(observed, dtype=np.int64)
+    if transforms.ndim != 3 or transforms.shape[1:] != (3, 3):
+        raise RuntimeError("Atlas-free expanded A2d shape is invalid")
+    if (
+        identities.ndim != 1
+        or np.any(identities < 0)
+        or np.any(identities >= len(transforms))
+        or len(np.unique(identities)) != len(identities)
+    ):
+        raise RuntimeError("Atlas-free observed physical indices are invalid")
+    unsupported = np.ones(len(transforms), dtype=bool)
+    unsupported[identities] = False
+    if not np.any(unsupported):
+        raise RuntimeError("Atlas-free A2d has no unsupported bookkeeping rows")
+    baseline = A2d[unsupported][0]
+    if not np.array_equal(
+        A2d[unsupported], np.broadcast_to(baseline, A2d[unsupported].shape)
+    ):
+        raise RuntimeError("Atlas-free unsupported rows do not share one frame")
+    recorded_baseline = coarse.finite(
+        "atlas-free common bookkeeping frame", np.loadtxt(common_frame_path)
+    ).astype(np.float64)
+    if recorded_baseline.shape != (3, 3) or not np.array_equal(
+        recorded_baseline, baseline
+    ):
+        raise RuntimeError("Recorded atlas-free bookkeeping frame changed")
+    residual = np.linalg.inv(baseline)[None] @ A2d
+    return np.asarray(baseline, dtype=np.float64), residual
+
+
+def _validated_native_geometry(
+    rows: list[dict[str, str]],
+    observed: np.ndarray,
+    xJ: list[np.ndarray],
+    J: np.ndarray,
+    W0: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+    """Validate the native physical lattice without assuming dataset dimensions."""
+    axes = [np.asarray(axis, dtype=np.float64) for axis in xJ]
+    if len(axes) != 3 or any(axis.ndim != 1 or len(axis) < 2 for axis in axes):
+        raise RuntimeError("Native histology axes are invalid")
+    serial_count, row_count, column_count = map(len, axes)
+    if (
+        len(rows) != serial_count
+        or J.shape != (3, serial_count, row_count, column_count)
+        or W0.shape != (serial_count, row_count, column_count)
+    ):
+        raise RuntimeError("Native histology arrays, axes, and rows differ")
+    identities = np.asarray(observed, dtype=np.int64)
+    if (
+        identities.ndim != 1
+        or np.any(identities < 0)
+        or np.any(identities >= serial_count)
+        or len(np.unique(identities)) != len(identities)
+    ):
+        raise RuntimeError("Native observed section identities are invalid")
+    differences = [np.diff(axis) for axis in axes]
+    if any(
+        not np.allclose(delta, delta[0], atol=1e-8, rtol=0.0)
+        or delta[0] <= 0.0
+        for delta in differences
+    ):
+        raise RuntimeError("Native histology axes are not uniform and increasing")
+    serial_spacing, row_spacing, column_spacing = (
+        float(delta[0]) for delta in differences
     )
+    if not np.allclose(
+        [serial_spacing, row_spacing, column_spacing],
+        [50.0, SPACING_UM, SPACING_UM],
+        atol=1e-8,
+        rtol=0.0,
+    ):
+        raise RuntimeError("Native histology physical spacing changed")
+    return axes[1], axes[2], serial_spacing, row_spacing, column_spacing
+
+
+def _copy_transform_provenance(
+    metadata: Path,
+    *,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    source_paths: dict[str, Path],
+    source_checksums: dict[str, str],
+    baseline: np.ndarray,
+    observed: np.ndarray,
+    xJ: list[np.ndarray],
+    symmetric_axis: np.ndarray,
+) -> Path:
+    """Make the derivative independently intelligible if results/ is cleaned."""
+    transforms = metadata / "transforms"
+    transforms.mkdir()
+    copied: dict[str, Path] = {}
+    copy_names = {
+        "expanded_A2d": "atlas_free_expanded_A2d.npy",
+        "observed_A2d": "atlas_free_observed_A2d.npy",
+        "observed_indices": "observed_physical_indices.npy",
+        "bookkeeping_frame": "atlas_free_common_bookkeeping_frame.txt",
+    }
+    for key, name in copy_names.items():
+        if key in source_paths:
+            destination = transforms / name
+            shutil.copy2(source_paths[key], destination)
+            copied[key] = destination
+    manifest_copy = transforms / "atlas_free_manifest.json"
+    shutil.copy2(manifest_path, manifest_copy)
+    copied["manifest"] = manifest_copy
+
+    axis_paths = {
+        "serial_axis_um": transforms / "serial_axis_um.npy",
+        "row_axis_um": transforms / "row_axis_um.npy",
+        "left_lr_axis_um": transforms / "left_lr_axis_um.npy",
+        "symmetric_lr_axis_um": transforms / "symmetric_lr_axis_um.npy",
+    }
+    for path, axis in zip(
+        axis_paths.values(), [xJ[0], xJ[1], xJ[2], symmetric_axis]
+    ):
+        np.save(path, np.asarray(axis, dtype=np.float64))
+
+    derivative_checksums = {
+        path.relative_to(metadata.parent).as_posix(): coarse.checksum(path)
+        for path in [*copied.values(), *axis_paths.values()]
+    }
+    provenance_path = transforms / "provenance.json"
+    _json(provenance_path, {
+        "schema": "allen-native-symmetric-section-aligned-v1",
+        "native_source_dataset": str(NATIVE_DATASET),
+        "atlas_free_manifest_source": str(manifest_path),
+        "atlas_free_manifest_sha256": coarse.checksum(manifest_path),
+        "atlas_free_manifest": manifest,
+        "atlas_free_source_outputs": {
+            key: str(path) for key, path in source_paths.items()
+        },
+        "atlas_free_source_checksums_sha256": source_checksums,
+        "derivative_transform_checksums_sha256": derivative_checksums,
+        "observed_physical_indices_count": int(len(observed)),
+        "physical_serial_positions": int(len(xJ[0])),
+        "common_frame_normalization": {
+            "baseline_selection": "expanded_A2d[unsupported][0]",
+            "unsupported_definition": (
+                "all physical serial indices absent from observed_physical_indices"
+            ),
+            "unsupported_rows_share_baseline": "exact np.array_equal",
+            "formula": "residual[index] = inv(baseline) @ expanded_A2d[index]",
+            "baseline_matrix": np.asarray(baseline).tolist(),
+            "coordinate_units": "micrometers",
+            "translation_rescaling": "none",
+        },
+        "materialization": {
+            "operation": "coarse._warp_saved_section",
+            "target_row_axis": "row_axis_um.npy",
+            "target_column_axis": "left_lr_axis_um.npy",
+            "source_row_axis": "row_axis_um.npy",
+            "source_column_axis": "left_lr_axis_um.npy",
+            "native_pixels_upsampled": False,
+            "serial_coordinates_modified": False,
+        },
+        "symmetry": {
+            "channel_last_formula": (
+                "concatenate((flip(unilateral, axis=1), unilateral), axis=1)"
+            ),
+            "channel_first_lr_axis": 2,
+            "support_operation_identical": True,
+            "high_column_half": "complete pixel-identical original unilateral",
+            "low_column_half": "exact LR reversal of complete unilateral",
+            "medial_column_duplicated": False,
+            "reflection_plane_x_um": 0.0,
+        },
+    })
+    return provenance_path
 
 
 def construct_symmetric_histology(
     output: Path = CLEAN_SYMMETRIC_DATASET,
 ) -> dict[str, Any]:
-    """Materialize the hemisphere final A/A2d once, then reflect it exactly."""
+    """Materialize atlas-free aligned native left sections, then reflect exactly."""
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite clean derivative: {output}")
+    manifest_path = ATLAS_FREE_MANIFEST
+    manifest, transform_paths, transform_checksums = (
+        _load_completed_atlas_free_manifest(manifest_path)
+    )
+    source_dataset = Path(str(manifest.get("source_dataset", ""))).resolve()
+    if source_dataset != NATIVE_DATASET.resolve():
+        raise RuntimeError("Atlas-free checkpoint source is not the native Nissl stack")
+
     em, rows, observed, xJ, J, W0 = load_native_stack(NATIVE_DATASET)
-    numerical = HEMI_ROOT / "registration/full_resolution_numerical_outputs.npz"
-    with np.load(numerical) as saved:
-        A = coarse.finite("A_hemi_final", saved["A"]).astype(np.float64)
-        A2d = coarse.finite("A2d_hemi_final", saved["A2d"]).astype(np.float64)
-        saved_observed = np.asarray(saved["observed"], dtype=np.int64)
-    if A.shape != (4, 4) or A2d.shape != (2846, 3, 3):
-        raise RuntimeError("Hemisphere final transform shapes are invalid")
+    row_axis, observed_axis, serial_spacing, row_spacing, column_spacing = (
+        _validated_native_geometry(rows, observed, xJ, J, W0)
+    )
+    A2d = np.load(transform_paths["expanded_A2d"])
+    saved_observed = np.asarray(
+        np.load(transform_paths["observed_indices"]), dtype=np.int64
+    )
+    if A2d.shape != (len(xJ[0]), 3, 3):
+        raise RuntimeError("Atlas-free expanded A2d does not span the native lattice")
     if not np.array_equal(saved_observed, observed):
-        raise RuntimeError("Hemisphere final section identities changed")
-    unsupported = np.ones(2846, bool)
-    unsupported[observed] = False
-    baseline = A2d[unsupported][0]
-    if not np.array_equal(A2d[unsupported], np.broadcast_to(baseline, A2d[unsupported].shape)):
-        raise RuntimeError("Hemisphere unsupported rows do not share a frame")
-    registered = coarse._registered_frame_axes(xJ, baseline)
-    provisional_row, provisional_column = map(_snap_axis, registered)
-    residual = np.linalg.inv(baseline)[None] @ A2d
-    union_support = np.zeros((len(provisional_row), len(provisional_column)), bool)
-    for index in observed:
-        _, warped_support = coarse._warp_saved_section(
-            J[:, index], W0[index], residual[index],
-            provisional_row, provisional_column,
-            source_row_um=xJ[1], source_column_um=xJ[2],
-        )
-        union_support |= warped_support > 0
-    valid_rows, valid_columns = np.where(union_support)
-    if not valid_rows.size:
-        raise RuntimeError("Registered hemisphere validity is empty")
-    row_axis = provisional_row[valid_rows.min() : valid_rows.max() + 1]
-    p = _mri_midline(A)
-    observed_valid_columns = provisional_column[valid_columns]
-    observed_valid_columns = observed_valid_columns[observed_valid_columns > p]
-    if not observed_valid_columns.size:
-        raise RuntimeError("Registered validity does not reach the observed hemisphere")
-    valid_column_max = float(observed_valid_columns.max())
-    symmetric_axis = symmetric_lr_axis(p, valid_column_max)
-    observed_axis = symmetric_axis[len(symmetric_axis) // 2 :]
+        raise RuntimeError("Atlas-free observed identities differ from native stack")
+    baseline, residual = _common_frame_residuals(
+        A2d, saved_observed, transform_paths["bookkeeping_frame"]
+    )
+
+    symmetric_axis = symmetric_lr_axis(len(observed_axis), column_spacing)
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
     try:
         view = stage / "inputs/views/HIST_NISSL"
@@ -810,6 +1398,17 @@ def construct_symmetric_histology(
         view.mkdir(parents=True)
         support_dir.mkdir(parents=True)
         metadata.mkdir()
+        provenance_path = _copy_transform_provenance(
+            metadata,
+            manifest_path=manifest_path,
+            manifest=manifest,
+            source_paths=transform_paths,
+            source_checksums=transform_checksums,
+            baseline=baseline,
+            observed=observed,
+            xJ=xJ,
+            symmetric_axis=symmetric_axis,
+        )
         output_rows = [dict(row) for row in rows]
         present_indices = set(map(int, observed))
         samples = []
@@ -823,80 +1422,155 @@ def construct_symmetric_histology(
             if not present:
                 continue
             warped, support = coarse._warp_saved_section(
-                J[:, index], W0[index], residual[index], row_axis, observed_axis,
-                source_row_um=xJ[1], source_column_um=xJ[2],
+                J[:, index],
+                W0[index],
+                residual[index],
+                row_axis,
+                observed_axis,
+                source_row_um=xJ[1],
+                source_column_um=xJ[2],
             )
             symmetric, symmetric_support = reflect_observed_half(warped, support)
+            width = len(observed_axis)
+            expected_shape = (len(row_axis), 2 * width)
+            if (
+                warped.shape != (3, len(row_axis), width)
+                or support.shape != (len(row_axis), width)
+                or symmetric.shape[1:] != expected_shape
+                or symmetric_support.shape != expected_shape
+                or not np.array_equal(symmetric[:, :, :width], warped[:, :, ::-1])
+                or not np.array_equal(symmetric[:, :, width:], warped)
+                or not np.array_equal(symmetric_support[:, :width], support[:, ::-1])
+                or not np.array_equal(symmetric_support[:, width:], support)
+            ):
+                raise RuntimeError(
+                    "Symmetry did not preserve the complete aligned unilateral raster"
+                )
             rgb = np.moveaxis(
                 np.rint(np.clip(symmetric, 0.0, 1.0) * 255.0).astype(np.uint8),
                 0, -1,
             )
-            Image.fromarray(rgb).save(view / name, format="TIFF", compression="tiff_deflate")
+            Image.fromarray(rgb).save(
+                view / name, format="TIFF", compression="tiff_deflate"
+            )
             tifffile.imwrite(support_dir / name, symmetric_support.astype(np.float32))
             _write_image_sidecar(
-                view / name, shape_yx=rgb.shape[:2],
+                view / name,
+                shape_yx=rgb.shape[:2],
                 origin_xy_um=(float(symmetric_axis[0]), float(row_axis[0])),
                 z_um=float(row["serial_z_center_mm"]) * 1000.0,
-                pixel_size_um=200.0,
+                pixel_size_um=column_spacing,
             )
-            row["prepared_relative_path"] = (Path("inputs/views/HIST_NISSL") / name).as_posix()
-        _write_rows(metadata / "physical_sections.tsv", output_rows, list(output_rows[0]))
-        _write_rows(view / "samples.tsv", samples, ["sample_id", "participant_id", "species", "status"])
-        canvas = {
+            row["prepared_relative_path"] = (
+                Path("inputs/views/HIST_NISSL") / name
+            ).as_posix()
+
+        _write_rows(
+            metadata / "physical_sections.tsv",
+            output_rows,
+            list(output_rows[0]),
+        )
+        _write_rows(
+            view / "samples.tsv",
+            samples,
+            ["sample_id", "participant_id", "species", "status"],
+        )
+        _json(metadata / "loader_canvas_audit.json", {
             "accepted_canvas_shape_yx": [len(row_axis), len(symmetric_axis)],
-            "target_spacing_um": 200.0,
-            "global_translation_xy_um": [float(symmetric_axis[0]), float(row_axis[0])],
+            "target_spacing_um": column_spacing,
+            "global_translation_xy_um": [
+                float(symmetric_axis[0]), float(row_axis[0])
+            ],
             "preserve_source_grid": True,
-        }
-        _json(metadata / "loader_canvas_audit.json", canvas)
+        })
         _json(metadata / "symmetry.json", {
-            "pixel_size_um": 200.0,
+            "pixel_size_um": column_spacing,
+            "serial_spacing_um": serial_spacing,
+            "unilateral_shape_yx": [len(row_axis), len(observed_axis)],
             "bilateral_shape_yx": [len(row_axis), len(symmetric_axis)],
-            "bilateral_origin_xy_um": [float(symmetric_axis[0]), float(row_axis[0])],
+            "bilateral_origin_xy_um": [
+                float(symmetric_axis[0]), float(row_axis[0])
+            ],
             "reflection_axis": "histology_column_lr",
-            "reflection_plane_um": p,
-            "medial_centers_um": [p - 100.0, p + 100.0],
+            "reflection_plane_um": 0.0,
+            "medial_centers_um": [
+                -column_spacing / 2.0, column_spacing / 2.0
+            ],
             "operation": "exact_reflection_no_medial_duplication",
             "support_semantics": "validity_missing_data_not_tissue",
             "source_dataset": str(NATIVE_DATASET),
-            "source_transforms": str(numerical),
+            "source_transforms": str(manifest_path),
+            "transform_provenance": str(provenance_path.relative_to(stage)),
         })
         _json(stage / "dataset.json", {
-            "dataset": "clean native 200-um registered symmetric Nissl",
+            "dataset": "native 200-um section-aligned symmetric Nissl",
             "space_name": "HIST_SYMMETRIC_NATIVE_200UM",
             "preparation_mode": "preserve_source_grid",
-            "pixel_size_um": 200.0,
+            "pixel_size_um": column_spacing,
+            "serial_spacing_um": serial_spacing,
+            "physical_serial_positions": len(xJ[0]),
+            "nissl_count": len(observed),
+            "unilateral_shape_yx": [len(row_axis), len(observed_axis)],
             "prepared_canvas_shape_yx": [len(row_axis), len(symmetric_axis)],
         })
+
         qc = stage / "native_symmetric_stack_orthogonal.png"
-        J_qc = np.zeros((3, len(observed), len(row_axis), len(symmetric_axis)), np.float32)
-        W_qc = np.zeros((len(observed), len(row_axis), len(symmetric_axis)), np.float32)
+        J_qc = np.zeros(
+            (3, len(observed), len(row_axis), len(symmetric_axis)),
+            np.float32,
+        )
+        W_qc = np.zeros(
+            (len(observed), len(row_axis), len(symmetric_axis)),
+            np.float32,
+        )
         for order, index in enumerate(observed):
-            name = f"allen_708424_nissl_{int(rows[index]['allen_section_number']):04d}.tif"
-            J_qc[:, order] = tifffile.imread(view / name).transpose(2, 0, 1) / 255.0
+            name = (
+                f"allen_708424_nissl_"
+                f"{int(rows[index]['allen_section_number']):04d}.tif"
+            )
+            J_qc[:, order] = (
+                tifffile.imread(view / name).transpose(2, 0, 1) / 255.0
+            )
             W_qc[order] = tifffile.imread(support_dir / name)
         coarse._emlddmm_stack_draw_qc(
-            em, J_qc, W_qc, [xJ[0][observed], row_axis, symmetric_axis],
-            qc, "Clean native 200-um symmetric Nissl",
+            em,
+            J_qc,
+            W_qc,
+            [xJ[0][observed], row_axis, symmetric_axis],
+            qc,
+            "Native 200-um atlas-free section-aligned symmetric Nissl",
         )
         os.replace(stage, output)
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
         raise
-    return {"output": str(output), "midline_um": p, "spacing_um": 200.0}
+    return {
+        "output": str(output),
+        "atlas_free_manifest": str(manifest_path),
+        "physical_serial_positions": len(xJ[0]),
+        "observed_sections": len(observed),
+        "unilateral_shape_yx": [len(row_axis), len(observed_axis)],
+        "symmetric_shape_yx": [len(row_axis), len(symmetric_axis)],
+        "spacing_um": [serial_spacing, row_spacing, column_spacing],
+        "reflection_plane_um": 0.0,
+        "qc": str(output / "native_symmetric_stack_orthogonal.png"),
+    }
 
 
 def symmetric_registration(
-    *, restart_interrupted: bool = False,
+    *, restart_interrupted: bool = False, stop_after_scale: int | None = None,
 ) -> dict[str, Any]:
-    hemi_path = HEMI_ROOT / "registration/full_resolution_numerical_outputs.npz"
-    with np.load(hemi_path) as saved:
-        A_hemi_final = np.asarray(saved["A"]).copy()
+    initial_A, initial_A_validation = _load_validated_symmetric_initial_affine(
+        CLEAN_SYMMETRIC_DATASET
+    )
     return _registration(
-        CLEAN_SYMMETRIC_DATASET, SYMMETRIC_ROOT, SYMMETRIC_ROOT,
+        CLEAN_SYMMETRIC_DATASET, None, SYMMETRIC_ROOT,
         stage="symmetric-registration", profile=FINAL_PROFILE,
-        initial_A=A_hemi_final,
+        initial_A=initial_A,
+        a2d_initialization="identity",
+        initial_A_validation=initial_A_validation,
         restart_interrupted=restart_interrupted,
+        stop_after_scale=stop_after_scale,
     )
 
 
@@ -924,10 +1598,20 @@ def main() -> int:
             "checkpoint and registration outputs"
         ),
     )
+    parser.add_argument(
+        "--stop-after-scale",
+        type=int,
+        choices=(1, 2, 3),
+        help="stop successfully after this one-based configured scale number",
+    )
     args = parser.parse_args()
     registration_stages = {"hemi-registration", "symmetric-registration"}
     if args.restart_interrupted and args.stage not in registration_stages:
         parser.error("--restart-interrupted applies only to registration stages")
+    if args.stop_after_scale is not None and args.stage != "symmetric-registration":
+        parser.error(
+            "--stop-after-scale applies only to symmetric-registration"
+        )
     actions = {
         "hemi-atlas-free": lambda: estimate_slice_initializer(NATIVE_DATASET, HEMI_ROOT),
         "hemi-registration": lambda: hemisphere_registration(
@@ -938,7 +1622,8 @@ def main() -> int:
             CLEAN_SYMMETRIC_DATASET, SYMMETRIC_ROOT
         ),
         "symmetric-registration": lambda: symmetric_registration(
-            restart_interrupted=args.restart_interrupted
+            restart_interrupted=args.restart_interrupted,
+            stop_after_scale=args.stop_after_scale,
         ),
         "postprocess": postprocess,
     }

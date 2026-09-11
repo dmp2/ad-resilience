@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 from collections import Counter
 from pathlib import Path
@@ -10,10 +11,11 @@ import pytest
 from PIL import Image
 
 from preprocess.build_allen_symmetric_histology import (
-    _registered_left_half_space,
     _symmetric_geometry,
+    _validate_left_source,
     apply_tissue_mask,
     bilateral_union,
+    build_symmetric_histology,
     hemisphere_origin_mask,
     generate_pv_mask,
     shift_to_medial_edge,
@@ -176,6 +178,31 @@ def test_bilateral_union_is_one_observation_with_exact_reflection() -> None:
     np.testing.assert_array_equal(mask[:, 3:], 2)
 
 
+def test_bilateral_union_preserves_every_unilateral_column_and_support() -> None:
+    unilateral = np.arange(3 * 5 * 3, dtype=np.uint8).reshape(3, 5, 3)
+    support = np.array(
+        [
+            [False, True, False, True, True],
+            [True, False, False, True, False],
+            [False, False, True, True, False],
+        ]
+    )
+
+    bilateral = bilateral_union(unilateral)
+    bilateral_support = bilateral_union(support)
+
+    assert bilateral.shape == (unilateral.shape[0], 2 * unilateral.shape[1], 3)
+    assert bilateral_support.shape == (
+        support.shape[0], 2 * support.shape[1]
+    )
+    np.testing.assert_array_equal(bilateral[:, 5:], unilateral)
+    np.testing.assert_array_equal(bilateral[:, :5], np.flip(unilateral, axis=1))
+    np.testing.assert_array_equal(bilateral_support[:, 5:], support)
+    np.testing.assert_array_equal(
+        bilateral_support[:, :5], np.flip(support, axis=1)
+    )
+
+
 
 
 
@@ -217,38 +244,34 @@ def test_preserved_reflection_plane_retains_nonzero_source_axis() -> None:
     assert axes[2][0] == 436779.5
     np.testing.assert_allclose(axes[2][54], 480729.94859813084)
 
-def test_registered_left_half_space_snaps_edge_and_preserves_pixels() -> None:
-    source = np.arange(2 * 6 * 3, dtype=np.uint8).reshape(2, 6, 3)
-    geometry = {
-        "directions": ["none", [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
-        "origin_xy": [10.0, 20.0],
-    }
-    affine = np.array(
-        [
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]
+def test_builder_symmetry_does_not_select_columns_from_mri_geometry() -> None:
+    source = (
+        inspect.getsource(_validate_left_source)
+        + inspect.getsource(build_symmetric_histology)
     )
-    half = _registered_left_half_space(
-        source.shape[:2], geometry, affine, mri_midline_um=15.99
-    )
-    assert half["first_column"] == 3
-    assert half["boundary_um"] == 15.0
-    assert abs(half["boundary_discrepancy_um"]) < 1.0
-    np.testing.assert_array_equal(
-        half["column_coordinates_um"], [16.0, 18.0, 20.0]
-    )
-    retained = source[:, half["first_column"] :, :]
-    bilateral = bilateral_union(retained)
-    np.testing.assert_array_equal(bilateral[:, retained.shape[1] :], retained)
-    np.testing.assert_array_equal(bilateral[:, : retained.shape[1]], retained[:, ::-1])
+    for forbidden in (
+        "MRI_PROVENANCE", "_registered_left_half_space", "first_column",
+        "boundary_um", "mri_midline",
+    ):
+        assert forbidden not in source
 
-    with pytest.raises(ValueError, match="within half a source column"):
-        _registered_left_half_space(
-            source.shape[:2], geometry, affine, mri_midline_um=16.0
-        )
+
+def test_aligned_coarse_raster_restores_full_bilateral_shape() -> None:
+    geometry = _symmetric_geometry(
+        (130, 91),
+        {
+            "directions": [
+                "none",
+                [813.8517084080959, 0.0, 0.0],
+                [0.0, 813.8517084080959, 0.0],
+            ],
+            "origin_xy": [450618.3454653041, -361346.5096708343],
+        },
+    )
+    assert geometry["source_shape_yx"] == [130, 91]
+    assert geometry["bilateral_shape_yx"] == [130, 182]
+    assert geometry["reflection_plane"]["coordinate_um"] == 0.0
+
 
 def test_symmetric_grid_and_plane_are_derived_from_source_geometry() -> None:
     geometry = _symmetric_geometry(
