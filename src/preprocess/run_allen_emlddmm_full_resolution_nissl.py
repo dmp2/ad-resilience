@@ -25,7 +25,13 @@ import torch
 from PIL import Image
 
 from preprocess.build_allen_symmetric_histology import (
-    _json, _write_image_sidecar, _write_rows, bilateral_union,
+    _json,
+    _project_annotation,
+    _read_rows,
+    _read_zarr_v3_uint32,
+    _write_image_sidecar,
+    _write_rows,
+    bilateral_union,
 )
 from preprocess.run_allen_emlddmm import (
     load_pinned_mri_image, pinned_emlddmm,
@@ -60,6 +66,10 @@ CLEAN_SYMMETRIC_DATASET = PROJECT / (
     "data/derivatives/allen/specimen_708424/"
     "histology_symmetric_nissl_native_200um_section_aligned"
 )
+SYMMETRIC_ANNOTATION_DATASET = PROJECT / (
+    "data/derivatives/allen/specimen_708424/"
+    "annotations_symmetric_nissl_native_200um_section_aligned"
+)
 THROUGH_SCALE_DIRECTORY = "registration_through_400um"
 SPACING_UM = 200.0
 HEMI_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-lc188-linear-no-v"
@@ -92,17 +102,24 @@ def _coarse_context(dataset: Path, output: Path):
     saved = (
         coarse.DATASET, coarse.VIEW, coarse.OUTPUT, coarse.CHECKPOINTS,
         coarse.ATLAS_DIR, coarse.REG_DIR, coarse.POST_DIR, coarse.ANNOTATION_DIR,
+        coarse.ANNOTATION_DATASET,
     )
     coarse.DATASET = dataset
+    coarse.ANNOTATION_DATASET = (
+        SYMMETRIC_ANNOTATION_DATASET
+        if dataset.resolve() == CLEAN_SYMMETRIC_DATASET.resolve() else dataset
+    )
     coarse.VIEW = dataset / "inputs/views/HIST_NISSL"
     coarse.configure_output_root(output)
+    if dataset.resolve() == CLEAN_SYMMETRIC_DATASET.resolve():
+        coarse.ANNOTATION_DIR = output / "annotations_on_native_mri"
     try:
         yield
     finally:
         (
             coarse.DATASET, coarse.VIEW, coarse.OUTPUT, coarse.CHECKPOINTS,
             coarse.ATLAS_DIR, coarse.REG_DIR, coarse.POST_DIR,
-            coarse.ANNOTATION_DIR,
+            coarse.ANNOTATION_DIR, coarse.ANNOTATION_DATASET,
         ) = saved
 
 
@@ -1557,6 +1574,433 @@ def construct_symmetric_histology(
     }
 
 
+def warp_categorical_section(
+    labels: np.ndarray,
+    transform: np.ndarray,
+    row_um: np.ndarray,
+    column_um: np.ndarray,
+    *,
+    source_row_um: np.ndarray | None = None,
+    source_column_um: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply the Nissl physical pullback with categorical nearest-neighbor."""
+    categorical = np.asarray(labels)
+    if categorical.ndim != 2 or not np.issubdtype(categorical.dtype, np.integer):
+        raise ValueError("Categorical section must be a 2-D integer raster")
+    iy, ix = coarse._section_sample_indices(
+        transform,
+        row_um,
+        column_um,
+        source_row_um=source_row_um,
+        source_column_um=source_column_um,
+    )
+    return coarse.ndi.map_coordinates(
+        categorical,
+        [iy, ix],
+        order=0,
+        mode="constant",
+        cval=0,
+        prefilter=False,
+    ).astype(np.uint32)
+
+
+def _prepared_projection_transform(
+    source_rows: dict[int, dict[str, str]], section: int
+) -> tuple[Path, dict[str, Any]]:
+    row = source_rows.get(section)
+    if row is None or row.get("image_present") != "true" or row.get("stain") != "nissl":
+        raise RuntimeError(f"Annotated Allen section {section} has no source Nissl")
+    prepared = NATIVE_DATASET / row["prepared_relative_path"]
+    transform_path = prepared.with_name(
+        f"{prepared.stem}_prepared-to-source.json"
+    )
+    if not transform_path.is_file() or transform_path.is_symlink():
+        raise RuntimeError(f"Missing prepared-to-source transform: {transform_path}")
+    return transform_path, json.loads(transform_path.read_text(encoding="utf-8"))
+
+
+def construct_symmetric_annotations(
+    output: Path = SYMMETRIC_ANNOTATION_DATASET,
+) -> dict[str, Any]:
+    """Project, residual-warp, and exactly reflect all Allen annotations."""
+    output = output.resolve()
+    parent = CLEAN_SYMMETRIC_DATASET.resolve()
+    if output == parent or parent in output.parents:
+        raise RuntimeError("Annotation output must not modify the parent Nissl derivative")
+    if output.exists():
+        raise FileExistsError(f"Refusing to overwrite annotation derivative: {output}")
+
+    parent_transforms = parent / "metadata/transforms"
+    axis_names = (
+        "serial_axis_um.npy",
+        "row_axis_um.npy",
+        "left_lr_axis_um.npy",
+        "symmetric_lr_axis_um.npy",
+    )
+    serial_axis, row_axis, left_axis, symmetric_axis = [
+        np.load(parent_transforms / name) for name in axis_names
+    ]
+    parent_dataset = json.loads((parent / "dataset.json").read_text(encoding="utf-8"))
+    parent_symmetry = json.loads(
+        (parent / "metadata/symmetry.json").read_text(encoding="utf-8")
+    )
+    left_shape = (len(row_axis), len(left_axis))
+    bilateral_shape = (len(row_axis), len(symmetric_axis))
+    if (
+        tuple(parent_dataset.get("unilateral_shape_yx", ())) != left_shape
+        or tuple(parent_dataset.get("prepared_canvas_shape_yx", ())) != bilateral_shape
+        or tuple(parent_symmetry.get("unilateral_shape_yx", ())) != left_shape
+        or tuple(parent_symmetry.get("bilateral_shape_yx", ())) != bilateral_shape
+        or len(symmetric_axis) != 2 * len(left_axis)
+    ):
+        raise RuntimeError("Parent Nissl axes and declared dimensions differ")
+
+    expanded = np.load(parent_transforms / "atlas_free_expanded_A2d.npy")
+    observed = np.asarray(
+        np.load(parent_transforms / "observed_physical_indices.npy"), dtype=np.int64
+    )
+    baseline, residual = _common_frame_residuals(
+        expanded,
+        observed,
+        parent_transforms / "atlas_free_common_bookkeeping_frame.txt",
+    )
+    parent_rows, _ = _read_rows(parent / "metadata/physical_sections.tsv")
+    source_rows_list, _ = _read_rows(
+        NATIVE_DATASET / "metadata/physical_sections.tsv"
+    )
+    if len(parent_rows) != len(serial_axis) or len(source_rows_list) != len(serial_axis):
+        raise RuntimeError("Physical-section inventory does not span the parent axes")
+    physical_by_allen = {
+        int(row["allen_section_number"]): index
+        for index, row in enumerate(parent_rows)
+    }
+    source_by_allen = {
+        int(row["allen_section_number"]): row for row in source_rows_list
+    }
+    observed_set = set(map(int, observed))
+
+    annotation_manifest, _ = _read_rows(
+        coarse.ANNOTATION_ZARR / "metadata/manifest.tsv"
+    )
+    if len(annotation_manifest) != 106:
+        raise RuntimeError(
+            f"Expected 106 source annotation sections, found {len(annotation_manifest)}"
+        )
+    source_dataset_path = coarse.ANNOTATION_ZARR / "dataset.json"
+    source_dataset = json.loads(source_dataset_path.read_text(encoding="utf-8"))
+    source_structures = (
+        PROJECT / "data/raw/allen/specimen_708424/metadata/structures.tsv"
+    )
+    if coarse.checksum(source_structures) != source_dataset["source"]["raw_structures_sha256"]:
+        raise RuntimeError("Source annotation structure hierarchy checksum differs")
+
+    stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
+    inventory: list[dict[str, Any]] = []
+    projection_rows: list[dict[str, Any]] = []
+    graphic_group_counts: dict[int, int] = {}
+    metadata_by_section: dict[str, Any] = {}
+    source_label_ids: set[int] = set()
+    output_label_ids: set[int] = set()
+    try:
+        annotations_root = stage / "annotations"
+        metadata_root = stage / "metadata"
+        transforms_root = metadata_root / "transforms"
+        annotations_root.mkdir(parents=True)
+        transforms_root.mkdir(parents=True)
+
+        transform_copy_names = {
+            "provenance.json": "parent_nissl_provenance.json",
+            **{name: name for name in (
+                *axis_names,
+                "atlas_free_expanded_A2d.npy",
+                "atlas_free_observed_A2d.npy",
+                "observed_physical_indices.npy",
+                "atlas_free_common_bookkeeping_frame.txt",
+                "atlas_free_manifest.json",
+            )},
+        }
+        copied_transform_checksums: dict[str, str] = {}
+        for source_name, destination_name in transform_copy_names.items():
+            source = parent_transforms / source_name
+            if not source.is_file() or source.is_symlink():
+                raise RuntimeError(f"Missing parent transform provenance: {source}")
+            destination = transforms_root / destination_name
+            shutil.copy2(source, destination)
+            copied_transform_checksums[
+                destination.relative_to(stage).as_posix()
+            ] = coarse.checksum(destination)
+
+        present_sections: list[int] = []
+        for manifest_row in annotation_manifest:
+            section = int(manifest_row["section_number"])
+            physical_index = physical_by_allen.get(section)
+            if physical_index is None or physical_index not in observed_set:
+                raise RuntimeError(
+                    f"Annotated Allen section {section} is not an observed parent section"
+                )
+            if parent_rows[physical_index].get("stain") != "nissl":
+                raise RuntimeError(f"Annotated Allen section {section} is not Nissl")
+            transform_path, projection_transform = _prepared_projection_transform(
+                source_by_allen, section
+            )
+            projection_rows.append({
+                "section_number": section,
+                "physical_index": physical_index,
+                "prepared_to_source_path": str(transform_path),
+                "prepared_to_source_sha256": coarse.checksum(transform_path),
+                "residual_formula": "inv(baseline) @ expanded_A2d[index]",
+            })
+            package = coarse.ANNOTATION_ZARR / manifest_row["path"]
+            labels_metadata = json.loads(
+                (package / "labels/zarr.json").read_text(encoding="utf-8")
+            )
+            declared_names = labels_metadata.get("attributes", {}).get("ome", {}).get(
+                "labels", []
+            )
+            group_ids = json.loads(manifest_row["graphic_groups_present"])
+            if declared_names != [f"group-{value}" for value in group_ids]:
+                raise RuntimeError(
+                    f"Graphic-group order differs for Allen section {section}"
+                )
+            section_metadata: dict[str, Any] = {
+                "graphic_groups": [],
+                "source_package": str(package),
+                "source_package_tree_sha256": manifest_row["tree_sha256"],
+            }
+            for group_id in group_ids:
+                group_name = f"group-{group_id}"
+                group_root = package / "labels" / group_name
+                group_metadata = json.loads(
+                    (group_root / "zarr.json").read_text(encoding="utf-8")
+                ).get("attributes", {})
+                labels = _read_zarr_v3_uint32(group_root / "0")
+                projected = _project_annotation(
+                    labels, projection_transform, left_shape
+                )
+                aligned = warp_categorical_section(
+                    projected,
+                    residual[physical_index],
+                    row_axis,
+                    left_axis,
+                    source_row_um=row_axis,
+                    source_column_um=left_axis,
+                )
+                bilateral = bilateral_union(aligned)
+                if (
+                    aligned.shape != left_shape
+                    or bilateral.shape != bilateral_shape
+                    or not np.array_equal(
+                        bilateral[:, : len(left_axis)], aligned[:, ::-1]
+                    )
+                    or not np.array_equal(
+                        bilateral[:, len(left_axis) :], aligned
+                    )
+                ):
+                    raise RuntimeError(
+                        f"Exact annotation symmetry failed for Allen section {section}"
+                    )
+                source_ids = {int(value) for value in np.unique(labels) if value}
+                aligned_ids = {int(value) for value in np.unique(aligned) if value}
+                if not aligned_ids.issubset(source_ids):
+                    raise RuntimeError(
+                        f"Categorical warp created label IDs for Allen section {section}"
+                    )
+                source_label_ids.update(source_ids)
+                output_label_ids.update(aligned_ids)
+                group_dir = annotations_root / group_name
+                group_dir.mkdir(exist_ok=True)
+                destination = group_dir / f"section-{section:04d}.tif"
+                tifffile.imwrite(destination, bilateral, compression="deflate")
+                reloaded = tifffile.imread(destination)
+                if reloaded.dtype != np.uint32 or not np.array_equal(reloaded, bilateral):
+                    raise RuntimeError(f"Categorical TIFF round trip changed {destination}")
+                inventory.append({
+                    "section_number": section,
+                    "graphic_group_id": int(group_id),
+                    "path": destination.relative_to(stage).as_posix(),
+                    "sha256": coarse.checksum(destination),
+                    "sampling": "categorical_nearest_neighbor",
+                    "right_origin": "synthetically_reflected",
+                })
+                graphic_group_counts[int(group_id)] = (
+                    graphic_group_counts.get(int(group_id), 0) + 1
+                )
+                section_metadata["graphic_groups"].append({
+                    "graphic_group_id": int(group_id),
+                    "ome_and_allen_metadata": group_metadata,
+                    "source_label_ids": sorted(source_ids),
+                    "aligned_label_ids": sorted(aligned_ids),
+                })
+            metadata_by_section[str(section)] = section_metadata
+            present_sections.append(section)
+
+        expected_sections = sorted(int(row["section_number"]) for row in annotation_manifest)
+        if sorted(present_sections) != expected_sections or len(set(present_sections)) != 106:
+            raise RuntimeError("Annotation section identity/inventory changed")
+        if output_label_ids != source_label_ids:
+            raise RuntimeError(
+                "Aligned annotation label-ID inventory differs from the source"
+            )
+        _write_rows(
+            metadata_root / "annotations.tsv",
+            inventory,
+            [
+                "section_number", "graphic_group_id", "path", "sha256",
+                "sampling", "right_origin",
+            ],
+        )
+        _write_rows(
+            metadata_root / "source_projection_transforms.tsv",
+            projection_rows,
+            [
+                "section_number", "physical_index", "prepared_to_source_path",
+                "prepared_to_source_sha256", "residual_formula",
+            ],
+        )
+        shutil.copy2(source_structures, annotations_root / "structures.tsv")
+        shutil.copy2(
+            coarse.ANNOTATION_ZARR / "metadata/manifest.tsv",
+            metadata_root / "source_annotation_manifest.tsv",
+        )
+        shutil.copy2(source_dataset_path, metadata_root / "source_annotations_dataset.json")
+        _json(metadata_root / "annotation_metadata.json", {
+            "graphic_groups": source_dataset["graphic_groups"],
+            "sections": metadata_by_section,
+            "source_label_ids": sorted(source_label_ids),
+            "aligned_label_ids": sorted(output_label_ids),
+            "aligned_ids_subset_of_source": output_label_ids.issubset(source_label_ids),
+        })
+        _json(metadata_root / "symmetry.json", {
+            "symmetric_space": "HIST_SYMMETRIC",
+            "image_operation": "exact_reflection_and_union_without_interpolation",
+            "operation": "exact_reflection_no_medial_duplication",
+            "parent_nissl_derivative": str(parent),
+            "parent_nissl_dataset_json_sha256": coarse.checksum(parent / "dataset.json"),
+            "pixel_size_um": float(np.diff(left_axis).mean()),
+            "unilateral_shape_yx": list(left_shape),
+            "bilateral_shape_yx": list(bilateral_shape),
+            "bilateral_origin_xy_um": [
+                float(symmetric_axis[0]), float(row_axis[0])
+            ],
+            "reflection_axis": "histology_column_lr",
+            "reflection_plane_um": 0.0,
+            "medial_centers_um": [
+                float(symmetric_axis[len(left_axis) - 1]),
+                float(symmetric_axis[len(left_axis)]),
+            ],
+            "left_half_columns": [len(left_axis), len(symmetric_axis) - 1],
+            "synthetic_reflection_columns": [0, len(left_axis) - 1],
+            "concatenation": "[flipped_aligned_left | aligned_left]",
+            "columns_cropped": 0,
+            "categorical_interpolation": "nearest_neighbor",
+            "right_origin": "synthetically_reflected",
+        })
+        projection_manifest = metadata_root / "source_projection_transforms.tsv"
+        transform_provenance = {
+            "schema": "allen-native-symmetric-annotations-v1",
+            "parent_nissl_derivative": str(parent),
+            "parent_nissl_dataset_json_sha256": coarse.checksum(parent / "dataset.json"),
+            "parent_nissl_symmetry_sha256": coarse.checksum(
+                parent / "metadata/symmetry.json"
+            ),
+            "parent_nissl_physical_sections_sha256": coarse.checksum(
+                parent / "metadata/physical_sections.tsv"
+            ),
+            "source_annotations_ome_zarr": str(coarse.ANNOTATION_ZARR.resolve()),
+            "source_annotations_dataset_json_sha256": coarse.checksum(source_dataset_path),
+            "source_annotations_manifest_sha256": coarse.checksum(
+                coarse.ANNOTATION_ZARR / "metadata/manifest.tsv"
+            ),
+            "source_structures_sha256": coarse.checksum(source_structures),
+            "prepared_projection_manifest": str(
+                projection_manifest.relative_to(stage)
+            ),
+            "prepared_projection_manifest_sha256": coarse.checksum(projection_manifest),
+            "copied_parent_transform_checksums_sha256": copied_transform_checksums,
+            "baseline_selection": "expanded_A2d[unsupported][0]",
+            "residual_formula": "inv(baseline) @ expanded_A2d[index]",
+            "baseline_matrix": baseline.tolist(),
+            "section_transform_semantics": "coarse._section_sample_indices",
+            "categorical_sampling": {
+                "operation": "scipy.ndimage.map_coordinates",
+                "order": 0,
+                "mode": "constant",
+                "cval": 0,
+                "prefilter": False,
+            },
+            "left_atlas_free_transform_applications": 1,
+            "mri_geometry_used": False,
+            "axes": {
+                "serial": "metadata/transforms/serial_axis_um.npy",
+                "row": "metadata/transforms/row_axis_um.npy",
+                "unilateral_lr": "metadata/transforms/left_lr_axis_um.npy",
+                "symmetric_lr": "metadata/transforms/symmetric_lr_axis_um.npy",
+                "lengths": [
+                    len(serial_axis), len(row_axis), len(left_axis), len(symmetric_axis)
+                ],
+                "units": "micrometers",
+            },
+            "symmetry": {
+                "formula": "concatenate((flip(aligned_left, axis=1), aligned_left), axis=1)",
+                "exact": True,
+                "interpolation": False,
+                "columns_cropped": 0,
+                "medial_column_duplicated": False,
+            },
+        }
+        _json(transforms_root / "provenance.json", transform_provenance)
+        _json(stage / "dataset.json", {
+            "dataset": "native 200-um section-aligned symmetric Allen annotations",
+            "space_name": "HIST_SYMMETRIC",
+            "symmetric_space": "HIST_SYMMETRIC",
+            "parent_nissl_derivative": str(parent),
+            "parent_nissl_dataset_json_sha256": coarse.checksum(parent / "dataset.json"),
+            "annotations_ome_zarr_source": str(coarse.ANNOTATION_ZARR.resolve()),
+            "annotation_section_count": len(expected_sections),
+            "annotation_image_count": len(inventory),
+            "graphic_group_counts": {
+                str(key): value for key, value in sorted(graphic_group_counts.items())
+            },
+            "source_label_ids": sorted(source_label_ids),
+            "aligned_label_ids": sorted(output_label_ids),
+            "label_id_inventory_preserved": True,
+            "label_ids_changed_by_interpolation": False,
+            "pixel_size_um": float(np.diff(left_axis).mean()),
+            "unilateral_shape_yx": list(left_shape),
+            "prepared_canvas_shape_yx": list(bilateral_shape),
+            "transform_provenance": "metadata/transforms/provenance.json",
+        })
+
+        from preprocess.visualize_allen_annotations import write_bilateral_montage
+
+        qc_root = stage / "qc"
+        qc_root.mkdir()
+        for section in (1532, 1616):
+            write_bilateral_montage(
+                stage,
+                section,
+                output=qc_root / f"section-{section:04d}.png",
+                annotations_zarr=coarse.ANNOTATION_ZARR,
+                panel_width=480,
+            )
+        os.replace(stage, output)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    return {
+        "output": str(output),
+        "parent_nissl_derivative": str(parent),
+        "annotation_section_count": 106,
+        "annotation_image_count": len(inventory),
+        "unilateral_shape_yx": list(left_shape),
+        "bilateral_shape_yx": list(bilateral_shape),
+        "qc": [
+            str(output / "qc/section-1532.png"),
+            str(output / "qc/section-1616.png"),
+        ],
+    }
+
+
 def symmetric_registration(
     *, restart_interrupted: bool = False, stop_after_scale: int | None = None,
 ) -> dict[str, Any]:
@@ -1589,7 +2033,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", choices=(
         "hemi-atlas-free", "hemi-registration", "construct-symmetric",
-        "symmetric-atlas-free", "symmetric-registration", "postprocess",
+        "construct-annotations", "symmetric-atlas-free",
+        "symmetric-registration", "postprocess",
     ))
     parser.add_argument(
         "--restart-interrupted", action="store_true",
@@ -1618,6 +2063,7 @@ def main() -> int:
             restart_interrupted=args.restart_interrupted
         ),
         "construct-symmetric": construct_symmetric_histology,
+        "construct-annotations": construct_symmetric_annotations,
         "symmetric-atlas-free": lambda: estimate_slice_initializer(
             CLEAN_SYMMETRIC_DATASET, SYMMETRIC_ROOT
         ),

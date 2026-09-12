@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import sys
 from dataclasses import dataclass
@@ -41,6 +42,21 @@ BOUNDARY_OVERLAY_TITLE = "Combined boundaries on Nissl"
 class Panel:
     title: str
     image: Image.Image
+
+
+class _StoredMetadataGroup:
+    """Read group attributes without requiring Zarr when arrays are external."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        payload = json.loads((path / "zarr.json").read_text(encoding="utf-8"))
+        self.attrs = payload.get("attributes", {})
+
+    def __getitem__(self, name: str) -> "_StoredMetadataGroup":
+        child = self.path / name
+        if not (child / "zarr.json").is_file():
+            raise KeyError(name)
+        return _StoredMetadataGroup(child)
 
 
 def _mapping(value: Any, description: str) -> Mapping[str, Any]:
@@ -451,7 +467,21 @@ def load_bilateral_panels(
         raise RuntimeError(
             f"Bilateral derivative is not a regular directory: {dataset}"
         )
-    physical = _tsv_rows(dataset / "metadata/physical_sections.tsv")
+    image_dataset = dataset
+    physical_path = dataset / "metadata/physical_sections.tsv"
+    if not physical_path.is_file():
+        try:
+            derivative = json.loads(
+                (dataset / "dataset.json").read_text(encoding="utf-8")
+            )
+            parent_recorded = derivative["parent_nissl_derivative"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "Annotation-only derivative has no valid parent Nissl reference"
+            ) from exc
+        image_dataset = Path(parent_recorded).expanduser().resolve()
+        physical_path = image_dataset / "metadata/physical_sections.tsv"
+    physical = _tsv_rows(physical_path)
     matches = [
         row
         for row in physical
@@ -462,7 +492,7 @@ def load_bilateral_panels(
             f"Bilateral derivative must contain one present section {section_number}"
         )
     image_path = _derivative_path(
-        dataset, matches[0].get("prepared_relative_path", ""), "section image"
+        image_dataset, matches[0].get("prepared_relative_path", ""), "section image"
     )
     try:
         with Image.open(image_path) as image:
@@ -503,7 +533,11 @@ def load_bilateral_panels(
             f"Source OME-Zarr package is not a regular directory: {package}"
         )
     try:
-        root = zarr.open_group(str(package), mode="r")
+        root = (
+            _StoredMetadataGroup(package)
+            if zarr is None
+            else zarr.open_group(str(package), mode="r")
+        )
     except Exception as exc:
         raise RuntimeError(f"Cannot open source OME-Zarr package {package}") from exc
     source_attrs = _mapping(dict(root.attrs), "source root attributes")

@@ -43,6 +43,7 @@ PEAK_FILE = Path(os.environ.get("EMLDDMM_RSS_PEAK_FILE", RUN_TMP / "process_grou
 DEFAULT_DATASET = PROJECT / "data/derivatives/allen/specimen_708424/emlddmm_7t_symmetric"
 OBSERVED_LEFT_DATASET = PROJECT / "data/derivatives/allen/specimen_708424/emlddmm_7t"
 DATASET = DEFAULT_DATASET
+ANNOTATION_DATASET = DATASET
 VIEW = DATASET / "inputs/views/HIST_NISSL"
 MRI = PROJECT / "data/derivatives/allen/specimen_708424/mri_7t_whole/T1_rot_space-MRI_7T_WHOLE_desc-header-corrected.nii"
 MRI_PROV = PROJECT / "data/derivatives/allen/specimen_708424/mri_7t_whole/mri_provenance.json"
@@ -565,10 +566,11 @@ class LightImage:
     space:str; name:str; data:np.ndarray; x:list[np.ndarray]; title:str; names:list[str]
     def fnames(self): return self.names
 
-def load_checkpoint(stage, checkpoint_root=None):
+def load_checkpoint(stage, checkpoint_root=None, *, accepted_statuses=("complete",)):
     checkpoint_root = CHECKPOINTS if checkpoint_root is None else checkpoint_root
     p=checkpoint_root/f"{stage}.json"; d=json.loads(p.read_text())
-    if d.get("status")!="complete": raise RuntimeError(f"{stage} checkpoint incomplete")
+    if d.get("status") not in accepted_statuses:
+        raise RuntimeError(f"{stage} checkpoint incomplete")
     for path,digest in d.get("checksums",{}).items():
         if checksum(Path(path))!=digest: raise RuntimeError(f"checkpoint checksum mismatch: {path}")
     return d
@@ -1297,11 +1299,149 @@ def _source_inventory(checkpoints: dict[str, Any]) -> tuple[dict[str, str], dict
     }
 
 
+def _resolve_recorded_checkpoint_path(
+    checkpoint_path: Path, recorded: str, *, description: str
+) -> Path:
+    if not isinstance(recorded, str) or not recorded:
+        raise RuntimeError(f"Registration checkpoint has no recorded {description} path")
+    path = Path(recorded).expanduser()
+    if not path.is_absolute():
+        path = checkpoint_path.parent.parent / path
+    path = path.resolve()
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f"Recorded {description} is not a regular file: {path}")
+    return path
+
+
+def _registration_output_value(registration: dict[str, Any], key: str) -> Any:
+    outputs = registration.get("outputs")
+    if isinstance(outputs, dict) and key in outputs:
+        return outputs[key]
+    return registration.get(key)
+
+
+def _native_postprocess_sources(
+    registration: dict[str, Any],
+) -> tuple[Path, list[Path], Path | None, dict[str, str], dict[str, Any]]:
+    """Resolve and hash the native product exactly as recorded by its checkpoint."""
+    checkpoint_path = CHECKPOINTS / "registration.json"
+    status = registration.get("status")
+    if status not in {"complete", "complete_through_scale"}:
+        raise RuntimeError("Registration checkpoint is not a usable completed product")
+    numerical = _resolve_recorded_checkpoint_path(
+        checkpoint_path, _registration_output_value(registration, "numerical"),
+        description="numerical package",
+    )
+    raw_recorded = _registration_output_value(registration, "raw_Esave")
+    if not isinstance(raw_recorded, list) or not raw_recorded:
+        raise RuntimeError("Registration checkpoint has no recorded raw_Esave list")
+    raw_paths = [
+        _resolve_recorded_checkpoint_path(
+            checkpoint_path, value, description=f"raw_Esave level {level}"
+        )
+        for level, value in enumerate(raw_recorded, 1)
+    ]
+    if status == "complete_through_scale":
+        completed = registration.get("completed_scale_number")
+        if not isinstance(completed, int) or completed < 1:
+            raise RuntimeError("Through-scale checkpoint has no valid completed scale")
+        if len(raw_paths) != completed:
+            raise RuntimeError(
+                "Recorded raw_Esave count does not match completed scale number"
+            )
+    effective_recorded = _registration_output_value(
+        registration, "effective_match_weight"
+    )
+    if effective_recorded is None and status == "complete":
+        effective_recorded = _registration_output_value(
+            registration, "final_effective_match_weight"
+        )
+    if effective_recorded is None:
+        if status != "complete_through_scale":
+            raise RuntimeError(
+                "Complete registration checkpoint has no effective match weight"
+            )
+        effective_path = None
+    else:
+        effective_path = _resolve_recorded_checkpoint_path(
+            checkpoint_path, effective_recorded,
+            description="effective match weight",
+        )
+    provenance_recorded = _registration_output_value(registration, "provenance")
+    provenance_path = (
+        _resolve_recorded_checkpoint_path(
+            checkpoint_path, provenance_recorded,
+            description="registration provenance",
+        )
+        if provenance_recorded is not None else None
+    )
+    if provenance_path is not None:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        for recorded, expected in provenance.get("checksums", {}).items():
+            candidate = _resolve_recorded_checkpoint_path(
+                checkpoint_path, recorded, description="provenance checksum source"
+            )
+            if checksum(candidate) != expected:
+                raise RuntimeError(
+                    f"Registration-product checksum mismatch: {candidate}"
+                )
+    product_recorded = _registration_output_value(
+        registration, "transform_output_root"
+    ) or registration.get("through_scale_product")
+    product_root = (
+        Path(product_recorded).expanduser()
+        if isinstance(product_recorded, str) and product_recorded
+        else numerical.parent
+    )
+    if not product_root.is_absolute():
+        product_root = checkpoint_path.parent.parent / product_root
+    product_root = product_root.resolve()
+    if not product_root.is_dir() or product_root.is_symlink():
+        raise RuntimeError(f"Recorded registration product is not a directory: {product_root}")
+    product_files = []
+    for path in product_root.rglob("*"):
+        if path.is_symlink():
+            raise RuntimeError(f"Registration product contains a symlink: {path}")
+        if path.is_file():
+            product_files.append(path.resolve())
+    checkpoint_files = [
+        path.resolve()
+        for path in CHECKPOINTS.glob("registration*")
+        if path.is_file() and not path.is_symlink()
+    ]
+    protected = sorted(
+        set([numerical, *raw_paths, *product_files, *checkpoint_files]
+            + ([effective_path] if effective_path is not None else [])
+            + ([provenance_path] if provenance_path is not None else [])),
+        key=str,
+    )
+    source_hashes = {str(path): checksum(path) for path in protected}
+    validation = {
+        "checkpoint_status": status,
+        "registration_checkpoint": str(checkpoint_path),
+        "numerical_package": str(numerical),
+        "raw_objective_histories": [str(path) for path in raw_paths],
+        "effective_match_weight": (
+            str(effective_path) if effective_path is not None else None
+        ),
+        "effective_match_weight_missing_is_legitimate": (
+            status == "complete_through_scale" and effective_path is None
+        ),
+        "registration_product_root": str(product_root),
+        "protected_source_file_count": len(source_hashes),
+        "numerical_package_verified": True,
+        "recorded_paths_used": True,
+    }
+    return numerical, raw_paths, effective_path, source_hashes, validation
+
+
 def _coarse_affine(
-    xI: list[np.ndarray], *, expected_shape: tuple[int, int, int] | None = (237, 284, 254)
+    xI: list[np.ndarray], *,
+    expected_shape: tuple[int, int, int] | None = (237, 284, 254),
+    grid_name: str = "coarse",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if expected_shape is not None and tuple(map(len, xI)) != expected_shape:
-        raise RuntimeError(f"Unexpected coarse MRI axes: {tuple(map(len, xI))}")
+        raise RuntimeError(f"Unexpected {grid_name} MRI axes: {tuple(map(len, xI))}")
     affine = np.eye(4, dtype=np.float64)
     spacings = []
     for axis, coordinates in enumerate(xI):
@@ -1325,7 +1465,7 @@ def _coarse_affine(
         expected = np.asarray([xI[axis][index[axis]] for axis in range(3)])
         errors.append(float(np.max(np.abs(measured - expected))))
     if max(errors) > 1e-6:
-        raise RuntimeError("Coarse MRI affine coordinate audit failed")
+        raise RuntimeError(f"{grid_name.capitalize()} MRI affine coordinate audit failed")
     return affine, {
         "shape": list(map(len, xI)),
         "axes_um": [
@@ -1340,7 +1480,8 @@ def _coarse_affine(
 
 
 def _final_residual_diagnostics(
-    rows, axes, observed, final: np.ndarray
+    rows, axes, observed, final: np.ndarray, *,
+    comparison_initializer: str = "atlas_free",
 ) -> tuple[np.ndarray, dict[str, Any], list[dict[str, Any]]]:
     unsupported = np.ones(2846, dtype=bool)
     unsupported[observed] = False
@@ -1399,11 +1540,24 @@ def _final_residual_diagnostics(
     panels[-1].set_xlabel("canonical anterior-to-posterior serial coordinate (mm)")
     figure.suptitle("Final section residuals after removal of the shared unsupported-row baseline")
     _atomic_figure(POST_DIR / "final_section_residual_traces.png", figure)
-    atlas_full = finite("atlas-free expanded A2d", np.load(ATLAS_DIR / "expanded_2846_A2d.npy"))
-    atlas_baseline = finite(
-        "atlas-free bookkeeping frame", np.loadtxt(ATLAS_DIR / "common_bookkeeping_frame.txt")
-    )
-    atlas_residual = np.linalg.inv(atlas_baseline)[None] @ atlas_full[observed]
+    if comparison_initializer == "identity":
+        initial_residual = np.broadcast_to(
+            np.eye(3, dtype=np.float64), (len(observed), 3, 3)
+        )
+        initial_baseline = "identity per physical serial position"
+    elif comparison_initializer == "atlas_free":
+        atlas_full = finite(
+            "atlas-free expanded A2d",
+            np.load(ATLAS_DIR / "expanded_2846_A2d.npy"),
+        )
+        atlas_baseline = finite(
+            "atlas-free bookkeeping frame",
+            np.loadtxt(ATLAS_DIR / "common_bookkeeping_frame.txt"),
+        )
+        initial_residual = np.linalg.inv(atlas_baseline)[None] @ atlas_full[observed]
+        initial_baseline = "atlas-free common_bookkeeping_frame"
+    else:
+        raise ValueError(f"Unknown residual comparison initializer: {comparison_initializer}")
     comparisons = []
     for allen in FLAGGED_ALLEN:
         position = flagged_by_allen[allen]
@@ -1413,13 +1567,13 @@ def _final_residual_diagnostics(
                 "column_translation_um": float(matrix[1, 2]),
                 "rotation_deg": float(np.degrees(np.arctan2(matrix[1, 0], matrix[0, 0]))),
             }
-        initial = components(atlas_residual[position])
+        initial = components(initial_residual[position])
         final_value = components(residual[position])
         comparisons.append({
             "allen_section": allen,
             "physical_index": int(observed[position]),
             "serial_z_um": float(serial[position]),
-            "initial_baseline": "atlas-free common_bookkeeping_frame",
+            "initial_baseline": initial_baseline,
             "final_baseline": "common matrix shared by 2,205 unsupported final A2d rows",
             "initial": initial,
             "final": final_value,
@@ -1434,17 +1588,28 @@ def _final_residual_diagnostics(
         "recomposition_max_abs_error": error,
         "largest_adjacent_jump_physical_indices": observed[largest].astype(int).tolist(),
         "flagged_allen_sections": list(FLAGGED_ALLEN),
+        "comparison_initializer": comparison_initializer,
+        "comparison_initial_baseline": initial_baseline,
         "tsv": str(path),
         "figure": str(POST_DIR / "final_section_residual_traces.png"),
     }
     return baseline, report, comparisons
 
 
-def _objective_figure() -> dict[str, Any]:
-    figure, panels = plt.subplots(2, 1, figsize=(10, 7), squeeze=False)
+def _objective_figure(
+    raw_history_paths: list[Path] | None = None,
+) -> dict[str, Any]:
+    paths = (
+        [REG_DIR / f"raw_Esave_level-{level}.npy" for level in (1, 2)]
+        if raw_history_paths is None else list(raw_history_paths)
+    )
+    if not paths:
+        raise RuntimeError("No raw objective histories were recorded")
+    figure, panels = plt.subplots(
+        len(paths), 1, figsize=(10, 3.5 * len(paths)), squeeze=False
+    )
     shapes = []
-    for level in (1, 2):
-        path = REG_DIR / f"raw_Esave_level-{level}.npy"
+    for level, path in enumerate(paths, 1):
         history = finite(f"raw Esave level {level}", np.load(path))
         if history.ndim == 1:
             history = history[:, None]
@@ -1781,9 +1946,12 @@ def _sample_chain_slabs(
     propagated = np.memmap(
         RUN_TMP / "nissl_support_on_mri.dat", mode="w+", dtype=np.float32, shape=shape
     )
-    propagated_effective = np.memmap(
-        RUN_TMP / "effective_match_weight_on_mri.dat", mode="w+",
-        dtype=np.float32, shape=shape,
+    propagated_effective = (
+        np.memmap(
+            RUN_TMP / "effective_match_weight_on_mri.dat", mode="w+",
+            dtype=np.float32, shape=shape,
+        )
+        if effective_match_weight is not None else None
     )
     for start in range(0, shape[1], 8):
         stop = min(start + 8, shape[1])
@@ -1802,11 +1970,13 @@ def _sample_chain_slabs(
         sampled_support = np.clip(ndi.map_coordinates(
             support, hist_indices, order=1, mode="constant", cval=0.0, prefilter=False
         ), 0.0, 1.0).astype(np.float32)
-        sampled_effective = np.clip(ndi.map_coordinates(
-            effective_match_weight, hist_indices, order=1, mode="constant",
-            cval=0.0, prefilter=False,
-        ), 0.0, 1.0).astype(np.float32)
-        sampled_effective[sampled_support <= 0.0] = 0.0
+        sampled_effective = None
+        if effective_match_weight is not None:
+            sampled_effective = np.clip(ndi.map_coordinates(
+                effective_match_weight, hist_indices, order=1, mode="constant",
+                cval=0.0, prefilter=False,
+            ), 0.0, 1.0).astype(np.float32)
+            sampled_effective[sampled_support <= 0.0] = 0.0
         output = np.zeros((*sampled_support.shape, 3), dtype=np.float32)
         positive = sampled_support > 0.0
         for channel in range(3):
@@ -1817,16 +1987,19 @@ def _sample_chain_slabs(
             output[..., channel][positive] = sampled[positive] / sampled_support[positive]
         if (not np.all(np.isfinite(output))
                 or not np.all(np.isfinite(sampled_support))
-                or not np.all(np.isfinite(sampled_effective))):
+                or (sampled_effective is not None
+                    and not np.all(np.isfinite(sampled_effective)))):
             raise RuntimeError("Nonfinite Nissl reconstruction slab")
         if np.any(output[~positive] != 0.0):
             raise RuntimeError("Nissl intensity is nonzero outside propagated support")
         reconstruction[:, start:stop] = output
         propagated[:, start:stop] = sampled_support
-        propagated_effective[:, start:stop] = sampled_effective
+        if propagated_effective is not None:
+            propagated_effective[:, start:stop] = sampled_effective
         reconstruction.flush()
         propagated.flush()
-        propagated_effective.flush()
+        if propagated_effective is not None:
+            propagated_effective.flush()
         print(f"sampled saved Nissl MRI slab {start}:{stop}", flush=True)
     if not np.any(propagated > 0) or not np.any(reconstruction != 0):
         raise RuntimeError("Saved-output Nissl reconstruction is blank")
@@ -1836,6 +2009,8 @@ def _sample_chain_slabs(
 def _mri_nissl_figures(
     mri, xI, reconstruction, support, effective_match_weight,
     mri_midline_um: float,
+    *,
+    grid_name: str = "coarse",
 ):
     axis0 = np.asarray(xI[0], dtype=np.float64)
     if not np.all(np.diff(axis0) > 0.0):
@@ -1854,7 +2029,11 @@ def _mri_nissl_figures(
         lo, hi = np.percentile(base, [1, 99])
         base = np.clip((base - lo) / (hi - lo + 1e-8), 0, 1)
         nissl = np.asarray(reconstruction[:, position, :])
-        effective = np.asarray(effective_match_weight[:, position, :])
+        effective = np.asarray(
+            support[:, position, :]
+            if effective_match_weight is None
+            else effective_match_weight[:, position, :]
+        )
         display_nissl = np.clip(nissl, 0.0, 1.0)
         departure_from_white = np.sqrt(
             np.mean((1.0 - display_nissl) ** 2, axis=-1)
@@ -1880,12 +2059,17 @@ def _mri_nissl_figures(
                 linewidth=0.8,
             )
         panels[0, column].set_title(f"axis-1 {position}\n{xI[1][position] / 1000:.1f} mm")
-    row_labels = (
-        "MRI",
-        "Registered Nissl",
-        "Effective match weight (WM × W0)",
-        "MRI + weighted Nissl",
+    weight_label = (
+        "Propagated Nissl support"
+        if effective_match_weight is None
+        else "Effective match weight (WM × W0)"
     )
+    overlay_label = (
+        "MRI + support-weighted Nissl"
+        if effective_match_weight is None
+        else "MRI + weighted Nissl"
+    )
+    row_labels = ("MRI", "Registered Nissl", weight_label, overlay_label)
     for row, label in enumerate(row_labels):
         box = panels[row, 0].get_position()
         figure.text(0.005, (box.y0 + box.y1) / 2.0, label,
@@ -1916,7 +2100,7 @@ def _mri_nissl_figures(
         panels[1, column].imshow(mview.T, origin="lower", extent=extent, aspect="auto", cmap="gray")
         panels[0, column].set_title(f"registered Nissl — axis {column}")
         panels[1, column].set_title(f"MRI — axis {column}")
-    figure.suptitle("Coarse-grid orthogonal views with physical extents")
+    figure.suptitle(f"{grid_name.capitalize()}-grid orthogonal views with physical extents")
     orthogonal = POST_DIR / "registered_nissl_orthogonal_overview.png"
     _atomic_figure(orthogonal, figure)
     return {"registration_overview": str(overview), "orthogonal_overview": str(orthogonal)}
@@ -1931,9 +2115,8 @@ class _StoredOmeMetadata:
 
 
 def _annotation_sources(rows, samples, axes, observed) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], list[tuple[int, tuple[int, ...]]]]:
-    inventory_path = DATASET / "metadata/annotations.tsv"
-    physical_path = DATASET / "metadata/physical_sections.tsv"
-    symmetry_path = DATASET / "metadata/symmetry.json"
+    inventory_path = ANNOTATION_DATASET / "metadata/annotations.tsv"
+    symmetry_path = ANNOTATION_DATASET / "metadata/symmetry.json"
     canvas_path = DATASET / "metadata/loader_canvas_audit.json"
     symmetry = json.loads(symmetry_path.read_text())
     canvas = json.loads(canvas_path.read_text())
@@ -1941,8 +2124,26 @@ def _annotation_sources(rows, samples, axes, observed) -> tuple[list[dict[str, A
         raise RuntimeError("Annotation derivative is not in HIST_SYMMETRIC")
     if symmetry.get("image_operation") != "exact_reflection_and_union_without_interpolation":
         raise RuntimeError("Unexpected symmetrization history")
-    if symmetry.get("bilateral_shape_yx") != [522, 730] or symmetry.get("pixel_size_um") != 200.0:
+    expected_shape = [len(axes[1]), len(axes[2])]
+    if (
+        symmetry.get("bilateral_shape_yx") != expected_shape
+        or symmetry.get("pixel_size_um") != canvas.get("target_spacing_um")
+    ):
         raise RuntimeError("Unexpected symmetric annotation geometry")
+    if ANNOTATION_DATASET.resolve() != DATASET.resolve():
+        parent_recorded = symmetry.get("parent_nissl_derivative")
+        if (
+            not isinstance(parent_recorded, str)
+            or Path(parent_recorded).resolve() != DATASET.resolve()
+        ):
+            raise RuntimeError(
+                "Annotation derivative has the wrong parent Nissl derivative"
+            )
+        if (
+            symmetry.get("parent_nissl_dataset_json_sha256")
+            != checksum(DATASET / "dataset.json")
+        ):
+            raise RuntimeError("Annotation parent Nissl checksum differs")
     if not np.allclose(symmetry.get("bilateral_origin_xy_um"), [axes[2][0], axes[1][0]]):
         raise RuntimeError("Symmetric derivative origin differs from loader axes")
     with inventory_path.open(encoding="utf-8", newline="") as stream:
@@ -1967,7 +2168,7 @@ def _annotation_sources(rows, samples, axes, observed) -> tuple[list[dict[str, A
         prepared = VIEW / samples[index]["sample_id"]
         with Image.open(prepared) as image:
             prepared_shape = [image.height, image.width]
-        if prepared_shape != [522, 730]:
+        if prepared_shape != expected_shape:
             raise RuntimeError(f"Prepared Nissl geometry mismatch for Allen {allen}")
         package_path = ANNOTATION_ZARR / f"section-{allen:04d}.ome.zarr"
         root = _StoredOmeMetadata(package_path / "zarr.json")
@@ -1986,11 +2187,15 @@ def _annotation_sources(rows, samples, axes, observed) -> tuple[list[dict[str, A
                 raise RuntimeError(f"Noncategorical annotation sampling for Allen {allen}")
             if record.get("right_origin") != "synthetically_reflected":
                 raise RuntimeError(f"Unexpected hemisphere convention for Allen {allen}")
-            path = (DATASET / record["path"]).resolve()
+            path = (ANNOTATION_DATASET / record["path"]).resolve()
+            try:
+                path.relative_to(ANNOTATION_DATASET.resolve())
+            except ValueError as exc:
+                raise RuntimeError(f"Unsafe annotation path: {path}") from exc
             if checksum(path) != record["sha256"]:
                 raise RuntimeError(f"Annotation checksum mismatch: {path}")
             labels = tifffile.imread(path)
-            if labels.shape != (522, 730) or not np.issubdtype(labels.dtype, np.integer):
+            if labels.shape != tuple(expected_shape) or not np.issubdtype(labels.dtype, np.integer):
                 raise RuntimeError(f"Annotation raster geometry/dtype mismatch: {path}")
             arrays.append(labels.astype(np.uint32, copy=False))
             paths.append(str(path))
@@ -2020,7 +2225,7 @@ def _annotation_sources(rows, samples, axes, observed) -> tuple[list[dict[str, A
             "physical_index": int(index),
             "serial_z_um": float(axes[0][index]),
             "hemisphere_and_symmetrization": "observed left plus exact synthetic right reflection",
-            "shape_yx": [522, 730],
+            "shape_yx": expected_shape,
             "axes": ["row/y", "column/x"],
             "origin_yx_um": [float(axes[1][0]), float(axes[2][0])],
             "axis_direction": ["increasing", "increasing"],
@@ -2037,7 +2242,8 @@ def _annotation_sources(rows, samples, axes, observed) -> tuple[list[dict[str, A
 
 
 def _annotation_transport(
-    rows, samples, axes, observed, final, A, phi, xv, xI, xJ, row_um, column_um, affine
+    rows, samples, axes, observed, final, A, phi, xv, xI, xJ, row_um,
+    column_um, affine, *, grid_name: str = "coarse",
 ):
     audits, sources, colors, label_metadata = _annotation_sources(rows, samples, axes, observed)
     labels_stack = np.memmap(
@@ -2118,8 +2324,12 @@ def _annotation_transport(
         raise RuntimeError("Annotation transport created an unknown label ID")
     if np.any(output_labels[np.asarray(output_support) == 0] != 0):
         raise RuntimeError("Annotation labels are nonzero outside direct support")
-    label_path = ANNOTATION_DIR / "combined_annotation_labels_on_coarse_mri_grid.nii"
-    support_path = ANNOTATION_DIR / "annotation_support_on_coarse_mri_grid.nii"
+    label_path = ANNOTATION_DIR / (
+        f"combined_annotation_labels_on_{grid_name}_mri_grid.nii"
+    )
+    support_path = ANNOTATION_DIR / (
+        f"annotation_support_on_{grid_name}_mri_grid.nii"
+    )
     _atomic_nifti(label_path, output_labels, affine, np.uint32)
     _atomic_nifti(support_path, output_support, affine, np.uint8)
     lookup_lines = ["label_id\tname\tacronym\tr\tg\tb\ta\n"]
@@ -2163,7 +2373,9 @@ def _annotation_transport(
     return output_labels, output_support, colors, report
 
 
-def _annotation_qc(mri, xI, labels, support, colors):
+def _annotation_qc(
+    mri, xI, labels, support, colors, *, grid_name: str = "coarse"
+):
     occupied_positions = np.flatnonzero(np.any(support != 0, axis=(0, 2)))
     if occupied_positions.size < 1:
         raise RuntimeError("No supported annotation planes available for QC")
@@ -2194,7 +2406,8 @@ def _annotation_qc(mri, xI, labels, support, colors):
     for row, title in enumerate(("MRI", "categorical labels", "boundaries over MRI", "direct support")):
         panels[row, 0].set_ylabel(title)
     figure.suptitle(
-        "Sparse directly observed annotation planes on coarse MRI — manual boundary review required"
+        f"Sparse directly observed annotation planes on {grid_name} MRI — "
+        "manual boundary review required"
     )
     output = ANNOTATION_DIR / "annotation_boundaries_on_mri_overview.png"
     _atomic_figure(output, figure)
@@ -2216,9 +2429,12 @@ def _validate_pngs(paths: list[Path]) -> dict[str, Any]:
 
 def postprocess(*, native_resolution: bool = False):
     start = time.monotonic()
-    annotations_enabled = (DATASET / "metadata" / "annotations.tsv").is_file()
+    grid_name = "native" if native_resolution else "coarse"
+    annotations_enabled = (
+        ANNOTATION_DATASET / "metadata" / "annotations.tsv"
+    ).is_file()
     if native_resolution and annotations_enabled:
-        symmetry_path = DATASET / "metadata/symmetry.json"
+        symmetry_path = ANNOTATION_DATASET / "metadata/symmetry.json"
         if not symmetry_path.is_file():
             annotations_enabled = False
         else:
@@ -2243,36 +2459,33 @@ def postprocess(*, native_resolution: bool = False):
     POST_DIR.mkdir(parents=True)
     if annotations_enabled:
         ANNOTATION_DIR.mkdir(parents=True)
-    checkpoints = {
-        "atlas-free": load_checkpoint("atlas-free"),
-        "registration": load_checkpoint("registration"),
-    }
     if native_resolution:
-        native_sources = [
-            CHECKPOINTS / "atlas-free.json",
-            CHECKPOINTS / "registration.json",
-            REG_DIR / "full_resolution_numerical_outputs.npz",
-            REG_DIR / "final_observed_effective_match_weight.npy",
-            *(REG_DIR / f"raw_Esave_level-{level}.npy" for level in range(1, 4)),
-        ]
-        before_hashes = {
-            str(path): checksum(path) for path in native_sources if path.is_file()
-        }
-        native_validation = {
-            "native_transform_count": 0,
-            "native_transform_manifest": None,
-            "native_manifest_verified": False,
-            "numerical_package_verified": True,
-        }
+        registration = load_checkpoint(
+            "registration",
+            accepted_statuses=("complete", "complete_through_scale"),
+        )
+        checkpoints = {"registration": registration}
+        (
+            numerical_path,
+            raw_history_paths,
+            effective_match_weight_path,
+            before_hashes,
+            native_validation,
+        ) = _native_postprocess_sources(registration)
     else:
+        checkpoints = {
+            "atlas-free": load_checkpoint("atlas-free"),
+            "registration": load_checkpoint("registration"),
+        }
         before_hashes, native_validation = _source_inventory(checkpoints)
+        numerical_path = REG_DIR / "full_coarse_numerical_outputs.npz"
+        raw_history_paths = None
+        effective_match_weight_path = (
+            REG_DIR / "final_observed_effective_match_weight.npy"
+        )
     em, rows, samples, axes, observed = load_context()
     if len(observed) != 641 or len(rows) - len(observed) != 2205:
         raise RuntimeError("Observed/unsupported Nissl counts changed")
-    numerical_path = REG_DIR / (
-        "full_resolution_numerical_outputs.npz"
-        if native_resolution else "full_coarse_numerical_outputs.npz"
-    )
     with np.load(numerical_path) as saved:
         required = {"A", "A2d", "v", "xv0", "xv1", "xv2",
                     "xI0", "xI1", "xI2", "xJ0", "xJ1", "xJ2", "observed"}
@@ -2321,23 +2534,26 @@ def postprocess(*, native_resolution: bool = False):
     ):
         raise RuntimeError("Saved histology working grid changed")
     affine, geometry = _coarse_affine(
-        xI, expected_shape=None if native_resolution else (237, 284, 254)
+        xI,
+        expected_shape=None if native_resolution else (237, 284, 254),
+        grid_name=grid_name,
     )
     baseline, residual_report, comparisons = _final_residual_diagnostics(
-        rows, axes, observed, final
+        rows, axes, observed, final,
+        comparison_initializer=("identity" if native_resolution else "atlas_free"),
     )
-    objective_report = _objective_figure()
+    objective_report = _objective_figure(raw_history_paths)
     phi, deformation_report = _deformation_products(em, xv, v)
     row_um, column_um = _registered_frame_axes(xJ, baseline)
     numerator, section_support = _warp_nissl_sections(
         samples, observed, axes, xJ, final, row_um, column_um
     )
-    effective_match_weight = _warp_effective_match_weight(
-        np.load(
-            REG_DIR / "final_observed_effective_match_weight.npy",
-            mmap_mode="r",
-        ),
-        observed, xJ, final, row_um, column_um,
+    effective_match_weight = (
+        _warp_effective_match_weight(
+            np.load(effective_match_weight_path, mmap_mode="r"),
+            observed, xJ, final, row_um, column_um,
+        )
+        if effective_match_weight_path is not None else None
     )
     velocity_max = float(np.max(np.abs(v)))
     observed_left = DATASET.resolve() == OBSERVED_LEFT_DATASET.resolve()
@@ -2368,7 +2584,6 @@ def postprocess(*, native_resolution: bool = False):
         A, phi, xv, xI, xJ, row_um, column_um, numerator, section_support,
         effective_match_weight,
     )
-    grid_name = "native" if native_resolution else "coarse"
     nissl_path = POST_DIR / f"nissl_reconstruction_on_{grid_name}_mri_grid.nii"
     nissl_support_path = POST_DIR / f"nissl_support_on_{grid_name}_mri_grid.nii"
     _atomic_nifti(nissl_path, reconstruction, affine, np.float32)
@@ -2382,11 +2597,13 @@ def postprocess(*, native_resolution: bool = False):
             native.x, native.data, [4, 4, 4]
         )
     loaded_xI = [np.asarray(axis) for axis in loaded_xI]
-    mri = finite("coarse MRI", mri).astype(np.float32)
+    mri = finite(f"{grid_name} MRI", mri).astype(np.float32)
     del native
     gc.collect()
     if any(not np.allclose(left, right) for left, right in zip(loaded_xI, xI, strict=True)):
-        raise RuntimeError("Reconstructed coarse MRI axes differ from saved registration axes")
+        raise RuntimeError(
+            f"Reconstructed {grid_name} MRI axes differ from saved registration axes"
+        )
     nissl_figures = _mri_nissl_figures(
         mri,
         xI,
@@ -2394,6 +2611,7 @@ def postprocess(*, native_resolution: bool = False):
         nissl_support,
         mri_effective_match_weight,
         float(provenance["physical_center_mm"][0]) * 1000.0,
+        grid_name=grid_name,
     )
     figures = [
         POST_DIR / "mri_nissl_registration_overview.png",
@@ -2414,11 +2632,12 @@ def postprocess(*, native_resolution: bool = False):
         annotation_labels, annotation_support, colors, annotation_report = (
             _annotation_transport(
                 rows, samples, axes, observed, final, A, phi, xv, xI, xJ,
-                row_um, column_um, affine,
+                row_um, column_um, affine, grid_name=grid_name,
             )
         )
         annotation_qc = _annotation_qc(
-            mri, xI, annotation_labels, annotation_support, colors
+            mri, xI, annotation_labels, annotation_support, colors,
+            grid_name=grid_name,
         )
         annotation_report["boundary_qc"] = annotation_qc
         atomic_json(Path(annotation_report["report"]), {
@@ -2493,11 +2712,10 @@ def postprocess(*, native_resolution: bool = False):
     )
     print(json.dumps(checkpoint, indent=2), flush=True)
 
-def _warp_saved_section(
-    image, support, transform, row_um, column_um,
-    *, source_row_um=None, source_column_um=None,
+def _section_sample_indices(
+    transform, row_um, column_um, *, source_row_um=None, source_column_um=None,
 ):
-    """Sample one prepared section into its baseline-factored registered frame."""
+    """Return the physical-coordinate pullback shared by image and label warps."""
     source_row_um = row_um if source_row_um is None else source_row_um
     source_column_um = column_um if source_column_um is None else source_column_um
     rr, cc = np.meshgrid(row_um, column_um, indexing="ij")
@@ -2513,11 +2731,24 @@ def _warp_saved_section(
     ix = (source_column - source_column_um[0]) / (
         source_column_um[1] - source_column_um[0]
     )
+    return iy, ix
+
+
+def _warp_saved_section(
+    image, support, transform, row_um, column_um,
+    *, source_row_um=None, source_column_um=None,
+):
+    """Sample one prepared section into its baseline-factored registered frame."""
+    iy, ix = _section_sample_indices(
+        transform, row_um, column_um,
+        source_row_um=source_row_um, source_column_um=source_column_um,
+    )
+    rr_shape = (len(row_um), len(column_um))
     transformed_support = ndi.map_coordinates(
         support, [iy, ix], order=1, mode="constant", cval=0.0,
         prefilter=False,
     ).astype(np.float32)
-    transformed = np.zeros((image.shape[0], *rr.shape), dtype=np.float32)
+    transformed = np.zeros((image.shape[0], *rr_shape), dtype=np.float32)
     positive = transformed_support > 0.0
     for channel in range(3):
         numerator = ndi.map_coordinates(
