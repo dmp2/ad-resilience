@@ -1,0 +1,19 @@
+{
+  "nt": 10,
+  "downI": [[1, 1]],
+  "downJ": [[1, 1]],
+  "n_iter": [100, 50, 25],
+  "a": [500.0],
+  "dv": [1000.0],
+  "slice_matching": [false],
+  "v_start": [0],
+  "eA": [0.0],
+  "eA2d": [0.0],
+  "ev": [0.01],
+  "local_contrast": [null],
+  "up_vector": [null],
+  "sigmaR": [10000.0],
+  "n_draw": 0,
+  "dtype": "float32",
+  "Amode": 0
+}
