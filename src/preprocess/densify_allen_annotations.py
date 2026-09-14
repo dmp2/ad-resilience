@@ -42,10 +42,6 @@ DEFAULT_DATASET = PROJECT / (
     "data/derivatives/allen/specimen_708424/"
     "histology_symmetric_nissl_native_200um_section_aligned"
 )
-DEFAULT_ANNOTATIONS = PROJECT / (
-    "data/derivatives/allen/specimen_708424/"
-    "annotations_symmetric_nissl_native_200um_section_aligned"
-)
 DEFAULT_REGISTRATION = PROJECT / (
     "results/allen/specimen_708424/emlddmm/native-200um-clean/"
     "HIST_NISSL_SYMMETRIC_SECTION_ALIGNED_to_MRI_7T_WHOLE"
@@ -63,10 +59,6 @@ SCHEMA = "allen-dense-registered-histology-v3"
 ANCHOR_SCHEMA = "allen-final-registered-annotation-anchors-v1"
 PAIR_SCHEMA = "allen-dense-pair-v3"
 TIFF_STORE_SCHEMA = "allen-dense-tiff-store-v1"
-GROUP_ORDER = (31, 113753816, 141667008, 265297118)
-EXPECTED_SHAPE = (522, 730)
-EXPECTED_SECTION_COUNT = 2846
-EXPECTED_ANNOTATION_LEVELS = 106
 
 UNSUPPORTED = 0
 OBSERVED_LABELS = 1
@@ -99,6 +91,11 @@ class SourceContext:
     registered_axes: tuple[np.ndarray, np.ndarray]
     source_hashes: Mapping[str, str]
     registration_identifier: str
+    graphic_groups: tuple[int, ...]
+    shape: tuple[int, int]
+    canonical_count: int
+    serial_spacing_um: float
+    pixel_size_um: float
 
 
 def _sha256(path: Path) -> str:
@@ -164,6 +161,89 @@ def _validate_uniform_axis(axis: np.ndarray, expected_step: float, name: str) ->
         )
 
 
+def _positive_metadata_number(
+    metadata: Mapping[str, Any], key: str, *, integer: bool = False
+) -> int | float:
+    value = metadata.get(key)
+    try:
+        number = int(value) if integer else float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"dataset.json has invalid {key}") from exc
+    if number <= 0 or (integer and number != value):
+        raise RuntimeError(f"dataset.json has invalid {key}")
+    return number
+
+
+def _metadata_shape(metadata: Mapping[str, Any], key: str) -> tuple[int, int]:
+    value = metadata.get(key)
+    if not isinstance(value, list) or len(value) != 2:
+        raise RuntimeError(f"dataset.json has invalid {key}")
+    try:
+        shape = tuple(int(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"dataset.json has invalid {key}") from exc
+    if any(item <= 0 for item in shape) or list(shape) != value:
+        raise RuntimeError(f"dataset.json has invalid {key}")
+    return shape
+
+
+def _annotation_graphic_groups(
+    annotations: Path, annotation_meta: Mapping[str, Any]
+) -> tuple[int, ...]:
+    source_value = annotation_meta.get("annotations_ome_zarr_source")
+    if not isinstance(source_value, str):
+        raise RuntimeError(
+            "Annotation derivative does not identify its source graphic-group catalog"
+        )
+    source_root = _recorded_path(annotations, source_value)
+    catalog_path = source_root / "dataset.json"
+    if not catalog_path.is_file() or catalog_path.is_symlink():
+        raise RuntimeError(f"Missing source graphic-group catalog: {catalog_path}")
+    catalog = json.loads(catalog_path.read_text()).get("graphic_groups")
+    if not isinstance(catalog, list) or not catalog:
+        raise RuntimeError("Source annotation dataset has no graphic-group catalog")
+    try:
+        groups = tuple(int(item["id"]) for item in catalog)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Source annotation graphic-group catalog is invalid"
+        ) from exc
+    if len(groups) != len(set(groups)):
+        raise RuntimeError("Source annotation graphic-group catalog has duplicate IDs")
+    return groups
+
+
+def _discover_annotation_derivative(dataset: Path) -> Path:
+    """Find the unique sibling annotation derivative linked to ``dataset``."""
+    candidates: list[Path] = []
+    for metadata_path in sorted(dataset.parent.glob("*/dataset.json")):
+        if metadata_path.is_symlink():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        parent = metadata.get("parent_nissl_derivative")
+        if not isinstance(parent, str):
+            continue
+        candidate = metadata_path.parent.resolve()
+        if _recorded_path(candidate, parent) != dataset:
+            continue
+        required = (
+            candidate / "metadata/annotations.tsv",
+            candidate / "metadata/source_annotation_manifest.tsv",
+        )
+        if all(path.is_file() and not path.is_symlink() for path in required):
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        formatted = ", ".join(str(path) for path in candidates) or "none"
+        raise RuntimeError(
+            "Could not identify one annotation derivative for the selected Nissl "
+            f"dataset (found {formatted}); pass --annotations explicitly"
+        )
+    return candidates[0]
+
+
 def discover_inputs(
     dataset: Path, registration: Path, annotations: Path | None = None
 ) -> SourceContext:
@@ -173,7 +253,7 @@ def discover_inputs(
     annotations = (
         annotations.expanduser().resolve()
         if annotations is not None
-        else DEFAULT_ANNOTATIONS.resolve()
+        else _discover_annotation_derivative(dataset)
     )
     for required in (dataset / "dataset.json", annotations / "dataset.json"):
         if not required.is_file() or required.is_symlink():
@@ -181,14 +261,14 @@ def discover_inputs(
 
     nissl_meta = json.loads((dataset / "dataset.json").read_text())
     annotation_meta = json.loads((annotations / "dataset.json").read_text())
-    if nissl_meta.get("physical_serial_positions") != EXPECTED_SECTION_COUNT:
-        raise RuntimeError(
-            "Nissl derivative is not the canonical 2,846-position product"
-        )
-    if nissl_meta.get("prepared_canvas_shape_yx") != list(EXPECTED_SHAPE):
-        raise RuntimeError(
-            "Nissl derivative is not the authoritative 522x730 native grid"
-        )
+    canonical_count = int(
+        _positive_metadata_number(nissl_meta, "physical_serial_positions", integer=True)
+    )
+    shape = _metadata_shape(nissl_meta, "prepared_canvas_shape_yx")
+    serial_spacing_um = float(
+        _positive_metadata_number(nissl_meta, "serial_spacing_um")
+    )
+    pixel_size_um = float(_positive_metadata_number(nissl_meta, "pixel_size_um"))
     if nissl_meta.get("preparation_mode") != "preserve_source_grid":
         raise RuntimeError(
             "Nissl derivative did not preserve its authoritative source grid"
@@ -196,7 +276,7 @@ def discover_inputs(
     recorded_parent = annotation_meta.get("parent_nissl_derivative")
     if (
         not isinstance(recorded_parent, str)
-        or Path(recorded_parent).resolve() != dataset
+        or _recorded_path(annotations, recorded_parent) != dataset
     ):
         raise RuntimeError(
             "Annotation derivative does not name the selected Nissl parent"
@@ -205,68 +285,111 @@ def discover_inputs(
         dataset / "dataset.json"
     ):
         raise RuntimeError("Annotation derivative parent checksum differs")
-    if annotation_meta.get("prepared_canvas_shape_yx") != list(EXPECTED_SHAPE):
+    if _metadata_shape(annotation_meta, "prepared_canvas_shape_yx") != shape:
         raise RuntimeError("Annotation and Nissl grids differ")
-    if annotation_meta.get("graphic_group_counts") != {
-        "31": 106,
-        "113753816": 106,
-        "141667008": 102,
-        "265297118": 106,
-    }:
-        raise RuntimeError("Authoritative graphic-group coverage changed")
+    annotation_pixel_size = float(
+        _positive_metadata_number(annotation_meta, "pixel_size_um")
+    )
+    if not np.isclose(annotation_pixel_size, pixel_size_um, atol=1e-9, rtol=0.0):
+        raise RuntimeError("Annotation and Nissl pixel sizes differ")
+    graphic_groups = _annotation_graphic_groups(annotations, annotation_meta)
 
     physical_path = dataset / "metadata/physical_sections.tsv"
     rows = _read_tsv(physical_path)
-    if len(rows) != EXPECTED_SECTION_COUNT:
-        raise RuntimeError("Canonical physical-section table length changed")
-    physical = np.asarray([int(row["physical_index"]) for row in rows], dtype=np.int64)
-    if not np.array_equal(physical, np.arange(EXPECTED_SECTION_COUNT)):
+    if len(rows) != canonical_count:
         raise RuntimeError(
-            "physical_index is not the authoritative consecutive lattice"
+            "Canonical physical-section table length differs from dataset metadata"
         )
+    physical = np.asarray([int(row["physical_index"]) for row in rows], dtype=np.int64)
+    if not np.array_equal(physical, np.arange(canonical_count)):
+        raise RuntimeError("physical_index is not a consecutive zero-based lattice")
     z_from_table = np.asarray(
         [float(row["serial_z_center_mm"]) * 1000.0 for row in rows], dtype=np.float64
     )
-    _validate_uniform_axis(z_from_table, 50.0, "physical_z_um")
+    _validate_uniform_axis(z_from_table, serial_spacing_um, "physical_z_um")
+    section_numbers = [int(row["allen_section_number"]) for row in rows]
+    if len(section_numbers) != len(set(section_numbers)):
+        raise RuntimeError(
+            "Canonical physical-section table has duplicate section numbers"
+        )
     physical_by_section = {
-        int(row["allen_section_number"]): i for i, row in enumerate(rows)
+        section_number: physical_index
+        for physical_index, section_number in enumerate(section_numbers)
     }
 
     source_manifest_path = annotations / "metadata/source_annotation_manifest.tsv"
     source_manifest = _read_tsv(source_manifest_path)
     annotation_sections = tuple(int(row["section_number"]) for row in source_manifest)
-    if len(annotation_sections) != EXPECTED_ANNOTATION_LEVELS or len(
+    recorded_annotation_count = int(
+        _positive_metadata_number(
+            annotation_meta, "annotation_section_count", integer=True
+        )
+    )
+    if len(annotation_sections) != recorded_annotation_count or len(
         set(annotation_sections)
     ) != len(annotation_sections):
-        raise RuntimeError("Authoritative annotation-level identity/count changed")
+        raise RuntimeError("Annotation-level identity/count differs from metadata")
+    unknown_sections = set(annotation_sections) - set(physical_by_section)
+    if unknown_sections:
+        raise RuntimeError(
+            f"Annotation sections are absent from the physical lattice: {sorted(unknown_sections)}"
+        )
+
     inventory_path = annotations / "metadata/annotations.tsv"
     inventory_rows = _read_tsv(inventory_path)
     inventory: dict[tuple[int, int], dict[str, str]] = {}
     for row in inventory_rows:
         key = (int(row["section_number"]), int(row["graphic_group_id"]))
-        if key in inventory or key[1] not in GROUP_ORDER:
+        if key in inventory or key[1] not in graphic_groups:
             raise RuntimeError(
                 f"Invalid duplicate/unknown annotation inventory row: {key}"
             )
+        if key[0] not in set(annotation_sections):
+            raise RuntimeError(f"Annotation inventory has an unknown section: {key[0]}")
         if row.get("sampling") != "categorical_nearest_neighbor":
             raise RuntimeError(f"Anchor {key} lacks categorical placement provenance")
         inventory[key] = row
-    expected_missing = {
-        (111, 141667008),
-        (179, 141667008),
-        (2737, 141667008),
-        (2797, 141667008),
-    }
-    actual_missing = {
-        (section, group)
-        for section in annotation_sections
-        for group in GROUP_ORDER
-        if (section, group) not in inventory
-    }
-    if actual_missing != expected_missing:
-        raise RuntimeError(
-            f"Unresolved graphic-group availability changed: {sorted(actual_missing)}"
+    recorded_image_count = int(
+        _positive_metadata_number(
+            annotation_meta, "annotation_image_count", integer=True
         )
+    )
+    if len(inventory) != recorded_image_count:
+        raise RuntimeError("Annotation inventory length differs from dataset metadata")
+    actual_group_counts = {
+        str(group): sum(key[1] == group for key in inventory)
+        for group in graphic_groups
+    }
+    try:
+        recorded_group_counts = {
+            str(int(group)): int(count)
+            for group, count in annotation_meta["graphic_group_counts"].items()
+        }
+    except (KeyError, AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("Annotation graphic-group counts are invalid") from exc
+    if recorded_group_counts != actual_group_counts:
+        raise RuntimeError("Annotation graphic-group counts differ from the inventory")
+    for row in source_manifest:
+        section = int(row["section_number"])
+        try:
+            declared = tuple(
+                int(group) for group in json.loads(row["graphic_groups_present"])
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Invalid graphic_groups_present for section {section}"
+            ) from exc
+        if len(declared) != len(set(declared)) or not set(declared).issubset(
+            graphic_groups
+        ):
+            raise RuntimeError(
+                f"Invalid graphic-group availability for section {section}"
+            )
+        inventoried = {group for candidate, group in inventory if candidate == section}
+        if set(declared) != inventoried:
+            raise RuntimeError(
+                f"Graphic-group availability differs for section {section}"
+            )
 
     checkpoint_path = registration / "checkpoints/registration.json"
     checkpoint = json.loads(checkpoint_path.read_text())
@@ -315,15 +438,15 @@ def discover_inputs(
         final_a2d = np.asarray(saved["A2d"], dtype=np.float64)
         axes = tuple(np.asarray(saved[f"xJ{i}"], dtype=np.float64) for i in range(3))
         observed = np.asarray(saved["observed"], dtype=np.int64)
-    if final_a2d.shape != (EXPECTED_SECTION_COUNT, 3, 3):
+    if final_a2d.shape != (canonical_count, 3, 3):
         raise RuntimeError("Accepted final A2d does not span the physical lattice")
-    if tuple(map(len, axes)) != (EXPECTED_SECTION_COUNT, *EXPECTED_SHAPE):
-        raise RuntimeError("Accepted registration histology axes changed")
+    if tuple(map(len, axes)) != (canonical_count, *shape):
+        raise RuntimeError("Accepted registration histology axes differ from metadata")
     if not np.allclose(axes[0], z_from_table, atol=1e-9, rtol=0.0):
         raise RuntimeError("Accepted xJ[0] differs from canonical physical coordinates")
-    _validate_uniform_axis(axes[0], 50.0, "accepted xJ[0]")
-    _validate_uniform_axis(axes[1], 200.0, "accepted xJ[1]")
-    _validate_uniform_axis(axes[2], 200.0, "accepted xJ[2]")
+    _validate_uniform_axis(axes[0], serial_spacing_um, "accepted xJ[0]")
+    _validate_uniform_axis(axes[1], pixel_size_um, "accepted xJ[1]")
+    _validate_uniform_axis(axes[2], pixel_size_um, "accepted xJ[2]")
     table_observed = np.flatnonzero(
         [row["image_present"] == "true" and row["stain"] == "nissl" for row in rows]
     )
@@ -331,8 +454,12 @@ def discover_inputs(
         raise RuntimeError(
             "Accepted observed Nissl indices differ from the canonical table"
         )
-    unsupported = np.ones(EXPECTED_SECTION_COUNT, dtype=bool)
+    unsupported = np.ones(canonical_count, dtype=bool)
     unsupported[observed] = False
+    if not np.any(unsupported):
+        raise RuntimeError(
+            "No unsupported A2d row is available to define the accepted output frame"
+        )
     baseline = final_a2d[unsupported][0]
     if not np.array_equal(
         final_a2d[unsupported], np.broadcast_to(baseline, final_a2d[unsupported].shape)
@@ -343,8 +470,8 @@ def discover_inputs(
     registered_axes = tuple(
         np.asarray(a) for a in coarse._registered_frame_axes(list(axes), baseline)
     )
-    if tuple(map(len, registered_axes)) != EXPECTED_SHAPE:
-        raise RuntimeError("Registered-histology grid shape changed")
+    if tuple(map(len, registered_axes)) != shape:
+        raise RuntimeError("Registered-histology grid shape differs from metadata")
 
     source_paths = (
         physical_path,
@@ -375,6 +502,11 @@ def discover_inputs(
         registered_axes=registered_axes,
         source_hashes=hashes,
         registration_identifier=identifier,
+        graphic_groups=graphic_groups,
+        shape=shape,
+        canonical_count=canonical_count,
+        serial_spacing_um=serial_spacing_um,
+        pixel_size_um=pixel_size_um,
     )
 
 
@@ -419,7 +551,10 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
     complete = output / "metadata/anchors.json"
     if complete.is_file():
         report = json.loads(complete.read_text())
-        if report.get("source_hashes") != context.source_hashes:
+        if (
+            report.get("source_hashes") != context.source_hashes
+            or tuple(report.get("graphic_groups", ())) != context.graphic_groups
+        ):
             raise RuntimeError(
                 "Existing anchors were made from different authoritative inputs"
             )
@@ -439,15 +574,15 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
     nissl = _zarr_array(
         root,
         "nissl",
-        shape=(count, 3, *EXPECTED_SHAPE),
-        chunks=(1, 3, *EXPECTED_SHAPE),
+        shape=(count, 3, *context.shape),
+        chunks=(1, 3, *context.shape),
         dtype="float32",
     )
     weight = _zarr_array(
         root,
         "nissl_weight",
-        shape=(count, *EXPECTED_SHAPE),
-        chunks=(1, *EXPECTED_SHAPE),
+        shape=(count, *context.shape),
+        chunks=(1, *context.shape),
         dtype="float32",
     )
     groups_root = root.require_group("groups")
@@ -455,14 +590,14 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
         group: _zarr_array(
             groups_root,
             str(group),
-            shape=(count, *EXPECTED_SHAPE),
-            chunks=(1, *EXPECTED_SHAPE),
+            shape=(count, *context.shape),
+            chunks=(1, *context.shape),
             dtype="uint32",
         )
-        for group in GROUP_ORDER
+        for group in context.graphic_groups
     }
     rows: list[dict[str, Any]] = []
-    vocabularies: dict[int, set[int]] = {group: {0} for group in GROUP_ORDER}
+    vocabularies: dict[int, set[int]] = {group: {0} for group in context.graphic_groups}
     y, x = context.registered_axes
     source_y, source_x = context.axes[1:]
     try:
@@ -472,15 +607,22 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
                 raise RuntimeError(
                     f"Annotated section {section} lacks accepted Nissl placement"
                 )
-            image_name = f"allen_708424_nissl_{section:04d}.tif"
-            image_path = context.dataset / "inputs/views/HIST_NISSL" / image_name
-            weight_path = context.dataset / "support/nissl" / image_name
+            prepared_relative = context.rows[physical_index].get(
+                "prepared_relative_path", ""
+            )
+            if not prepared_relative:
+                raise RuntimeError(
+                    f"Annotated section {section} has no prepared Nissl path"
+                )
+            image_path = (context.dataset / prepared_relative).resolve()
+            image_path.relative_to(context.dataset)
+            stain = context.rows[physical_index].get("stain", "")
+            if not stain:
+                raise RuntimeError(f"Annotated section {section} has no declared stain")
+            weight_path = context.dataset / "support" / stain / image_path.name
             image = tifffile.imread(image_path)
             raw_weight = tifffile.imread(weight_path).astype(np.float32)
-            if (
-                image.shape != (*EXPECTED_SHAPE, 3)
-                or raw_weight.shape != EXPECTED_SHAPE
-            ):
+            if image.shape != (*context.shape, 3) or raw_weight.shape != context.shape:
                 raise RuntimeError(
                     f"Nissl/weight geometry differs for section {section}"
                 )
@@ -495,7 +637,7 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
             )
             nissl[ordinal] = placed_image
             weight[ordinal] = placed_weight
-            for group in GROUP_ORDER:
+            for group in context.graphic_groups:
                 state = semantic_state(context, section, group)
                 record = context.annotation_inventory.get((section, group))
                 source_path = ""
@@ -509,7 +651,7 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
                             f"Authoritative annotation checksum differs: {label_path}"
                         )
                     labels = tifffile.imread(label_path)
-                    if labels.shape != EXPECTED_SHAPE or not np.issubdtype(
+                    if labels.shape != context.shape or not np.issubdtype(
                         labels.dtype, np.integer
                     ):
                         raise RuntimeError(
@@ -537,8 +679,8 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
                         "source_annotation_sha256": source_sha,
                         "graphic_group": group,
                         "semantic_state": state,
-                        "final_rows": EXPECTED_SHAPE[0],
-                        "final_columns": EXPECTED_SHAPE[1],
+                        "final_rows": context.shape[0],
+                        "final_columns": context.shape[1],
                         "registration_identifier": context.registration_identifier,
                         "placement": "accepted final A2d physical pullback exactly once",
                     }
@@ -562,7 +704,7 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
         "source_hashes": dict(context.source_hashes),
         "registration_identifier": context.registration_identifier,
         "annotation_levels": count,
-        "graphic_groups": list(GROUP_ORDER),
+        "graphic_groups": list(context.graphic_groups),
         "semantic_counts": {
             state: sum(row["semantic_state"] == state for row in rows)
             for state in (SEMANTIC_LABELED, SEMANTIC_VALID_EMPTY, SEMANTIC_UNAVAILABLE)
@@ -587,15 +729,21 @@ def materialize_anchors(context: SourceContext, output: Path) -> dict[str, Any]:
 
 def build_endpoint_sequences(
     anchor_rows: Sequence[Mapping[str, str]],
+    graphic_groups: Sequence[int] | None = None,
 ) -> tuple[dict[int, list[int]], dict[tuple[int, int], tuple[int, ...]]]:
     """Build per-group semantic anchors and the compact unique-pair table."""
-    by_group: dict[int, list[int]] = {group: [] for group in GROUP_ORDER}
+    groups = (
+        tuple(graphic_groups)
+        if graphic_groups is not None
+        else tuple(dict.fromkeys(int(row["graphic_group"]) for row in anchor_rows))
+    )
+    by_group: dict[int, list[int]] = {group: [] for group in groups}
     for row in anchor_rows:
         group = int(row["graphic_group"])
         if row["semantic_state"] in {SEMANTIC_LABELED, SEMANTIC_VALID_EMPTY}:
             by_group[group].append(int(row["physical_index"]))
     pair_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for group in GROUP_ORDER:
+    for group in groups:
         sequence = sorted(set(by_group[group]))
         by_group[group] = sequence
         for left, right in zip(sequence[:-1], sequence[1:], strict=False):
@@ -1024,7 +1172,7 @@ class DenseAnnotationStore:
         output: Path,
         shape: tuple[int, int],
         canonical_z_um: np.ndarray,
-        groups: Sequence[int] = GROUP_ORDER,
+        groups: Sequence[int],
     ) -> None:
         self.output = output
         self.shape = tuple(shape)
@@ -1084,20 +1232,20 @@ def _validated_uint32_plane(plane: np.ndarray, shape: tuple[int, int]) -> np.nda
 
 
 def _dense_products(
-    output: Path, shape: tuple[int, int], canonical_z_um: np.ndarray
+    output: Path,
+    shape: tuple[int, int],
+    canonical_z_um: np.ndarray,
+    groups: Sequence[int],
 ) -> tuple[Any, dict[int, Any], Any]:
     """Open the validated legacy Zarr dense product."""
-    if len(canonical_z_um) != EXPECTED_SECTION_COUNT:
-        raise RuntimeError(
-            "Dense output must use the authoritative canonical z lattice"
-        )
+    canonical_count = len(canonical_z_um)
     root = zarr.open_group(str(output / "dense.zarr"), mode="a")
     coordinate_exists = "z_um" in root
     coordinate = _zarr_array(
         root,
         "z_um",
-        shape=(EXPECTED_SECTION_COUNT,),
-        chunks=(EXPECTED_SECTION_COUNT,),
+        shape=(canonical_count,),
+        chunks=(canonical_count,),
         dtype="float64",
     )
     if coordinate_exists:
@@ -1114,17 +1262,17 @@ def _dense_products(
         group: _zarr_array(
             group_root,
             str(group),
-            shape=(EXPECTED_SECTION_COUNT, *shape),
+            shape=(canonical_count, *shape),
             chunks=(1, *shape),
             dtype="uint32",
         )
-        for group in GROUP_ORDER
+        for group in groups
     }
     states = _zarr_array(
         root,
         "semantic_state",
-        shape=(len(GROUP_ORDER), EXPECTED_SECTION_COUNT),
-        chunks=(1, EXPECTED_SECTION_COUNT),
+        shape=(len(groups), canonical_count),
+        chunks=(1, canonical_count),
         dtype="uint8",
     )
     return root, arrays, states
@@ -1136,11 +1284,15 @@ class ZarrDenseAnnotationStore(DenseAnnotationStore):
     output_format = "zarr"
 
     def __init__(
-        self, output: Path, shape: tuple[int, int], canonical_z_um: np.ndarray
+        self,
+        output: Path,
+        shape: tuple[int, int],
+        canonical_z_um: np.ndarray,
+        groups: Sequence[int],
     ) -> None:
-        super().__init__(output, shape, canonical_z_um)
+        super().__init__(output, shape, canonical_z_um, groups)
         self.root, self.arrays, self.states = _dense_products(
-            output, shape, canonical_z_um
+            output, shape, canonical_z_um, groups
         )
 
     def write_group_plane(
@@ -1212,7 +1364,7 @@ class TiffDenseAnnotationStore(DenseAnnotationStore):
         canonical_z_um: np.ndarray,
         *,
         compression: str = "deflate",
-        groups: Sequence[int] = GROUP_ORDER,
+        groups: Sequence[int],
     ) -> None:
         super().__init__(output, shape, canonical_z_um, groups)
         if compression not in {"deflate", "none"}:
@@ -1426,13 +1578,18 @@ def create_dense_store(
     *,
     output_format: str,
     tiff_compression: str,
+    groups: Sequence[int],
 ) -> DenseAnnotationStore:
     if output_format == "tiff":
         return TiffDenseAnnotationStore(
-            output, shape, canonical_z_um, compression=tiff_compression
+            output,
+            shape,
+            canonical_z_um,
+            compression=tiff_compression,
+            groups=groups,
         )
     if output_format == "zarr":
-        return ZarrDenseAnnotationStore(output, shape, canonical_z_um)
+        return ZarrDenseAnnotationStore(output, shape, canonical_z_um, groups)
     raise ValueError(f"Unsupported dense output format: {output_format}")
 
 
@@ -1529,9 +1686,9 @@ def _parse_pair(value: str) -> tuple[int, int]:
         raise argparse.ArgumentTypeError(
             "pair must be PHYSICAL_INDEX-PHYSICAL_INDEX"
         ) from exc
-    if not 0 <= pair[0] < pair[1] < EXPECTED_SECTION_COUNT:
+    if not 0 <= pair[0] < pair[1]:
         raise argparse.ArgumentTypeError(
-            "pair indices are outside the canonical lattice"
+            "pair indices must be nonnegative and strictly increasing"
         )
     return pair
 
@@ -1750,7 +1907,7 @@ def assert_observed_immutable(
 
 def _write_state_table(context: SourceContext, output: Path, states: Any) -> Path:
     rows = []
-    for group_index, group in enumerate(GROUP_ORDER):
+    for group_index, group in enumerate(context.graphic_groups):
         values = np.asarray(states[group_index], dtype=np.uint8)
         for physical, value in enumerate(values):
             rows.append(
@@ -1801,9 +1958,12 @@ def finalize_dense(
         for values in anchor_report["group_vocabularies"].values()
         for value in values
     }
-    for physical in range(EXPECTED_SECTION_COUNT):
+    for physical in range(context.canonical_count):
         plane = _combined_display_map(
-            [store.read_group_plane(group, physical) for group in GROUP_ORDER]
+            [
+                store.read_group_plane(group, physical)
+                for group in context.graphic_groups
+            ]
         )
         plane = np.asarray(plane, dtype=np.uint32)
         if not set(map(int, np.unique(plane))).issubset(source_vocab):
@@ -1832,7 +1992,7 @@ def finalize_dense(
             "annotations using two endpoint-conditioned WSI trajectories"
         ),
         "canonical_lattice": {
-            "positions": EXPECTED_SECTION_COUNT,
+            "positions": context.canonical_count,
             "physical_z_um_source": str(
                 context.dataset / "metadata/physical_sections.tsv"
             ),
@@ -1852,7 +2012,7 @@ def finalize_dense(
             "numerical": str(context.numerical),
             "source_hashes": dict(context.source_hashes),
         },
-        "graphic_groups": list(GROUP_ORDER),
+        "graphic_groups": list(context.graphic_groups),
         "graphic_group_combination": (
             "existing ordered nonzero overwrite via visualize_allen_annotations._combined_display_map"
         ),
@@ -1952,11 +2112,18 @@ def run(
     _write_output_readme(output)
     anchor_report = materialize_anchors(context, output)
     anchor_rows = _read_tsv(output / "metadata/anchors.tsv")
-    sequences, pair_groups = build_endpoint_sequences(anchor_rows)
-    if pair is not None and pair not in pair_groups:
-        raise RuntimeError(
-            f"Requested pair {_pair_id(pair)} is not in the required endpoint table"
-        )
+    sequences, pair_groups = build_endpoint_sequences(
+        anchor_rows, context.graphic_groups
+    )
+    if pair is not None:
+        if pair[1] >= context.canonical_count:
+            raise RuntimeError(
+                f"Requested pair {_pair_id(pair)} is outside the canonical lattice"
+            )
+        if pair not in pair_groups:
+            raise RuntimeError(
+                f"Requested pair {_pair_id(pair)} is not in the required endpoint table"
+            )
     if nt_override is not None and pair is None:
         raise RuntimeError("An nt override requires one explicitly selected pair")
     base_config = _load_pair_config(pair_config.resolve())
@@ -1999,7 +2166,7 @@ def run(
                 str(group): values for group, values in sequences.items()
             },
             "unique_endpoint_pair_count": len(pair_groups),
-            "canonical_output_positions": EXPECTED_SECTION_COUNT,
+            "canonical_output_positions": context.canonical_count,
             "canonical_z_coordinate_source": str(
                 output / "metadata/physical_sections.tsv"
             ),
@@ -2010,7 +2177,7 @@ def run(
     )
     planning = {
         "unique_endpoint_pairs": len(pair_groups),
-        "canonical_output_positions": EXPECTED_SECTION_COUNT,
+        "canonical_output_positions": context.canonical_count,
         "endpoint_pair_table": str(pair_table_path),
         "configured_lddmm_nt": int(base_config["nt"]),
         "output_time_rule": "t=(z-z0)/(z1-z0)",
@@ -2032,10 +2199,11 @@ def run(
     }
     store = create_dense_store(
         output,
-        EXPECTED_SHAPE,
+        context.shape,
         context.axes[0],
         output_format=output_format,
         tiff_compression=tiff_compression,
+        groups=context.graphic_groups,
     )
     initialize_dense(context, output, store, recoverable_planes)
     reports = []
@@ -2093,9 +2261,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--annotations", type=Path, default=None)
-    parser.add_argument("--registration-run", type=Path, default=DEFAULT_REGISTRATION)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--annotations",
+        type=Path,
+        default=None,
+        help="annotation derivative (default: unique derivative linked to --dataset)",
+    )
+    parser.add_argument(
+        "--registration-run",
+        type=Path,
+        default=None,
+        help="accepted registration run (required for a non-default --dataset)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="output root (required for a non-default --dataset)",
+    )
     parser.add_argument(
         "--output-format",
         choices=("tiff", "zarr"),
@@ -2135,15 +2318,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    dataset = args.dataset.expanduser().resolve()
+    using_default_dataset = dataset == DEFAULT_DATASET.resolve()
+    if args.registration_run is None and not using_default_dataset:
+        parser.error("--registration-run is required with a non-default --dataset")
+    if args.output is None and not using_default_dataset:
+        parser.error("--output is required with a non-default --dataset")
+    registration = args.registration_run or DEFAULT_REGISTRATION
+    output = args.output or DEFAULT_OUTPUT
     if args.overwrite and args.pair is None:
         parser.error("--overwrite is limited to an explicitly selected --pair")
     if args.nt is not None and args.pair is None:
         parser.error("--nt requires an explicitly selected --pair")
     report = run(
-        dataset=args.dataset,
-        registration=args.registration_run,
+        dataset=dataset,
+        registration=registration,
         annotations=args.annotations,
-        output=args.output.expanduser().resolve(),
+        output=output.expanduser().resolve(),
         pair=args.pair,
         pair_config=args.pair_config,
         wsi_repository=args.wsi_repository,

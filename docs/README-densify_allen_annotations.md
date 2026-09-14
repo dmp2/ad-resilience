@@ -7,9 +7,12 @@ space; MRI transfer is deliberately excluded.
 
 ## Canonical physical-z sampling and LDDMM time
 
-The authoritative 2,846-position Allen/Ding physical-section lattice is both
-the source of real anchor coordinates and the dense output z axis. For every
-canonical coordinate `z` strictly between consecutive valid semantic anchors
+For the current specimen, the authoritative Allen/Ding physical-section
+lattice contains 2,846 positions. Its length and coordinates are read from the
+selected Nissl derivative metadata and `physical_sections.tsv`; they are not
+fixed implementation constants. The lattice is both the source of real anchor
+coordinates and the dense output z axis. For every canonical coordinate `z`
+strictly between consecutive valid semantic anchors
 `z0 < z1`, the requested pseudotime is
 
 ```text
@@ -19,7 +22,8 @@ t = (z - z0) / (z1 - z0).
 Only the annotation-supported range is filled. Observed endpoints are copied
 literally from the stored final registered anchors and are never regenerated
 from a trajectory. The authoritative coordinates remain explicit in
-`metadata/physical_sections.tsv`; every dense group retains 2,846 z planes.
+`metadata/physical_sections.tsv`; every dense group retains the full number of
+positions declared by that selected dataset (2,846 for the current specimen).
 
 `nt` has a separate role: it is the number of temporal intervals used to
 estimate and numerically integrate each LDDMM velocity trajectory. The initial
@@ -46,6 +50,26 @@ that output planes must be stored integer trajectory states are not used.
 
 Use the environment containing the pinned WSI pipeline, EM-LDDMM, Zarr,
 SciPy, tifffile, PyTorch, and this project's `src` tree.
+
+### Dataset-derived geometry and groups
+
+The implementation derives the canonical plane count, image shape, serial
+spacing, and pixel spacing from the selected Nissl derivative and validates
+them against its physical-section table and accepted numerical package. It
+derives graphic-group IDs and precedence order from the linked source
+annotation catalog, and derives annotation section and image counts from the
+annotation derivative metadata and manifests. The current values (2,846
+planes, 522 by 730 pixels, 50-um serial spacing, 200-um pixels, and four graphic
+groups) therefore remain unchanged without constraining another valid example
+to those values.
+
+When `--annotations` is omitted, the command finds the unique sibling
+annotation derivative whose metadata names the selected Nissl derivative as
+its parent. No match or multiple matches fail clearly and require an explicit
+`--annotations` path. The no-argument `--dataset`, `--registration-run`, and
+`--output` locations remain convenience defaults for specimen 708424. For a
+different example, pass its dataset, accepted registration run, and output root
+explicitly; the geometry and group inventory then come from those inputs.
 
 ### Storage policy
 

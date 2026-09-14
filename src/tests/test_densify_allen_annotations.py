@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 
 import numpy as np
 import pytest
@@ -263,10 +264,11 @@ def test_cli_defaults_to_tiff_and_accepts_explicit_zarr():
 def test_store_factory_selects_existing_zarr_backend(monkeypatch, tmp_path):
     selected = object()
 
-    def fake_zarr_store(output, shape, canonical_z_um):
+    def fake_zarr_store(output, shape, canonical_z_um, groups):
         assert output == tmp_path
         assert shape == (2, 2)
         np.testing.assert_array_equal(canonical_z_um, [0.0])
+        assert groups == (19, 7)
         return selected
 
     monkeypatch.setattr(dense, "ZarrDenseAnnotationStore", fake_zarr_store)
@@ -277,6 +279,7 @@ def test_store_factory_selects_existing_zarr_backend(monkeypatch, tmp_path):
         np.array([0.0]),
         output_format="zarr",
         tiff_compression="deflate",
+        groups=(19, 7),
     )
 
     assert result is selected
@@ -292,3 +295,99 @@ def test_tiff_temp_file_is_not_a_completed_plane(tmp_path):
 
     assert not store.plane_exists(0, group=31)
     assert not store.verify_plane(0, group=31)
+
+
+def test_zarr_store_uses_programmatic_dimensions_and_group_order(tmp_path):
+    axis = np.array([-12.5, 7.25, 99.0], dtype=np.float64)
+    store = dense.ZarrDenseAnnotationStore(tmp_path, (3, 5), axis, groups=(9001, 17))
+
+    assert tuple(store.root["z_um"].shape) == (3,)
+    assert tuple(store.root["groups"]["9001"].shape) == (3, 3, 5)
+    assert tuple(store.root["groups"]["17"].shape) == (3, 3, 5)
+    assert tuple(store.states.shape) == (2, 3)
+    assert store.groups == (9001, 17)
+
+
+def test_endpoint_sequences_use_supplied_programmatic_group_order():
+    rows = [
+        {"physical_index": "2", "graphic_group": "17", "semantic_state": "LABELED"},
+        {"physical_index": "8", "graphic_group": "17", "semantic_state": "LABELED"},
+        {"physical_index": "2", "graphic_group": "9001", "semantic_state": "LABELED"},
+        {"physical_index": "8", "graphic_group": "9001", "semantic_state": "LABELED"},
+    ]
+
+    _, pairs = dense.build_endpoint_sequences(rows, graphic_groups=(9001, 17))
+
+    assert pairs[(2, 8)] == (9001, 17)
+
+
+def test_pair_parser_has_no_example_specific_upper_bound():
+    assert dense._parse_pair("3000-4000") == (3000, 4000)
+
+
+def test_annotation_derivative_is_discovered_from_selected_dataset(tmp_path):
+    dataset = tmp_path / "nissl_example"
+    annotations = tmp_path / "annotations_example"
+    dataset.mkdir()
+    annotations.joinpath("metadata").mkdir(parents=True)
+    dataset.joinpath("dataset.json").write_text("{}\n")
+    annotations.joinpath("dataset.json").write_text(
+        json.dumps({"parent_nissl_derivative": "../nissl_example"}) + "\n"
+    )
+    annotations.joinpath("metadata/annotations.tsv").write_text("header\n")
+    annotations.joinpath("metadata/source_annotation_manifest.tsv").write_text(
+        "header\n"
+    )
+
+    assert (
+        dense._discover_annotation_derivative(dataset.resolve())
+        == annotations.resolve()
+    )
+
+
+def test_annotation_derivative_discovery_rejects_ambiguity(tmp_path):
+    dataset = tmp_path / "nissl_example"
+    dataset.mkdir()
+    dataset.joinpath("dataset.json").write_text("{}\n")
+    for name in ("annotations_a", "annotations_b"):
+        candidate = tmp_path / name
+        candidate.joinpath("metadata").mkdir(parents=True)
+        candidate.joinpath("dataset.json").write_text(
+            json.dumps({"parent_nissl_derivative": "../nissl_example"}) + "\n"
+        )
+        candidate.joinpath("metadata/annotations.tsv").write_text("header\n")
+        candidate.joinpath("metadata/source_annotation_manifest.tsv").write_text(
+            "header\n"
+        )
+
+    with pytest.raises(RuntimeError, match="pass --annotations explicitly"):
+        dense._discover_annotation_derivative(dataset.resolve())
+
+
+def test_custom_dataset_requires_explicit_registration_and_output(tmp_path):
+    with pytest.raises(SystemExit):
+        dense.main(["--dataset", str(tmp_path)])
+    with pytest.raises(SystemExit):
+        dense.main(
+            [
+                "--dataset",
+                str(tmp_path),
+                "--registration-run",
+                str(tmp_path / "registration"),
+            ]
+        )
+
+
+def test_default_example_paths_resolve_before_run(monkeypatch):
+    received = {}
+
+    def fake_run(**kwargs):
+        received.update(kwargs)
+        return {"status": "test"}
+
+    monkeypatch.setattr(dense, "run", fake_run)
+
+    assert dense.main([]) == 0
+    assert received["dataset"] == dense.DEFAULT_DATASET.resolve()
+    assert received["registration"] == dense.DEFAULT_REGISTRATION
+    assert received["output"] == dense.DEFAULT_OUTPUT.resolve()
