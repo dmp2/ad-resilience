@@ -37,7 +37,6 @@ from preprocess.run_allen_emlddmm_full_resolution_nissl import (
 )
 from preprocess.visualize_allen_annotations import _combined_display_map
 
-
 PROJECT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = PROJECT / (
     "data/derivatives/allen/specimen_708424/"
@@ -63,6 +62,7 @@ WSI_PIN = "d4d118a47d08700c8c30cf852b855e14e411bbdf"
 SCHEMA = "allen-dense-registered-histology-v3"
 ANCHOR_SCHEMA = "allen-final-registered-annotation-anchors-v1"
 PAIR_SCHEMA = "allen-dense-pair-v3"
+TIFF_STORE_SCHEMA = "allen-dense-tiff-store-v1"
 GROUP_ORDER = (31, 113753816, 141667008, 265297118)
 EXPECTED_SHAPE = (522, 730)
 EXPECTED_SECTION_COUNT = 2846
@@ -133,6 +133,21 @@ def _write_tsv(
         writer.writeheader()
         writer.writerows(rows)
     os.replace(temporary, path)
+
+
+def _copy_file_transactionally(source: Path, destination: Path) -> None:
+    """Copy immutable metadata without ever exposing a partial destination."""
+    payload = source.read_bytes()
+    if destination.is_file():
+        if destination.read_bytes() != payload:
+            raise RuntimeError(
+                f"Existing metadata conflicts with {source}: {destination}"
+            )
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(payload)
+    os.replace(temporary, destination)
 
 
 def _recorded_path(root: Path, value: str) -> Path:
@@ -999,9 +1014,79 @@ def categorical_pair_plane(
     return winner
 
 
+class DenseAnnotationStore:
+    """Narrow storage boundary for already-hardened uint32 label planes."""
+
+    output_format: str
+
+    def __init__(
+        self,
+        output: Path,
+        shape: tuple[int, int],
+        canonical_z_um: np.ndarray,
+        groups: Sequence[int] = GROUP_ORDER,
+    ) -> None:
+        self.output = output
+        self.shape = tuple(shape)
+        self.canonical_z_um = np.asarray(canonical_z_um, dtype=np.float64)
+        self.groups = tuple(groups)
+        self.group_index = {group: index for index, group in enumerate(self.groups)}
+
+    def write_group_plane(
+        self, group: int, canonical_index: int, plane: np.ndarray, *, overwrite: bool
+    ) -> bool:
+        raise NotImplementedError
+
+    def read_group_plane(self, group: int, canonical_index: int) -> np.ndarray:
+        raise NotImplementedError
+
+    def write_combined_plane(
+        self, canonical_index: int, plane: np.ndarray, *, overwrite: bool
+    ) -> bool:
+        raise NotImplementedError
+
+    def plane_exists(
+        self, canonical_index: int, *, group: int | None = None, combined: bool = False
+    ) -> bool:
+        raise NotImplementedError
+
+    def verify_plane(
+        self,
+        canonical_index: int,
+        *,
+        group: int | None = None,
+        combined: bool = False,
+        expected: np.ndarray | None = None,
+    ) -> bool:
+        raise NotImplementedError
+
+    def state(self, group: int, canonical_index: int) -> int:
+        return int(self.states[self.group_index[group], canonical_index])
+
+    def set_state(self, group: int, canonical_index: int, value: int) -> None:
+        self.states[self.group_index[group], canonical_index] = value
+
+    def finalize(self, *, include_combined: bool) -> Path | None:
+        return None
+
+    def products(self) -> dict[str, str]:
+        raise NotImplementedError
+
+
+def _validated_uint32_plane(plane: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    value = np.asarray(plane)
+    if value.dtype != np.dtype("uint32") or value.shape != shape:
+        raise RuntimeError(
+            f"Dense label plane must have dtype uint32 and shape {shape}; "
+            f"got {value.dtype} {value.shape}"
+        )
+    return value
+
+
 def _dense_products(
     output: Path, shape: tuple[int, int], canonical_z_um: np.ndarray
 ) -> tuple[Any, dict[int, Any], Any]:
+    """Open the validated legacy Zarr dense product."""
     if len(canonical_z_um) != EXPECTED_SECTION_COUNT:
         raise RuntimeError(
             "Dense output must use the authoritative canonical z lattice"
@@ -1045,16 +1130,323 @@ def _dense_products(
     return root, arrays, states
 
 
+class ZarrDenseAnnotationStore(DenseAnnotationStore):
+    """Adapter around the previously validated dense Zarr representation."""
+
+    output_format = "zarr"
+
+    def __init__(
+        self, output: Path, shape: tuple[int, int], canonical_z_um: np.ndarray
+    ) -> None:
+        super().__init__(output, shape, canonical_z_um)
+        self.root, self.arrays, self.states = _dense_products(
+            output, shape, canonical_z_um
+        )
+
+    def write_group_plane(
+        self, group: int, canonical_index: int, plane: np.ndarray, *, overwrite: bool
+    ) -> bool:
+        self.arrays[group][canonical_index] = _validated_uint32_plane(plane, self.shape)
+        return True
+
+    def read_group_plane(self, group: int, canonical_index: int) -> np.ndarray:
+        return np.asarray(self.arrays[group][canonical_index], dtype=np.uint32)
+
+    def write_combined_plane(
+        self, canonical_index: int, plane: np.ndarray, *, overwrite: bool
+    ) -> bool:
+        combined = _zarr_array(
+            self.root,
+            "combined",
+            shape=(len(self.canonical_z_um), *self.shape),
+            chunks=(1, *self.shape),
+            dtype="uint32",
+        )
+        combined[canonical_index] = _validated_uint32_plane(plane, self.shape)
+        return True
+
+    def plane_exists(
+        self, canonical_index: int, *, group: int | None = None, combined: bool = False
+    ) -> bool:
+        if combined:
+            return "combined" in self.root
+        return group in self.arrays
+
+    def verify_plane(
+        self,
+        canonical_index: int,
+        *,
+        group: int | None = None,
+        combined: bool = False,
+        expected: np.ndarray | None = None,
+    ) -> bool:
+        if combined:
+            if "combined" not in self.root:
+                return False
+            value = np.asarray(self.root["combined"][canonical_index])
+        else:
+            if group is None or group not in self.arrays:
+                return False
+            value = self.read_group_plane(group, canonical_index)
+        _validated_uint32_plane(value, self.shape)
+        return expected is None or np.array_equal(value, expected)
+
+    def products(self) -> dict[str, str]:
+        return {
+            "dense_z_coordinate": str(self.output / "dense.zarr/z_um"),
+            "dense_per_group": str(self.output / "dense.zarr/groups"),
+            "semantic_state": str(self.output / "dense.zarr/semantic_state"),
+            "combined": str(self.output / "dense.zarr/combined"),
+        }
+
+
+class TiffDenseAnnotationStore(DenseAnnotationStore):
+    """Transactional, one-file-per-plane uint32 TIFF dense representation."""
+
+    output_format = "tiff"
+
+    def __init__(
+        self,
+        output: Path,
+        shape: tuple[int, int],
+        canonical_z_um: np.ndarray,
+        *,
+        compression: str = "deflate",
+        groups: Sequence[int] = GROUP_ORDER,
+    ) -> None:
+        super().__init__(output, shape, canonical_z_um, groups)
+        if compression not in {"deflate", "none"}:
+            raise ValueError(f"Unsupported TIFF compression: {compression}")
+        self.compression = compression
+        self.root = output / "dense_tiff"
+        self.states = np.zeros(
+            (len(self.groups), len(self.canonical_z_um)), dtype=np.uint8
+        )
+        descriptor_path = output / "metadata/dense_tiff_store.json"
+        coordinate_sha256 = hashlib.sha256(
+            self.canonical_z_um.astype("<f8", copy=False).tobytes()
+        ).hexdigest()
+        descriptor = {
+            "schema": TIFF_STORE_SCHEMA,
+            "output_format": self.output_format,
+            "compression": self.compression,
+            "dtype": "uint32",
+            "shape_yx": list(self.shape),
+            "canonical_positions": len(self.canonical_z_um),
+            "canonical_z_float64_sha256": coordinate_sha256,
+            "graphic_groups": list(self.groups),
+        }
+        if descriptor_path.is_file():
+            if json.loads(descriptor_path.read_text()) != descriptor:
+                raise RuntimeError(
+                    f"Existing TIFF product conflicts with this run: {descriptor_path}"
+                )
+        else:
+            if self.root.exists() and any(self.root.rglob("*.tif")):
+                raise RuntimeError(
+                    "Existing TIFF planes lack compatible store metadata; move the "
+                    f"incomplete product aside: {self.root}"
+                )
+            _json(descriptor_path, descriptor)
+        for group in self.groups:
+            (self.root / "groups" / str(group)).mkdir(parents=True, exist_ok=True)
+        (self.root / "combined").mkdir(parents=True, exist_ok=True)
+
+    def _path(self, canonical_index: int, *, group: int | None, combined: bool) -> Path:
+        if not 0 <= canonical_index < len(self.canonical_z_um):
+            raise IndexError(f"Canonical position is out of range: {canonical_index}")
+        filename = f"{canonical_index:06d}.tif"
+        if combined:
+            if group is not None:
+                raise ValueError("A combined plane cannot have a graphic group")
+            return self.root / "combined" / filename
+        if group not in self.group_index:
+            raise ValueError(f"Unknown graphic group: {group}")
+        return self.root / "groups" / str(group) / filename
+
+    def _write(self, path: Path, plane: np.ndarray, *, overwrite: bool) -> bool:
+        value = _validated_uint32_plane(plane, self.shape)
+        if path.is_file():
+            existing = tifffile.imread(path)
+            _validated_uint32_plane(existing, self.shape)
+            if np.array_equal(existing, value):
+                return False
+            if not overwrite:
+                raise RuntimeError(
+                    f"Existing TIFF conflicts with requested dense plane: {path}"
+                )
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        os.close(file_descriptor)
+        temporary = Path(temporary_name)
+        try:
+            tifffile.imwrite(
+                temporary,
+                value,
+                compression=None if self.compression == "none" else "deflate",
+                photometric="minisblack",
+                metadata=None,
+            )
+            written = tifffile.imread(temporary)
+            _validated_uint32_plane(written, self.shape)
+            if not np.array_equal(written, value):
+                raise RuntimeError(f"TIFF verification failed before commit: {path}")
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        return True
+
+    def write_group_plane(
+        self, group: int, canonical_index: int, plane: np.ndarray, *, overwrite: bool
+    ) -> bool:
+        return self._write(
+            self._path(canonical_index, group=group, combined=False),
+            plane,
+            overwrite=overwrite,
+        )
+
+    def read_group_plane(self, group: int, canonical_index: int) -> np.ndarray:
+        path = self._path(canonical_index, group=group, combined=False)
+        return np.asarray(tifffile.imread(path))
+
+    def write_combined_plane(
+        self, canonical_index: int, plane: np.ndarray, *, overwrite: bool
+    ) -> bool:
+        return self._write(
+            self._path(canonical_index, group=None, combined=True),
+            plane,
+            overwrite=overwrite,
+        )
+
+    def plane_exists(
+        self, canonical_index: int, *, group: int | None = None, combined: bool = False
+    ) -> bool:
+        return self._path(canonical_index, group=group, combined=combined).is_file()
+
+    def verify_plane(
+        self,
+        canonical_index: int,
+        *,
+        group: int | None = None,
+        combined: bool = False,
+        expected: np.ndarray | None = None,
+    ) -> bool:
+        path = self._path(canonical_index, group=group, combined=combined)
+        if not path.is_file():
+            return False
+        value = np.asarray(tifffile.imread(path))
+        _validated_uint32_plane(value, self.shape)
+        return expected is None or np.array_equal(value, expected)
+
+    @staticmethod
+    def _manifest_state(value: int) -> tuple[str, str]:
+        evidence = {
+            UNSUPPORTED: "UNAVAILABLE",
+            OBSERVED_LABELS: "OBSERVED",
+            OBSERVED_VALID_EMPTY: "OBSERVED",
+            INFERRED: "INFERRED",
+        }
+        return STATE_NAME[value], evidence[value]
+
+    def finalize(self, *, include_combined: bool) -> Path:
+        rows: list[dict[str, Any]] = []
+        for group in self.groups:
+            for canonical_index, z_um in enumerate(self.canonical_z_um):
+                path = self._path(canonical_index, group=group, combined=False)
+                if not self.verify_plane(canonical_index, group=group):
+                    raise RuntimeError(f"Missing completed TIFF plane: {path}")
+                semantic, evidence = self._manifest_state(
+                    self.state(group, canonical_index)
+                )
+                rows.append(
+                    {
+                        "relative_path": str(path.relative_to(self.output)),
+                        "canonical_index": canonical_index,
+                        "z_um": f"{z_um:.17g}",
+                        "graphic_group_id": group,
+                        "product_type": "group",
+                        "semantic_state": semantic,
+                        "evidence_state": evidence,
+                        "dtype": "uint32",
+                        "height": self.shape[0],
+                        "width": self.shape[1],
+                        "sha256": _sha256(path),
+                    }
+                )
+        if include_combined:
+            for canonical_index, z_um in enumerate(self.canonical_z_um):
+                path = self._path(canonical_index, group=None, combined=True)
+                if not self.verify_plane(canonical_index, combined=True):
+                    raise RuntimeError(f"Missing completed TIFF plane: {path}")
+                state_values = [
+                    self.state(group, canonical_index) for group in self.groups
+                ]
+                if all(value == UNSUPPORTED for value in state_values):
+                    semantic, evidence = "UNSUPPORTED", "UNAVAILABLE"
+                else:
+                    semantic, evidence = "SEE_SECTION_GROUP_PROVENANCE", "COMBINED"
+                rows.append(
+                    {
+                        "relative_path": str(path.relative_to(self.output)),
+                        "canonical_index": canonical_index,
+                        "z_um": f"{z_um:.17g}",
+                        "graphic_group_id": "",
+                        "product_type": "combined",
+                        "semantic_state": semantic,
+                        "evidence_state": evidence,
+                        "dtype": "uint32",
+                        "height": self.shape[0],
+                        "width": self.shape[1],
+                        "sha256": _sha256(path),
+                    }
+                )
+        path = self.output / "metadata/dense_tiff_manifest.tsv"
+        _write_tsv(path, rows, list(rows[0]))
+        return path
+
+    def products(self) -> dict[str, str]:
+        return {
+            "dense_per_group": str(self.root / "groups"),
+            "semantic_state": str(
+                self.output / "metadata/section_group_provenance.tsv"
+            ),
+            "combined": str(self.root / "combined"),
+            "tiff_manifest": str(self.output / "metadata/dense_tiff_manifest.tsv"),
+        }
+
+
+def create_dense_store(
+    output: Path,
+    shape: tuple[int, int],
+    canonical_z_um: np.ndarray,
+    *,
+    output_format: str,
+    tiff_compression: str,
+) -> DenseAnnotationStore:
+    if output_format == "tiff":
+        return TiffDenseAnnotationStore(
+            output, shape, canonical_z_um, compression=tiff_compression
+        )
+    if output_format == "zarr":
+        return ZarrDenseAnnotationStore(output, shape, canonical_z_um)
+    raise ValueError(f"Unsupported dense output format: {output_format}")
+
+
 def initialize_dense(
-    context: SourceContext, output: Path
-) -> tuple[Any, dict[int, Any], Any, dict[int, int]]:
+    context: SourceContext,
+    output: Path,
+    store: DenseAnnotationStore,
+    recoverable_planes: set[tuple[int, int]],
+) -> dict[int, int]:
     anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
     anchor_rows = _read_tsv(output / "metadata/anchors.tsv")
     ordinal_by_physical: dict[int, int] = {}
     for ordinal, section in enumerate(context.annotation_sections):
         ordinal_by_physical[context.physical_by_section[section]] = ordinal
-    root, arrays, states = _dense_products(output, EXPECTED_SHAPE, context.axes[0])
-    group_index = {group: i for i, group in enumerate(GROUP_ORDER)}
     anchor_groups = anchor_root["groups"]
     for row in anchor_rows:
         state = row["semantic_state"]
@@ -1063,15 +1455,70 @@ def initialize_dense(
         physical = int(row["physical_index"])
         group = int(row["graphic_group"])
         ordinal = ordinal_by_physical[physical]
-        arrays[group][physical] = anchor_groups[str(group)][ordinal]
-        states[group_index[group], physical] = (
-            OBSERVED_LABELS if state == SEMANTIC_LABELED else OBSERVED_VALID_EMPTY
+        observed = np.asarray(anchor_groups[str(group)][ordinal], dtype=np.uint32)
+        store.write_group_plane(group, physical, observed, overwrite=False)
+        store.set_state(
+            group,
+            physical,
+            OBSERVED_LABELS if state == SEMANTIC_LABELED else OBSERVED_VALID_EMPTY,
         )
-    return root, arrays, states, ordinal_by_physical
+    if isinstance(store, TiffDenseAnnotationStore):
+        _restore_tiff_checkpoint_states(store, output)
+        zero = np.zeros(store.shape, dtype=np.uint32)
+        for group in store.groups:
+            for physical in range(len(store.canonical_z_um)):
+                if not store.plane_exists(physical, group=group):
+                    store.write_group_plane(group, physical, zero, overwrite=False)
+                elif (
+                    store.state(group, physical) == UNSUPPORTED
+                    and (group, physical) not in recoverable_planes
+                    and np.any(store.read_group_plane(group, physical))
+                ):
+                    raise RuntimeError(
+                        "Existing TIFF plane has no matching observed or pair "
+                        f"provenance: group {group}, canonical index {physical}"
+                    )
+    return ordinal_by_physical
 
 
 def _pair_id(pair: tuple[int, int]) -> str:
     return f"{pair[0]:04d}-{pair[1]:04d}"
+
+
+def _pair_status_path(output: Path, pair: tuple[int, int], output_format: str) -> Path:
+    return output / "metadata/pairs" / output_format / f"{_pair_id(pair)}.json"
+
+
+def _existing_pair_status_path(
+    output: Path, pair: tuple[int, int], output_format: str
+) -> Path | None:
+    path = _pair_status_path(output, pair, output_format)
+    if path.is_file():
+        return path
+    legacy = output / "metadata/pairs" / f"{_pair_id(pair)}.json"
+    if output_format == "zarr" and legacy.is_file():
+        return legacy
+    return None
+
+
+def _restore_tiff_checkpoint_states(
+    store: TiffDenseAnnotationStore, output: Path
+) -> None:
+    directory = output / "metadata/pairs/tiff"
+    if not directory.is_dir():
+        return
+    for path in sorted(directory.glob("*.json")):
+        status = json.loads(path.read_text())
+        if status.get("status") != "complete" or status.get("output_format") != "tiff":
+            continue
+        left, right = map(int, status["pair"])
+        for group in map(int, status["groups"]):
+            for canonical_index in range(left + 1, right):
+                if not store.verify_plane(canonical_index, group=group):
+                    raise RuntimeError(
+                        f"TIFF pair checkpoint exists without a valid plane: {path}"
+                    )
+                store.set_state(group, canonical_index, INFERRED)
 
 
 def _parse_pair(value: str) -> tuple[int, int]:
@@ -1096,6 +1543,7 @@ def _peak_rss_kib() -> int:
 def process_pair(
     context: SourceContext,
     output: Path,
+    store: DenseAnnotationStore,
     pair: tuple[int, int],
     groups: Sequence[int],
     config: Mapping[str, Any],
@@ -1109,26 +1557,51 @@ def process_pair(
     configuration_sha256 = hashlib.sha256(
         json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    status_path = output / "metadata/pairs" / f"{_pair_id(pair)}.json"
-    if status_path.is_file() and not overwrite:
-        status = json.loads(status_path.read_text())
+    left_index, right_index = pair
+    existing_status_path = _existing_pair_status_path(output, pair, store.output_format)
+    status_path = _pair_status_path(output, pair, store.output_format)
+    if existing_status_path is not None and not overwrite:
+        status = json.loads(existing_status_path.read_text())
         if status.get("status") != "complete":
-            raise RuntimeError(f"Existing pair status is incomplete: {status_path}")
+            raise RuntimeError(
+                f"Existing pair status is incomplete: {existing_status_path}"
+            )
+        recorded_format = status.get("output_format")
+        if recorded_format is None and existing_status_path == (
+            output / "metadata/pairs" / f"{_pair_id(pair)}.json"
+        ):
+            recorded_format = "zarr"
+        if recorded_format != store.output_format:
+            raise RuntimeError(
+                f"Existing pair status belongs to {recorded_format}, not "
+                f"{store.output_format}: {existing_status_path}"
+            )
         if (
             status.get("nt") != nt
             or status.get("configuration_sha256") != configuration_sha256
         ):
             raise RuntimeError(
-                f"Existing pair status uses another nt/configuration: {status_path}"
+                f"Existing pair status uses another nt/configuration: "
+                f"{existing_status_path}"
             )
+        for group in groups:
+            for physical in range(left_index + 1, right_index):
+                if store.state(group, physical) != INFERRED or not store.verify_plane(
+                    physical, group=group
+                ):
+                    raise RuntimeError(
+                        "Pair checkpoint exists without its completed "
+                        f"{store.output_format} output: {existing_status_path}"
+                    )
+        if existing_status_path != status_path:
+            status = {**status, "output_format": store.output_format}
+            _json(status_path, status)
         return status
     anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
-    _, dense, states = _dense_products(output, EXPECTED_SHAPE, context.axes[0])
     ordinal_by_physical = {
         context.physical_by_section[section]: ordinal
         for ordinal, section in enumerate(context.annotation_sections)
     }
-    left_index, right_index = pair
     left_ordinal = ordinal_by_physical[left_index]
     right_ordinal = ordinal_by_physical[right_index]
     z0_um = float(context.axes[0][left_index])
@@ -1153,7 +1626,6 @@ def process_pair(
         wsi_repository=wsi_repository,
         device=device,
     )
-    group_index = {group: i for i, group in enumerate(GROUP_ORDER)}
     group_reports: dict[str, Any] = {}
     for group in groups:
         endpoint_left = np.asarray(
@@ -1169,7 +1641,7 @@ def process_pair(
         )
         written = 0
         for physical in range(left_index + 1, right_index):
-            current = int(states[group_index[group], physical])
+            current = store.state(group, physical)
             if current in {OBSERVED_LABELS, OBSERVED_VALID_EMPTY}:
                 continue
             t = (float(context.axes[0][physical]) - z0_um) / (z1_um - z0_um)
@@ -1186,8 +1658,17 @@ def process_pair(
                 em,
                 torch,
             )
-            dense[group][physical] = plane
-            states[group_index[group], physical] = INFERRED
+            replace_placeholder = False
+            if isinstance(store, TiffDenseAnnotationStore) and current == UNSUPPORTED:
+                existing = store.read_group_plane(group, physical)
+                replace_placeholder = not np.any(existing)
+            store.write_group_plane(
+                group,
+                physical,
+                plane,
+                overwrite=overwrite or replace_placeholder,
+            )
+            store.set_state(group, physical, INFERRED)
             written += 1
         group_reports[str(group)] = {
             "pair_local_vocabulary": vocabulary,
@@ -1200,6 +1681,7 @@ def process_pair(
     status = {
         "schema": PAIR_SCHEMA,
         "status": "complete",
+        "output_format": store.output_format,
         "pair": list(pair),
         "pair_id": _pair_id(pair),
         "endpoint_z_um": [z0_um, z1_um],
@@ -1235,9 +1717,10 @@ def process_pair(
     return status
 
 
-def assert_observed_immutable(context: SourceContext, output: Path) -> dict[str, Any]:
+def assert_observed_immutable(
+    context: SourceContext, output: Path, store: DenseAnnotationStore
+) -> dict[str, Any]:
     anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
-    dense_root = zarr.open_group(str(output / "dense.zarr"), mode="r")
     rows = _read_tsv(output / "metadata/anchors.tsv")
     ordinal_by_section = {
         section: i for i, section in enumerate(context.annotation_sections)
@@ -1250,10 +1733,10 @@ def assert_observed_immutable(context: SourceContext, output: Path) -> dict[str,
         physical = int(row["physical_index"])
         group = int(row["graphic_group"])
         observed = np.asarray(
-            anchor_root["groups"][str(group)][ordinal_by_section[section]]
+            anchor_root["groups"][str(group)][ordinal_by_section[section]],
+            dtype=np.uint32,
         )
-        emitted = np.asarray(dense_root["groups"][str(group)][physical])
-        if not np.array_equal(observed, emitted):
+        if not store.verify_plane(physical, group=group, expected=observed):
             raise RuntimeError(
                 f"Observed-evidence immutability failed for section {section}, group {group}"
             )
@@ -1289,16 +1772,16 @@ def _write_state_table(context: SourceContext, output: Path, states: Any) -> Pat
 def finalize_dense(
     context: SourceContext,
     output: Path,
+    store: DenseAnnotationStore,
     pair_groups: Mapping[tuple[int, int], Sequence[int]],
     anchor_report: Mapping[str, Any],
     config: Mapping[str, Any],
     pair_reports: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    root, dense, states = _dense_products(output, EXPECTED_SHAPE, context.axes[0])
     missing_status = [
         pair
         for pair in pair_groups
-        if not (output / "metadata/pairs" / f"{_pair_id(pair)}.json").is_file()
+        if _existing_pair_status_path(output, pair, store.output_format) is None
     ]
     if missing_status:
         raise RuntimeError(
@@ -1306,18 +1789,13 @@ def finalize_dense(
         )
     for (left, right), groups in pair_groups.items():
         for group in groups:
-            values = np.asarray(states[GROUP_ORDER.index(group), left + 1 : right])
+            values = np.asarray(
+                store.states[store.group_index[group], left + 1 : right]
+            )
             if np.any(values != INFERRED):
                 raise RuntimeError(
                     f"Pair {_pair_id((left, right))}, group {group} has missing inferred planes"
                 )
-    combined = _zarr_array(
-        root,
-        "combined",
-        shape=(EXPECTED_SECTION_COUNT, *EXPECTED_SHAPE),
-        chunks=(1, *EXPECTED_SHAPE),
-        dtype="uint32",
-    )
     source_vocab = {
         int(value)
         for values in anchor_report["group_vocabularies"].values()
@@ -1325,22 +1803,30 @@ def finalize_dense(
     }
     for physical in range(EXPECTED_SECTION_COUNT):
         plane = _combined_display_map(
-            [
-                np.asarray(dense[group][physical], dtype=np.uint32)
-                for group in GROUP_ORDER
-            ]
+            [store.read_group_plane(group, physical) for group in GROUP_ORDER]
         )
+        plane = np.asarray(plane, dtype=np.uint32)
         if not set(map(int, np.unique(plane))).issubset(source_vocab):
             raise RuntimeError("Combined product contains a non-authoritative Allen ID")
-        combined[physical] = plane
-    immutability = assert_observed_immutable(context, output)
-    state_path = _write_state_table(context, output, states)
+        store.write_combined_plane(physical, plane, overwrite=False)
+    immutability = assert_observed_immutable(context, output, store)
+    state_path = _write_state_table(context, output, store.states)
+    manifest_path = store.finalize(include_combined=True)
     after = {path: _sha256(Path(path)) for path in context.source_hashes}
     if after != context.source_hashes:
         raise RuntimeError("An authoritative input changed during dense assembly")
+    coordinate_product = (
+        str(output / "dense.zarr/z_um")
+        if store.output_format == "zarr"
+        else str(output / "metadata/physical_sections.tsv")
+    )
     report = {
         "schema": SCHEMA,
         "status": "complete",
+        "output_format": store.output_format,
+        "tiff_compression": (
+            store.compression if isinstance(store, TiffDenseAnnotationStore) else None
+        ),
         "method": (
             "two-sided Nissl-driven diffeomorphic interpolation of categorical Allen "
             "annotations using two endpoint-conditioned WSI trajectories"
@@ -1350,7 +1836,12 @@ def finalize_dense(
             "physical_z_um_source": str(
                 context.dataset / "metadata/physical_sections.tsv"
             ),
-            "coordinate_array": str(output / "dense.zarr/z_um"),
+            "coordinate_product": coordinate_product,
+            **(
+                {"coordinate_array": coordinate_product}
+                if store.output_format == "zarr"
+                else {}
+            ),
             "xJ0_verified_equal": True,
             "role": "both real-anchor locations and dense output sampling",
         },
@@ -1366,7 +1857,11 @@ def finalize_dense(
             "existing ordered nonzero overwrite via visualize_allen_annotations._combined_display_map"
         ),
         "semantic_state_codes": {str(key): value for key, value in STATE_NAME.items()},
-        "unsupported_zero_distinguished_by": "dense.zarr/semantic_state",
+        "unsupported_zero_distinguished_by": (
+            str(output / "dense.zarr/semantic_state")
+            if store.output_format == "zarr"
+            else str(state_path)
+        ),
         "time_convention": (
             "for canonical z, t=(z-z0)/(z1-z0); source velocities are integrated "
             "to arbitrary t and complementary 1-t using WSI's Euler/composition convention"
@@ -1383,13 +1878,12 @@ def finalize_dense(
         "products": {
             "observed_anchors": str(output / "anchors.zarr"),
             "anchor_manifest": str(output / "metadata/anchors.tsv"),
-            "dense_z_coordinate": str(output / "dense.zarr/z_um"),
-            "dense_per_group": str(output / "dense.zarr/groups"),
-            "semantic_state": str(output / "dense.zarr/semantic_state"),
+            "physical_sections": str(output / "metadata/physical_sections.tsv"),
             "semantic_provenance_tsv": str(state_path),
-            "combined": str(output / "dense.zarr/combined"),
-            "pair_provenance": str(output / "metadata/pairs"),
+            "pair_provenance": str(output / "metadata/pairs" / store.output_format),
+            **store.products(),
         },
+        "per_plane_sha256": manifest_path is not None,
         "capacity_planning": [
             {
                 key: report.get(key)
@@ -1408,7 +1902,30 @@ def finalize_dense(
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     _json(output / "dataset.json", report)
+    _json(output / "provenance.json", report)
     return report
+
+
+def _write_output_readme(output: Path) -> None:
+    text = """# Dense registered-histology Allen annotations
+
+The default scientific raster representation is a lossless plain TIFF series:
+one uint32 file per canonical z position and graphic group under `dense_tiff/`.
+Files are named by six-digit canonical position index; physical z coordinates
+are authoritative in `metadata/physical_sections.tsv`.
+
+TIFF value 0 alone does not establish annotation availability. Consumers must
+consult `metadata/section_group_provenance.tsv` and the TIFF manifest to
+distinguish valid categorical background from unsupported or unavailable
+evidence. These files are categorical scientific rasters, not display images.
+Lossy compression is forbidden. The optional Zarr backend is selected explicitly
+with `--output-format zarr` and remains in `dense.zarr/` when present.
+"""
+    path = output / "README.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(text)
+    os.replace(temporary, path)
 
 
 def run(
@@ -1424,8 +1941,15 @@ def run(
     overwrite: bool,
     nt_override: int | None = None,
     anchors_only: bool = False,
+    output_format: str = "tiff",
+    tiff_compression: str = "deflate",
 ) -> dict[str, Any]:
     context = discover_inputs(dataset, registration, annotations)
+    _copy_file_transactionally(
+        context.dataset / "metadata/physical_sections.tsv",
+        output / "metadata/physical_sections.tsv",
+    )
+    _write_output_readme(output)
     anchor_report = materialize_anchors(context, output)
     anchor_rows = _read_tsv(output / "metadata/anchors.tsv")
     sequences, pair_groups = build_endpoint_sequences(anchor_rows)
@@ -1477,10 +2001,11 @@ def run(
             "unique_endpoint_pair_count": len(pair_groups),
             "canonical_output_positions": EXPECTED_SECTION_COUNT,
             "canonical_z_coordinate_source": str(
-                context.dataset / "metadata/physical_sections.tsv"
+                output / "metadata/physical_sections.tsv"
             ),
             "configured_lddmm_nt": int(base_config["nt"]),
             "output_time_rule": "t=(z-z0)/(z1-z0) at each canonical physical z",
+            "output_format": output_format,
         },
     )
     planning = {
@@ -1489,6 +2014,7 @@ def run(
         "endpoint_pair_table": str(pair_table_path),
         "configured_lddmm_nt": int(base_config["nt"]),
         "output_time_rule": "t=(z-z0)/(z1-z0)",
+        "output_format": output_format,
     }
     if anchors_only:
         return {
@@ -1497,8 +2023,21 @@ def run(
             "planning": planning,
         }
 
-    initialize_dense(context, output)
     selected = list(pair_groups) if pair is None else [pair]
+    recoverable_planes = {
+        (group, physical)
+        for endpoint_pair in selected
+        for group in pair_groups[endpoint_pair]
+        for physical in range(endpoint_pair[0] + 1, endpoint_pair[1])
+    }
+    store = create_dense_store(
+        output,
+        EXPECTED_SHAPE,
+        context.axes[0],
+        output_format=output_format,
+        tiff_compression=tiff_compression,
+    )
+    initialize_dense(context, output, store, recoverable_planes)
     reports = []
     for endpoint_pair in selected:
         selected_override = nt_override if endpoint_pair == pair else None
@@ -1507,6 +2046,7 @@ def run(
             process_pair(
                 context,
                 output,
+                store,
                 endpoint_pair,
                 pair_groups[endpoint_pair],
                 solver_config,
@@ -1520,19 +2060,25 @@ def run(
                 overwrite=overwrite,
             )
         )
-    immutability = assert_observed_immutable(context, output)
+    immutability = assert_observed_immutable(context, output, store)
     if pair is not None:
+        state_path = _write_state_table(context, output, store.states)
+        manifest_path = store.finalize(include_combined=False)
         return {
             "status": "pair_complete",
+            "output_format": store.output_format,
             "pair": list(pair),
             "report": reports[0],
             "planning": planning,
             "observed_evidence_immutability": immutability,
+            "semantic_provenance_tsv": str(state_path),
+            "tiff_manifest": str(manifest_path) if manifest_path else None,
             "output": str(output),
         }
     return finalize_dense(
         context,
         output,
+        store,
         pair_groups,
         anchor_report,
         base_config,
@@ -1540,7 +2086,7 @@ def run(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Densify sparse Allen annotations after accepted final registered-histology placement"
@@ -1550,6 +2096,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--annotations", type=Path, default=None)
     parser.add_argument("--registration-run", type=Path, default=DEFAULT_REGISTRATION)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output-format",
+        choices=("tiff", "zarr"),
+        default="tiff",
+        help="primary dense raster backend (default: tiff)",
+    )
+    parser.add_argument(
+        "--tiff-compression",
+        choices=("deflate", "none"),
+        default="deflate",
+        help="lossless TIFF compression (used only for TIFF output)",
+    )
     parser.add_argument(
         "--pair",
         type=_parse_pair,
@@ -1571,6 +2129,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="recompute a selected completed pair; observed anchors remain immutable",
     )
     parser.add_argument("--anchors-only", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_argument_parser()
     args = parser.parse_args(argv)
     if args.overwrite and args.pair is None:
         parser.error("--overwrite is limited to an explicitly selected --pair")
@@ -1588,6 +2151,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         overwrite=args.overwrite,
         nt_override=args.nt,
         anchors_only=args.anchors_only,
+        output_format=args.output_format,
+        tiff_compression=args.tiff_compression,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

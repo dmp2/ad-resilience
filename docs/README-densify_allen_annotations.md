@@ -18,8 +18,8 @@ t = (z - z0) / (z1 - z0).
 
 Only the annotation-supported range is filled. Observed endpoints are copied
 literally from the stored final registered anchors and are never regenerated
-from a trajectory. `dense.zarr/z_um` stores the authoritative coordinates
-explicitly as `float64`; the dense group arrays retain 2,846 z planes.
+from a trajectory. The authoritative coordinates remain explicit in
+`metadata/physical_sections.tsv`; every dense group retains 2,846 z planes.
 
 `nt` has a separate role: it is the number of temporal intervals used to
 estimate and numerically integrate each LDDMM velocity trajectory. The initial
@@ -46,6 +46,30 @@ that output planes must be stored integer trajectory states are not used.
 
 Use the environment containing the pinned WSI pipeline, EM-LDDMM, Zarr,
 SciPy, tifffile, PyTorch, and this project's `src` tree.
+
+### Storage policy
+
+The default primary output is a lossless plain TIFF series:
+
+```text
+--output-format tiff                 # default
+--tiff-compression deflate           # default, lossless zlib/Deflate
+--tiff-compression none              # optional, lossless uncompressed TIFF
+```
+
+Use `--output-format zarr` to select the existing chunked multidimensional
+backend instead. A run writes exactly one primary dense backend; selecting TIFF
+does not also write `dense.zarr`, and selecting Zarr does not write the TIFF
+series. The internal `anchors.zarr` cache remains common to both backends and is
+not a second dense output.
+
+TIFF is the default because section-wise access matches the histology workflow,
+each canonical plane is independently readable, interoperability is broad,
+restart/recovery is straightforward, and basic use requires no specialized Zarr
+reader. The TIFFs contain categorical Allen structure IDs as `uint32`, not RGB
+or palette/display images. Lossy compression, including JPEG, is forbidden.
+Scientific coordinates and semantics remain authoritative in TSV/JSON rather
+than TIFF tags.
 
 Materialize and validate observed anchors and write the pair plan without
 running registration:
@@ -115,23 +139,74 @@ No full production run has been launched.
 ## Products
 
 The default root is
-`data/derivatives/allen/specimen_708424/annotations_dense_registered_histology_200um/`:
+`data/derivatives/allen/specimen_708424/annotations_dense_registered_histology_200um/`.
+A default TIFF run uses this layout:
+
+```text
+annotations_dense_registered_histology_200um/
+├── dense_tiff/
+│   ├── groups/
+│   │   └── <graphic-group-id>/
+│   │       ├── 000000.tif
+│   │       ├── ...
+│   │       └── 002845.tif
+│   └── combined/
+│       ├── 000000.tif
+│       ├── ...
+│       └── 002845.tif
+├── metadata/
+│   ├── physical_sections.tsv
+│   ├── anchors.tsv
+│   ├── endpoint_pairs.tsv
+│   ├── section_group_provenance.tsv
+│   ├── dense_tiff_manifest.tsv
+│   └── pairs/tiff/*.json
+├── provenance.json
+└── README.md
+```
+
+Each group directory contains exactly one six-digit, zero-padded TIFF per
+canonical position, including unsupported positions. Filenames encode the
+canonical positional index, never a rounded z coordinate. Unsupported planes
+are ordinary zero-valued `uint32` rasters, while their state remains
+`UNSUPPORTED`/`UNAVAILABLE` in metadata. Therefore TIFF pixel value 0 alone does
+not determine availability or valid categorical background: consumers **must**
+consult `metadata/section_group_provenance.tsv` and
+`metadata/dense_tiff_manifest.tsv`. The same warning applies to combined TIFFs,
+which retain the established ordered nonzero-overwrite group precedence but do
+not replace per-group provenance.
+
+Each TIFF is written to a temporary file in its destination directory, verified,
+and atomically committed with `os.replace`. Only a final six-digit `.tif` name is
+a completed plane; temporary files are ignored on restart. Pair checkpoints are
+backend-qualified under `metadata/pairs/tiff/` or `metadata/pairs/zarr/` and
+record `output_format`, so an old Zarr checkpoint cannot complete a TIFF run.
+Without `--overwrite`, incompatible existing planes or store metadata fail
+clearly. `--overwrite` remains limited to one explicit pair and never replaces
+the observed anchor cache.
+
+`metadata/dense_tiff_manifest.tsv` has one row per completed TIFF with its
+relative path, canonical index, physical z, graphic group/product type,
+semantic/evidence state, dtype, shape, and SHA256. The existing project SHA256
+helper is reused. The copied `metadata/physical_sections.tsv` is the
+authoritative filename-index-to-physical-z mapping.
+
+Products shared by both backends include:
 
 - `anchors.zarr`: final-placed Nissl, endpoint weights, and per-group hard
   annotation anchors;
 - `metadata/anchors.tsv`: section-by-group semantic and transform provenance;
-- `metadata/endpoint_pairs.tsv`: every required pair's endpoint coordinates,
-  canonical gap/interior count, and configured LDDMM `nt`;
-- `dense.zarr/z_um`: the authoritative 2,846-position physical-z array;
-- `dense.zarr/groups/<group-id>`: chunked dense `uint32` group volumes;
-- `dense.zarr/semantic_state`: group-by-canonical-z `uint8` provenance;
-- `metadata/section_group_provenance.tsv`: readable state table after full
-  assembly;
-- `dense.zarr/combined`: ordered nonzero-overwrite composite after full
-  assembly;
-- `metadata/pairs/*.json`: map checks, temporal configuration, categorical
-  vocabulary, runtime/memory, and restart status.
+- `metadata/endpoint_pairs.tsv`: pair endpoints, canonical gaps, and LDDMM `nt`;
+- `metadata/section_group_provenance.tsv`: readable dense state table;
+- `metadata/pairs/<output-format>/*.json`: pair map checks, temporal settings,
+  categorical vocabulary, runtime/memory, output format, and restart status.
 
-State codes are 0 `UNSUPPORTED`, 1 `OBSERVED_LABELS`, 2
-`OBSERVED_VALID_EMPTY`, and 3 `INFERRED`. Thus zero-valued background and
-unsupported group/position combinations remain distinguishable.
+With `--output-format zarr`, the preserved optional products are
+`dense.zarr/z_um`, `dense.zarr/groups/<group-id>`,
+`dense.zarr/semantic_state`, and `dense.zarr/combined`. Existing Zarr products
+are left in place when TIFF is selected, and existing TIFF products are left in
+place when Zarr is selected.
+
+State codes remain 0 `UNSUPPORTED`, 1 `OBSERVED_LABELS`, 2
+`OBSERVED_VALID_EMPTY`, and 3 `INFERRED`. No availability state is inferred from
+raster values.

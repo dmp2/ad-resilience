@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 
 import numpy as np
 import pytest
@@ -188,3 +189,106 @@ def test_unknown_endpoint_id_is_rejected_before_transport():
             _IdentityInterpolation(),
             _TorchFacade(),
         )
+
+
+def test_tiff_uint32_round_trip_preserves_ids_shape_and_deflate(tmp_path):
+    axis = np.array([-71_125.0, -71_075.0], dtype=np.float64)
+    store = dense.TiffDenseAnnotationStore(
+        tmp_path, (2, 3), axis, compression="deflate", groups=(31,)
+    )
+    plane = np.array([[0, 10, 266441685], [20, 30, 40]], dtype=np.uint32)
+
+    assert store.write_group_plane(31, 1, plane, overwrite=False)
+
+    path = tmp_path / "dense_tiff/groups/31/000001.tif"
+    assert path.is_file()
+    emitted = store.read_group_plane(31, 1)
+    np.testing.assert_array_equal(emitted, plane)
+    assert emitted.dtype == np.uint32
+    assert emitted.shape == (2, 3)
+    with dense.tifffile.TiffFile(path) as tif:
+        assert tif.pages[0].compression.name in {"DEFLATE", "ADOBE_DEFLATE"}
+
+
+def test_tiff_manifest_maps_canonical_filename_to_z_and_observed_state(tmp_path):
+    axis = np.array([-100.25, -50.0], dtype=np.float64)
+    store = dense.TiffDenseAnnotationStore(
+        tmp_path, (2, 2), axis, compression="none", groups=(31,)
+    )
+    observed = np.array([[0, 101], [202, 303]], dtype=np.uint32)
+    unavailable = np.zeros((2, 2), dtype=np.uint32)
+    store.write_group_plane(31, 0, observed, overwrite=False)
+    store.write_group_plane(31, 1, unavailable, overwrite=False)
+    store.set_state(31, 0, dense.OBSERVED_LABELS)
+
+    manifest = store.finalize(include_combined=False)
+
+    with manifest.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream, delimiter="\t"))
+    assert rows[0]["relative_path"] == "dense_tiff/groups/31/000000.tif"
+    assert rows[0]["canonical_index"] == "0"
+    assert float(rows[0]["z_um"]) == axis[0]
+    assert rows[0]["graphic_group_id"] == "31"
+    assert rows[0]["semantic_state"] == "OBSERVED_LABELS"
+    assert rows[0]["evidence_state"] == "OBSERVED"
+    assert rows[0]["sha256"] == dense._sha256(tmp_path / rows[0]["relative_path"])
+    assert rows[1]["semantic_state"] == "UNSUPPORTED"
+    assert rows[1]["evidence_state"] == "UNAVAILABLE"
+
+
+def test_observed_anchor_tiff_is_pixel_identical(tmp_path):
+    axis = np.array([0.0], dtype=np.float64)
+    store = dense.TiffDenseAnnotationStore(
+        tmp_path, (2, 2), axis, compression="deflate", groups=(31,)
+    )
+    observed = np.array([[0, 1], [np.iinfo(np.uint32).max, 42]], dtype=np.uint32)
+
+    store.write_group_plane(31, 0, observed, overwrite=False)
+
+    assert store.verify_plane(0, group=31, expected=observed)
+    np.testing.assert_array_equal(store.read_group_plane(31, 0), observed)
+
+
+def test_cli_defaults_to_tiff_and_accepts_explicit_zarr():
+    parser = dense.build_argument_parser()
+
+    defaults = parser.parse_args([])
+    zarr_args = parser.parse_args(["--output-format", "zarr"])
+
+    assert defaults.output_format == "tiff"
+    assert defaults.tiff_compression == "deflate"
+    assert zarr_args.output_format == "zarr"
+
+
+def test_store_factory_selects_existing_zarr_backend(monkeypatch, tmp_path):
+    selected = object()
+
+    def fake_zarr_store(output, shape, canonical_z_um):
+        assert output == tmp_path
+        assert shape == (2, 2)
+        np.testing.assert_array_equal(canonical_z_um, [0.0])
+        return selected
+
+    monkeypatch.setattr(dense, "ZarrDenseAnnotationStore", fake_zarr_store)
+
+    result = dense.create_dense_store(
+        tmp_path,
+        (2, 2),
+        np.array([0.0]),
+        output_format="zarr",
+        tiff_compression="deflate",
+    )
+
+    assert result is selected
+
+
+def test_tiff_temp_file_is_not_a_completed_plane(tmp_path):
+    axis = np.array([0.0], dtype=np.float64)
+    store = dense.TiffDenseAnnotationStore(
+        tmp_path, (2, 2), axis, compression="deflate", groups=(31,)
+    )
+    temporary = tmp_path / "dense_tiff/groups/31/.000000.tif.interrupted.tmp"
+    temporary.write_bytes(b"partial TIFF")
+
+    assert not store.plane_exists(0, group=31)
+    assert not store.verify_plane(0, group=31)
