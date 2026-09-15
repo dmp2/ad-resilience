@@ -286,6 +286,43 @@ n_draw = 0
 Standard geometric outputs and transformation files are written; complete
 voxelwise mixture arrays are not retained.
 
+
+## Support-aware 400-um QC
+
+The canonical comparison remains the direct pinned
+`em.write_qc_outputs(...)` output. In the slice-matching branch, upstream
+constructs registered histology as `Jr = interp(xJ, Jdata, XJr_)`, then samples
+it onto MRI as `interp(xJ, Jr, Aphi)`. The writer receives the image facade but
+not `W0`, so absent physical planes represented by zeros participate as
+intensity in both ordinary trilinear interpolations. Conversely, MRI to
+histology samples dense MRI at section coordinates and is therefore
+interpretable at actual observed sections.
+
+Render the separate QC-only products from the immutable saved 400-um state:
+
+```bash
+PYTHONPATH=src conda run -n pylddmm_env3.10 \
+  python -m preprocess.render_allen_emlddmm_support_aware_qc --dry-run
+
+PYTHONPATH=src conda run -n pylddmm_env3.10 \
+  python -m preprocess.render_allen_emlddmm_support_aware_qc
+```
+
+The project renderer applies the saved section and volume transforms separately
+to `W0 * J` and `W0`, using pinned linear/trilinear grid sampling. It divides
+the sampled numerator only where sampled support is at least 0.05. Explicit
+zero-support physical planes remain in the 2,846-plane lattice, zero padding is
+used at support boundaries, and no gap-filling pass is performed. The output
+directory contains a copy of canonical reverse QC, support-normalized
+histology-to-MRI orthogonal views, an explicit interpolated-coverage view, and
+MRI-to-histology panels/overlays at five observed sections. Its provenance
+records the registration source, pinned commit, W0 source, method, and threshold.
+
+These images are QC displays only. Unsupported display zeros are sentinels, not
+anatomical intensities; interpolated coverage is not observed tissue; and no QC
+product may be used as a registration target. Improved rendering does not by
+itself demonstrate improved registration.
+
 ## Stop conditions
 
 Do not run a real pilot or full optimization until all preceding gates pass.

@@ -358,7 +358,9 @@ def _ensure_output_paths_available(stage_dir: Path, final_dir: Path) -> None:
             raise FileExistsError(f"Refusing existing QC output path: {path}")
 
 
-def resolve_state(em: Any) -> ResolvedState:
+def resolve_state(
+    em: Any, *, require_upstream_output_available: bool = True
+) -> ResolvedState:
     _require_equal(
         "configured EM-LDDMM pin",
         PIN_FILE.read_text(encoding="utf-8").strip(),
@@ -489,7 +491,8 @@ def resolve_state(em: Any) -> ResolvedState:
     stage_dir, final_dir = _output_paths(EXPECTED_EFFECTIVE_INPLANE_UM)
     if not POSTPROCESSED_QC.is_dir():
         raise RuntimeError(f"QC parent directory is missing: {POSTPROCESSED_QC}")
-    _ensure_output_paths_available(stage_dir, final_dir)
+    if require_upstream_output_available:
+        _ensure_output_paths_available(stage_dir, final_dir)
 
     _audit_weighted_section_equivalence(em, histology, down_j)
     return ResolvedState(
