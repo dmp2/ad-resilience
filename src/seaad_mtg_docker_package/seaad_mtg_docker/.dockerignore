@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.parquet
+*.csv
+*.xlsx
+*.xls
+*.h5ad
+.git/

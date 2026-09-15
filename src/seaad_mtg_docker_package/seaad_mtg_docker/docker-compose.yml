@@ -1,0 +1,51 @@
+services:
+  seaad-mtg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: seaad-mtg:latest
+    container_name: seaad-mtg
+    working_dir: /work
+    stdin_open: true
+    tty: true
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - type: bind
+        source: ${SEAAD_HOST_DIR}
+        target: /work/data
+      - type: bind
+        source: ${SEAAD_WORK_DIR}
+        target: /work/work
+    command:
+      - ${SEAAD_COMMAND:-pipeline}
+      - --data-dir
+      - /work/data
+      - --work-dir
+      - /work/work
+      - --h5ad
+      - ${SEAAD_H5AD:-SEAAD_MTG_MERFISH.2024-12-11.h5ad}
+      - --donor-metadata
+      - ${SEAAD_DONOR_METADATA:-68debdfdd1b8e9f8fd64dab0_sea-ad_cohort_donor_metadata_072524.xlsx}
+      - --cognition
+      - ${SEAAD_COGNITION:-68debdfd4748b7546943a7b4_sea-ad_cohort_harmonized_cognitive_scores_20241213.xlsx}
+      - --mri
+      - ${SEAAD_MRI:-68debdfdae5f82b97af2fb0f_sea-ad_cohort_mri_volumetrics.xlsx}
+      - --mtg-neuropath
+      - ${SEAAD_MTG_NEUROPATH:-68debdfd24606956df13f2dd_sea-ad_all_mtg_quant_neuropath_bydonorid_081122.csv}
+      - --luminex
+      - ${SEAAD_LUMINEX:-68debdff5b8003454786ea29_sea-ad_cohort_mtg-tissue_extractions-luminex_data.xlsx}
+      - --specimen-metadata
+      - ${SEAAD_SPECIMEN_METADATA:-SpecimenMetadata.csv}
+      - --region-prefix
+      - ${SEAAD_REGION_PREFIX:-middle-temporal-gyrus/}
+      - --spatial-outdir
+      - ${SEAAD_SPATIAL_OUTDIR:-seaad_spatial_section_manifest}
+      - --linkage-outdir
+      - ${SEAAD_LINKAGE_OUTDIR:-seaad_mtg_linkage}
+      - --probe-outdir
+      - ${SEAAD_PROBE_OUTDIR:-seaad_mtg_h5ad_crosswalk_probe}
+      - --rank-outdir
+      - ${SEAAD_RANK_OUTDIR:-seaad_crosswalk_ranked}
+      - --outdir
+      - ${SEAAD_CROSSWALK_OUTDIR:-seaad_mtg_spatial_crosswalk_outputs}
