@@ -34,7 +34,7 @@ from preprocess.build_allen_symmetric_histology import (
     bilateral_union,
 )
 from preprocess.run_allen_emlddmm import (
-    load_pinned_mri_image, pinned_emlddmm,
+    load_pinned_mri_image, mri_physical_axes_from_provenance, pinned_emlddmm,
 )
 from preprocess import run_allen_emlddmm_full_coarse_nissl as coarse
 
@@ -2018,6 +2018,674 @@ def symmetric_registration(
     )
 
 
+DIRECT_SECTION_QC_DIRECTORY = "direct_observed_section_registration"
+FORWARD_DEFORMATION = "mri_to_registered_pre_affine"
+INVERSE_DEFORMATION = "registered_pre_affine_to_mri"
+
+
+def _select_direct_qc_sections(
+    observed: np.ndarray,
+    rows: list[dict[str, str]],
+    *,
+    number: int = 9,
+    flagged_allen: tuple[int, ...] = coarse.FLAGGED_ALLEN,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Choose observed representatives and available flagged sections, without overlap."""
+    observed = np.asarray(observed, dtype=np.int64)
+    if observed.ndim != 1 or len(observed) < number or len(np.unique(observed)) != len(observed):
+        raise RuntimeError("Observed section indices are invalid for representative selection")
+    if np.any(observed < 0) or np.any(observed >= len(rows)):
+        raise RuntimeError("Observed section index is outside the physical manifest")
+    observed_set = set(map(int, observed))
+    flagged_lookup = {
+        int(rows[index]["allen_section_number"]): int(index)
+        for index in observed
+    }
+    flagged = np.asarray(
+        [flagged_lookup[value] for value in flagged_allen if value in flagged_lookup],
+        dtype=np.int64,
+    )
+    eligible = np.asarray(
+        [index for index in observed if int(index) not in set(map(int, flagged))],
+        dtype=np.int64,
+    )
+    positions = coarse._uniform_representative_positions(len(eligible), number)
+    representative = eligible[positions]
+    if len(representative) != number:
+        raise RuntimeError(f"Could not select exactly {number} representative sections")
+    if not set(map(int, representative)).issubset(observed_set):
+        raise RuntimeError("Representative selection included an unobserved section")
+    if set(map(int, representative)).intersection(map(int, flagged)):
+        raise RuntimeError("Representative and flagged section selections overlap")
+    return representative, flagged
+
+
+def _integrate_saved_deformation(
+    em: Any,
+    xv: list[np.ndarray],
+    v: np.ndarray,
+    *,
+    direction: str,
+) -> torch.Tensor:
+    """Integrate saved velocity using the two directions in pinned EM-LDDMM."""
+    axes = [torch.as_tensor(axis, dtype=torch.float32) for axis in xv]
+    velocity = torch.as_tensor(v, dtype=torch.float32)
+    if direction == FORWARD_DEFORMATION:
+        integration_velocity = -velocity.flip(0)
+    elif direction == INVERSE_DEFORMATION:
+        integration_velocity = velocity
+    else:
+        raise ValueError(f"Unknown saved deformation direction: {direction}")
+    field = em.v_to_phii(axes, integration_velocity)
+    expected = (3, *(len(axis) for axis in xv))
+    if tuple(field.shape) != expected or not torch.all(torch.isfinite(field)):
+        raise RuntimeError(f"Invalid saved deformation field: {tuple(field.shape)}")
+    return field
+
+
+def _sample_position_field(
+    em: Any,
+    xv: list[np.ndarray],
+    field: torch.Tensor,
+    points: np.ndarray | torch.Tensor,
+) -> torch.Tensor:
+    """Sample a position field by interpolating displacement, as pinned EM-LDDMM does."""
+    axes = [torch.as_tensor(axis, dtype=field.dtype) for axis in xv]
+    identity = torch.stack(torch.meshgrid(axes, indexing="ij"))
+    query = torch.as_tensor(points, dtype=field.dtype)
+    squeeze = query.ndim == 3
+    if squeeze:
+        query = query[:, None]
+    if query.ndim != 4 or query.shape[0] != 3:
+        raise RuntimeError("Position-field query must have shape (3, [plane,] row, column)")
+    sampled = em.interp(axes, field - identity, query) + query
+    return sampled[:, 0] if squeeze else sampled
+
+
+def _registered_plane_mri_queries(
+    em: Any,
+    A: np.ndarray,
+    xv: list[np.ndarray],
+    inverse_field: torch.Tensor,
+    serial_um: float,
+    row_um: np.ndarray,
+    column_um: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return A^-1 y and phi^-1(A^-1 y) for one registered section plane."""
+    rr, cc = np.meshgrid(row_um, column_um, indexing="ij")
+    y = np.stack((np.full_like(rr, serial_um), rr, cc))
+    inverse_affine = np.linalg.inv(np.asarray(A, dtype=np.float64))
+    affine = (
+        inverse_affine[:3, :3] @ y.reshape(3, -1)
+        + inverse_affine[:3, 3, None]
+    ).reshape(y.shape)
+    nonlinear = _sample_position_field(em, xv, inverse_field, affine).cpu().numpy()
+    return affine.astype(np.float32), nonlinear.astype(np.float32)
+
+
+def _query_crop_slices(
+    axes: list[np.ndarray], queries: list[np.ndarray],
+) -> tuple[slice, slice, slice]:
+    """Find the smallest source voxel box containing every trilinear query neighbor."""
+    slices = []
+    for axis_number, axis in enumerate(axes):
+        coordinates = np.asarray(axis, dtype=np.float64)
+        if len(coordinates) < 2 or not np.all(np.diff(coordinates) > 0):
+            raise RuntimeError("MRI axes must be strictly increasing")
+        low = min(float(np.min(query[axis_number])) for query in queries)
+        high = max(float(np.max(query[axis_number])) for query in queries)
+        start = max(0, int(np.searchsorted(coordinates, low, side="right")) - 1)
+        stop = min(len(coordinates), int(np.searchsorted(coordinates, high, side="left")) + 1)
+        if stop - start < 2:
+            if start == 0:
+                stop = min(len(coordinates), 2)
+            else:
+                start = max(0, stop - 2)
+        slices.append(slice(start, stop))
+    return tuple(slices)  # type: ignore[return-value]
+
+
+def _sample_mri_queries_from_proxy(
+    em: Any,
+    proxy: Any,
+    axes: list[np.ndarray],
+    queries: list[np.ndarray],
+) -> tuple[list[np.ndarray], list[int]]:
+    """Sample query planes with pinned interpolation after loading one small MRI crop."""
+    crop_slices = _query_crop_slices(axes, queries)
+    crop_axes = [np.asarray(axis[sl]) for axis, sl in zip(axes, crop_slices, strict=True)]
+    crop = np.asanyarray(proxy[crop_slices], dtype=np.float32)
+    expected = tuple(len(axis) for axis in crop_axes)
+    if crop.shape != expected or not np.all(np.isfinite(crop)):
+        raise RuntimeError(f"Invalid MRI proxy crop {crop.shape}, expected {expected}")
+    stacked_queries = np.stack(queries, axis=1)
+    sampled = em.interp(
+        crop_axes,
+        torch.as_tensor(crop[None]),
+        torch.as_tensor(stacked_queries, dtype=torch.float32),
+        padding_mode="zeros",
+    )[0].cpu().numpy()
+    return [sampled[index].astype(np.float32) for index in range(len(queries))], list(crop.shape)
+
+
+def _registered_nissl_section(
+    samples: list[dict[str, str]],
+    axes: list[np.ndarray],
+    xJ: list[np.ndarray],
+    final: np.ndarray,
+    index: int,
+    row_um: np.ndarray,
+    column_um: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Warp only one already-materialized observed Nissl section with final A2d."""
+    if not coarse._preserves_source_grid():
+        raise RuntimeError("Direct section QC requires the native preserved source grid")
+    image, support = coarse.read_section(
+        samples[index], spatial_axes=[axes[1], axes[2]], preserve_source_grid=True
+    )
+    return coarse._warp_saved_section(
+        image,
+        support,
+        final[index],
+        row_um,
+        column_um,
+        source_row_um=xJ[1],
+        source_column_um=xJ[2],
+    )
+
+
+def _normalized_mutual_information(
+    nissl: np.ndarray, mri: np.ndarray, support: np.ndarray, *, bins: int = 64,
+) -> tuple[float | None, int]:
+    """Compute histogram NMI inside observed registered Nissl tissue support."""
+    mask = (support > 0.05) & np.isfinite(nissl) & np.isfinite(mri)
+    count = int(np.count_nonzero(mask))
+    if count < bins:
+        return None, count
+    left = np.asarray(nissl[mask], dtype=np.float64)
+    right = np.asarray(mri[mask], dtype=np.float64)
+    left_limits = np.percentile(left, [0.5, 99.5])
+    right_limits = np.percentile(right, [0.5, 99.5])
+    if left_limits[1] <= left_limits[0] or right_limits[1] <= right_limits[0]:
+        return None, count
+    histogram, _, _ = np.histogram2d(
+        np.clip(left, *left_limits),
+        np.clip(right, *right_limits),
+        bins=bins,
+        range=[left_limits.tolist(), right_limits.tolist()],
+    )
+    probability = histogram / histogram.sum()
+    px = probability.sum(axis=1)
+    py = probability.sum(axis=0)
+    nz = probability > 0
+    product = px[:, None] * py[None, :]
+    mutual_information = float(np.sum(probability[nz] * np.log(probability[nz] / product[nz])))
+    hx = float(-np.sum(px[px > 0] * np.log(px[px > 0])))
+    hy = float(-np.sum(py[py > 0] * np.log(py[py > 0])))
+    denominator = hx + hy
+    return (2.0 * mutual_information / denominator if denominator > 0 else None), count
+
+
+def _section_display_images(record: dict[str, Any]) -> list[np.ndarray]:
+    support = record["support"]
+    mask = support > 0.05
+    affine = record["affine_mri"]
+    nonlinear = record["nonlinear_mri"]
+    values = (
+        np.concatenate((affine[mask], nonlinear[mask]))
+        if np.any(mask)
+        else np.concatenate((affine.ravel(), nonlinear.ravel()))
+    )
+    lo, hi = np.percentile(values, [1.0, 99.0])
+    affine_gray = np.clip((affine - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+    nonlinear_gray = np.clip((nonlinear - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+    nissl = np.clip(np.moveaxis(record["nissl"], 0, -1), 0.0, 1.0)
+    shown_nissl = np.ones_like(nissl)
+    shown_nissl[mask] = nissl[mask]
+    alpha = (0.5 * np.clip(support, 0.0, 1.0))[..., None]
+    affine_overlay = (1.0 - alpha) * affine_gray[..., None] + alpha * nissl
+    nonlinear_overlay = (1.0 - alpha) * nonlinear_gray[..., None] + alpha * nissl
+    return [shown_nissl, affine_gray, affine_overlay, nonlinear_gray, nonlinear_overlay]
+
+
+def _registered_nissl_boundaries(
+    nissl: np.ndarray, support: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return tissue-support and strong internal Nissl boundaries."""
+    image = np.asarray(nissl, dtype=np.float32)
+    weights = np.asarray(support, dtype=np.float32)
+    if image.ndim != 3 or image.shape[0] != 3 or image.shape[1:] != weights.shape:
+        raise RuntimeError("Boundary inputs must be RGB Nissl and matching 2-D support")
+    tissue = weights > 0.05
+    if not np.any(tissue):
+        raise RuntimeError("Registered Nissl support is empty")
+    support_boundary = tissue & ~coarse.ndi.binary_erosion(tissue)
+
+    luminance = np.sum(
+        np.moveaxis(image, 0, -1)
+        * np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32),
+        axis=-1,
+    )
+    optical_density = 1.0 - luminance
+    lo, hi = np.percentile(optical_density[tissue], [1.0, 99.0])
+    normalized = np.zeros_like(optical_density)
+    normalized[tissue] = np.clip(
+        (optical_density[tissue] - lo) / (hi - lo + 1e-8), 0.0, 1.0
+    )
+    smooth = coarse.ndi.gaussian_filter(normalized, sigma=1.25)
+    gradient = np.hypot(
+        coarse.ndi.sobel(smooth, axis=0),
+        coarse.ndi.sobel(smooth, axis=1),
+    )
+    interior = coarse.ndi.binary_erosion(tissue, iterations=3)
+    interior &= ~coarse.ndi.binary_dilation(support_boundary, iterations=2)
+    intensity_boundary = np.zeros_like(tissue)
+    if np.any(interior):
+        threshold = float(np.percentile(gradient[interior], 95.0))
+        if threshold > 0.0:
+            intensity_boundary = interior & (gradient >= threshold)
+    return support_boundary, intensity_boundary
+
+
+def _boundary_overlay(
+    gray: np.ndarray,
+    support_boundary: np.ndarray,
+    intensity_boundary: np.ndarray,
+) -> np.ndarray:
+    """Draw cyan support and yellow Nissl edges with a dark contrast halo."""
+    rgb = np.repeat(np.asarray(gray, dtype=np.float32)[..., None], 3, axis=-1)
+    support_line = coarse.ndi.binary_dilation(support_boundary, iterations=1)
+    intensity_line = coarse.ndi.binary_dilation(intensity_boundary, iterations=1)
+    halo = coarse.ndi.binary_dilation(support_line | intensity_line, iterations=2)
+    rgb[halo] = 0.0
+    rgb[intensity_line] = np.asarray([1.0, 0.85, 0.0], dtype=np.float32)
+    rgb[support_line] = np.asarray([0.0, 1.0, 1.0], dtype=np.float32)
+    return rgb
+
+
+def _section_boundary_display_images(record: dict[str, Any]) -> list[np.ndarray]:
+    """Build the five direct-QC rows with high-contrast boundary overlays."""
+    standard = _section_display_images(record)
+    support_boundary, intensity_boundary = _registered_nissl_boundaries(
+        record["nissl"], record["support"]
+    )
+    return [
+        standard[0],
+        standard[1],
+        _boundary_overlay(standard[1], support_boundary, intensity_boundary),
+        standard[3],
+        _boundary_overlay(standard[3], support_boundary, intensity_boundary),
+    ]
+
+
+def _write_section_montage(
+    records: list[dict[str, Any]],
+    output: Path,
+    row_um: np.ndarray,
+    column_um: np.ndarray,
+    *,
+    title: str,
+    boundaries: bool = False,
+) -> None:
+    if not records:
+        figure, panel = coarse.plt.subplots(figsize=(8, 3))
+        panel.text(
+            0.5, 0.5, "No requested flagged sections are observed", ha="center", va="center"
+        )
+        panel.axis("off")
+        coarse._atomic_figure(output, figure)
+        return
+    if boundaries:
+        row_labels = (
+            "Registered Nissl",
+            "MRI — affine only (v=0)",
+            "Nissl boundaries over affine-only MRI",
+            "MRI — full nonlinear",
+            "Nissl boundaries over full-nonlinear MRI",
+        )
+        display_images = _section_boundary_display_images
+    else:
+        row_labels = (
+            "Registered Nissl",
+            "MRI — affine only (v=0)",
+            "Nissl + affine-only MRI overlay",
+            "MRI — full nonlinear",
+            "Nissl + full-nonlinear MRI overlay",
+        )
+        display_images = _section_display_images
+    figure, panels = coarse.plt.subplots(
+        5, len(records), figsize=(3.1 * len(records), 14.5), squeeze=False,
+        sharex=True, sharey=True,
+    )
+    extent = [
+        float(column_um[0]) / 1000.0,
+        float(column_um[-1]) / 1000.0,
+        float(row_um[0]) / 1000.0,
+        float(row_um[-1]) / 1000.0,
+    ]
+    for column, record in enumerate(records):
+        for row, image in enumerate(display_images(record)):
+            panels[row, column].imshow(
+                image, origin="lower", extent=extent, aspect="equal",
+                cmap="gray" if image.ndim == 2 else None, vmin=0.0, vmax=1.0,
+            )
+            panels[row, column].tick_params(labelsize=6)
+        panels[0, column].set_title(
+            f"Allen {record['allen_section']}\nk={record['physical_index']}, "
+            f"serial={record['serial_z_um'] / 1000.0:.2f} mm",
+            fontsize=8,
+        )
+        panels[-1, column].set_xlabel("registered column/LR (mm) →", fontsize=7)
+    for row, label in enumerate(row_labels):
+        panels[row, 0].set_ylabel(f"{label}\nregistered row (mm) ↑", fontsize=8)
+    method = (
+        "\ncyan = observed tissue-support boundary; yellow = strongest 5% of "
+        "smoothed internal Nissl gradients; dark halo improves contrast"
+        if boundaries else ""
+    )
+    figure.suptitle(
+        title + "\nPhysical z/y/x = serial/row/column; origin=lower; no array transpose; "
+        "all five rows use identical physical extents" + method,
+        fontsize=11,
+    )
+    figure.subplots_adjust(left=0.08, right=0.995, bottom=0.05, top=0.91, wspace=0.04, hspace=0.12)
+    coarse._atomic_figure(output, figure)
+
+
+def _prepare_direct_qc_directory(post_dir: Path) -> tuple[Path, dict[str, Path]]:
+    """Preserve completed base QC while protecting new additive boundary outputs."""
+    post_dir.mkdir(parents=True, exist_ok=True)
+    output = post_dir / DIRECT_SECTION_QC_DIRECTORY
+    output.mkdir(exist_ok=True)
+    paths = {
+        "representative_figure": output / "representative_sections.png",
+        "flagged_figure": output / "flagged_sections.png",
+        "representative_boundaries": output / "representative_sections_boundaries.png",
+        "flagged_boundaries": output / "flagged_sections_boundaries.png",
+        "tsv": output / "section_qc.tsv",
+        "json": output / "section_qc.json",
+    }
+    existing = [
+        str(paths[key]) for key in ("representative_boundaries", "flagged_boundaries")
+        if paths[key].exists()
+    ]
+    if existing:
+        raise RuntimeError(f"Refusing to overwrite existing direct section QC: {existing}")
+    return output, paths
+
+
+def _open_mri_proxy(
+    saved_xI: list[np.ndarray], provenance: dict[str, Any],
+) -> tuple[Any, list[np.ndarray], dict[str, Any]]:
+    axes = mri_physical_axes_from_provenance(provenance)
+    if any(
+        not np.allclose(left, right, atol=1e-6, rtol=0.0)
+        for left, right in zip(axes, saved_xI, strict=True)
+    ):
+        raise RuntimeError("MRI provenance axes differ from saved registration xI")
+    image = coarse.nib.load(str(MRI), mmap=True)
+    if tuple(image.shape) != tuple(map(len, axes)):
+        raise RuntimeError("MRI proxy dimensions differ from saved physical axes")
+    expected_affine = np.asarray(provenance["voxel_to_physical_affine_mm"], dtype=np.float64)
+    if not np.allclose(image.affine, expected_affine, atol=1e-6, rtol=0.0):
+        raise RuntimeError("MRI NIfTI affine differs from provenance")
+    return image.dataobj, axes, {
+        "path": str(MRI),
+        "shape": list(image.shape),
+        "access": "nibabel array proxy; per-section bounding-box crops only",
+        "full_mri_volume_materialized": False,
+        "global_mean_normalization_omitted": (
+            "a positive scalar has no effect on percentile display or NMI"
+        ),
+    }
+
+
+def section_qc() -> dict[str, Any]:
+    """Directly compare saved affine/nonlinear MRI pulls with real observed sections."""
+    with _coarse_context(CLEAN_SYMMETRIC_DATASET, SYMMETRIC_ROOT):
+        registration = coarse.load_checkpoint(
+            "registration", accepted_statuses=("complete", "complete_through_scale")
+        )
+        numerical_path, _, _, before_hashes, source_validation = (
+            coarse._native_postprocess_sources(registration)
+        )
+        _, paths = _prepare_direct_qc_directory(coarse.POST_DIR)
+        em, rows, samples, axes, observed = coarse.load_context()
+        with np.load(numerical_path, allow_pickle=False) as saved:
+            required = {
+                "A", "A2d", "v", "xv0", "xv1", "xv2", "xI0", "xI1", "xI2",
+                "xJ0", "xJ1", "xJ2", "observed",
+            }
+            if set(saved.files) != required:
+                raise RuntimeError(f"Saved numerical package keys changed: {saved.files}")
+            A = coarse.finite("A", saved["A"]).astype(np.float64)
+            final = coarse.finite("A2d", saved["A2d"]).astype(np.float64)
+            v = coarse.finite("v", saved["v"]).astype(np.float32)
+            xv = [coarse.finite(f"xv{i}", saved[f"xv{i}"]).astype(np.float64) for i in range(3)]
+            xI = [coarse.finite(f"xI{i}", saved[f"xI{i}"]).astype(np.float64) for i in range(3)]
+            xJ = [coarse.finite(f"xJ{i}", saved[f"xJ{i}"]).astype(np.float64) for i in range(3)]
+            saved_observed = np.asarray(saved["observed"], dtype=np.int64)
+        if A.shape != (4, 4) or final.shape != (len(rows), 3, 3):
+            raise RuntimeError("Saved affine or final A2d shape changed")
+        if not np.array_equal(saved_observed, observed):
+            raise RuntimeError("Saved observed indices differ from the physical manifest")
+        if any(
+            not np.allclose(left, right, atol=1e-6, rtol=0.0)
+            for left, right in zip(xJ, axes, strict=True)
+        ):
+            raise RuntimeError("Saved histology axes differ from the symmetric section dataset")
+        baseline, unsupported = coarse._final_a2d_baseline(final, observed)
+        row_um, column_um = coarse._registered_frame_axes(xJ, baseline)
+        representative, flagged = _select_direct_qc_sections(observed, rows)
+        inverse_field = _integrate_saved_deformation(
+            em, xv, v, direction=INVERSE_DEFORMATION
+        )
+        provenance = json.loads(MRI_PROVENANCE.read_text(encoding="utf-8"))
+        mri_proxy, mri_axes, mri_report = _open_mri_proxy(xI, provenance)
+        groups = {
+            "representative": list(map(int, representative)),
+            "flagged": list(map(int, flagged)),
+        }
+        results: list[dict[str, Any]] = []
+        maximum_crop_voxels = 0
+        for group, indices in groups.items():
+            for index in indices:
+                nissl, support = _registered_nissl_section(
+                    samples, axes, xJ, final, index, row_um, column_um
+                )
+                affine_query, nonlinear_query = _registered_plane_mri_queries(
+                    em, A, xv, inverse_field, float(xJ[0][index]), row_um, column_um
+                )
+                (affine_mri, nonlinear_mri), crop_shape = _sample_mri_queries_from_proxy(
+                    em, mri_proxy, mri_axes, [affine_query, nonlinear_query]
+                )
+                nissl_scalar = 1.0 - np.sum(
+                    np.moveaxis(nissl, 0, -1)
+                    * np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32),
+                    axis=-1,
+                )
+                affine_nmi, metric_pixels = _normalized_mutual_information(
+                    nissl_scalar, affine_mri, support
+                )
+                nonlinear_nmi, _ = _normalized_mutual_information(
+                    nissl_scalar, nonlinear_mri, support
+                )
+                row = {
+                    "selection": group,
+                    "physical_index": index,
+                    "allen_section": int(rows[index]["allen_section_number"]),
+                    "serial_z_um": float(xJ[0][index]),
+                    "supported_metric_pixels": metric_pixels,
+                    "affine_nmi": affine_nmi,
+                    "nonlinear_nmi": nonlinear_nmi,
+                    "delta_nmi": (
+                        nonlinear_nmi - affine_nmi
+                        if affine_nmi is not None and nonlinear_nmi is not None else None
+                    ),
+                    "mri_crop_shape": crop_shape,
+                }
+                results.append({
+                    **row,
+                    "nissl": nissl,
+                    "support": support,
+                    "affine_mri": affine_mri,
+                    "nonlinear_mri": nonlinear_mri,
+                })
+                maximum_crop_voxels = max(maximum_crop_voxels, int(np.prod(crop_shape)))
+                print(
+                    f"direct section QC {group}: Allen {row['allen_section']} "
+                    f"(physical {index})",
+                    flush=True,
+                )
+        by_group = {
+            group: [record for record in results if record["selection"] == group]
+            for group in groups
+        }
+        if not paths["representative_figure"].exists():
+            _write_section_montage(
+                by_group["representative"],
+                paths["representative_figure"],
+                row_um,
+                column_um,
+                title=("Direct observed-section MRI/Nissl registration QC — "
+                       "representative sections"),
+            )
+        if not paths["flagged_figure"].exists():
+            _write_section_montage(
+                by_group["flagged"],
+                paths["flagged_figure"],
+                row_um,
+                column_um,
+                title=("Direct observed-section MRI/Nissl registration QC — "
+                       "flagged Allen sections"),
+            )
+        _write_section_montage(
+            by_group["representative"],
+            paths["representative_boundaries"],
+            row_um,
+            column_um,
+            title=("High-contrast direct observed-section QC — affine-only vs "
+                   "full nonlinear — representative sections"),
+            boundaries=True,
+        )
+        _write_section_montage(
+            by_group["flagged"],
+            paths["flagged_boundaries"],
+            row_um,
+            column_um,
+            title=("High-contrast direct observed-section QC — affine-only vs "
+                   "full nonlinear — flagged Allen sections"),
+            boundaries=True,
+        )
+        public_rows = [
+            {
+                key: value for key, value in record.items()
+                if key not in {"nissl", "support", "affine_mri", "nonlinear_mri"}
+            }
+            for record in results
+        ]
+        columns = (
+            "selection", "physical_index", "allen_section", "serial_z_um",
+            "supported_metric_pixels", "affine_nmi", "nonlinear_nmi", "delta_nmi",
+            "mri_crop_shape",
+        )
+        lines = ["\t".join(columns) + "\n"]
+        for row in public_rows:
+            lines.append("\t".join(
+                "" if row[key] is None else (
+                    "x".join(map(str, row[key])) if key == "mri_crop_shape" else str(row[key])
+                )
+                for key in columns
+            ) + "\n")
+        if not paths["tsv"].exists():
+            coarse._atomic_text(paths["tsv"], "".join(lines))
+        after_hashes = {path: coarse.checksum(Path(path)) for path in before_hashes}
+        if before_hashes != after_hashes:
+            changed = sorted(
+                path for path in before_hashes if before_hashes[path] != after_hashes[path]
+            )
+            raise RuntimeError(f"Authoritative registration sources changed: {changed}")
+        report = {
+            "stage": "section-qc",
+            "status": "review_required",
+            "purpose": "direct anatomical comparison on real observed histological sections",
+            "automatic_pass_fail": False,
+            "registration_checkpoint_status": registration["status"],
+            "numerical_package": str(numerical_path),
+            "numerical_product_resolution": source_validation,
+            "emlddmm_commit": coarse.PIN,
+            "deformation_conventions": {
+                "saved_forward": "phi = em.v_to_phii(xv, -v.flip(0))",
+                "saved_inverse": "phi_inverse = em.v_to_phii(xv, v)",
+                "pinned_source_evidence": (
+                    "v_to_phii docstring, Transform(direction='b'), and "
+                    "write_transform_outputs at pinned commit"
+                ),
+            },
+            "transform_chains": {
+                "registered_nissl": (
+                    "source_row_column = final_A2d[k] @ "
+                    "[registered_row, registered_column, 1]"
+                ),
+                "affine_only_mri": (
+                    "u = inverse(A) @ [xJ0[k], registered_row, registered_column, 1]"
+                ),
+                "full_nonlinear_mri": (
+                    "x = phi_inverse(inverse(A) @ "
+                    "[xJ0[k], registered_row, registered_column, 1])"
+                ),
+                "atlas_free_A2d_reapplied": False,
+            },
+            "registered_frame": {
+                "basis": (
+                    "inverse(final common unsupported-row A2d baseline) applied to "
+                    "xJ row/column corners"
+                ),
+                "baseline_matrix": baseline.tolist(),
+                "unsupported_rows": int(np.count_nonzero(unsupported)),
+                "row_extent_um": [float(row_um[0]), float(row_um[-1])],
+                "column_lr_extent_um": [float(column_um[0]), float(column_um[-1])],
+                "orientation": "z/y/x=serial/row/column; origin lower; no display transpose",
+            },
+            "selection": groups,
+            "requested_flagged_allen_sections": list(coarse.FLAGGED_ALLEN),
+            "sections": public_rows,
+            "metrics": {
+                "name": "normalized mutual information",
+                "formula": "2*MI/(H_nissl+H_mri)",
+                "mask": "registered Nissl support > 0.05",
+                "nissl_scalar": "1 - Rec.709 RGB luminance",
+                "interpretation": "supporting information only; no automatic pass/fail",
+            },
+            "mri": {
+                **mri_report,
+                "maximum_loaded_crop_voxels": maximum_crop_voxels,
+            },
+            "outputs": {key: str(value) for key, value in paths.items()},
+            "boundary_method": {
+                "support": "support > 0.05 followed by a one-pixel inner boundary",
+                "internal_nissl": (
+                    "top 5% gradient magnitude after Gaussian smoothing (sigma 1.25)"
+                ),
+                "display": "cyan support, yellow internal edges, two-pixel dark halo",
+            },
+            "source_transforms_and_checkpoints_unchanged": True,
+            "full_dense_nissl_reconstruction_created": False,
+            "full_rgb_mri_volume_allocated": False,
+            "registration_invoked": False,
+            "atlas_free_invoked": False,
+            "densification_invoked": False,
+        }
+        if not paths["json"].exists():
+            coarse.atomic_json(paths["json"], report)
+        coarse._validate_pngs([
+            paths["representative_figure"], paths["flagged_figure"],
+            paths["representative_boundaries"], paths["flagged_boundaries"],
+        ])
+        print(json.dumps(report, indent=2), flush=True)
+        return report
+
+
 def postprocess() -> None:
     saved_tmp = coarse.RUN_TMP
     with tempfile.TemporaryDirectory(prefix="allen-native-postprocess-") as temporary:
@@ -2034,7 +2702,7 @@ def main() -> int:
     parser.add_argument("stage", choices=(
         "hemi-atlas-free", "hemi-registration", "construct-symmetric",
         "construct-annotations", "symmetric-atlas-free",
-        "symmetric-registration", "postprocess",
+        "symmetric-registration", "postprocess", "section-qc",
     ))
     parser.add_argument(
         "--restart-interrupted", action="store_true",
@@ -2072,6 +2740,7 @@ def main() -> int:
             stop_after_scale=args.stop_after_scale,
         ),
         "postprocess": postprocess,
+        "section-qc": section_qc,
     }
     actions[args.stage]()
     return 0

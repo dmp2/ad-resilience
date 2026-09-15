@@ -1483,14 +1483,7 @@ def _final_residual_diagnostics(
     rows, axes, observed, final: np.ndarray, *,
     comparison_initializer: str = "atlas_free",
 ) -> tuple[np.ndarray, dict[str, Any], list[dict[str, Any]]]:
-    unsupported = np.ones(2846, dtype=bool)
-    unsupported[observed] = False
-    unsupported_matrices = final[unsupported]
-    baseline = unsupported_matrices[0].copy()
-    if not np.array_equal(
-        unsupported_matrices, np.broadcast_to(baseline, unsupported_matrices.shape)
-    ):
-        raise RuntimeError("Unsupported final A2d rows do not share one exact baseline")
+    baseline, unsupported = _final_a2d_baseline(final, observed)
     residual = np.linalg.inv(baseline)[None] @ final[observed]
     error = float(np.max(np.abs(baseline[None] @ residual - final[observed])))
     if error > 1e-7:
@@ -1594,6 +1587,23 @@ def _final_residual_diagnostics(
         "figure": str(POST_DIR / "final_section_residual_traces.png"),
     }
     return baseline, report, comparisons
+
+
+def _final_a2d_baseline(
+    final: np.ndarray, observed: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the exact common final-A2d matrix on unsupported physical rows."""
+    unsupported = np.ones(len(final), dtype=bool)
+    unsupported[np.asarray(observed, dtype=np.int64)] = False
+    unsupported_matrices = np.asarray(final)[unsupported]
+    if not len(unsupported_matrices):
+        raise RuntimeError("Final A2d has no unsupported rows for baseline recovery")
+    baseline = unsupported_matrices[0].copy()
+    if not np.array_equal(
+        unsupported_matrices, np.broadcast_to(baseline, unsupported_matrices.shape)
+    ):
+        raise RuntimeError("Unsupported final A2d rows do not share one exact baseline")
+    return baseline, unsupported
 
 
 def _objective_figure(
@@ -2079,7 +2089,11 @@ def _mri_nissl_figures(
         color="cyan", ha="right", va="bottom",
     )
     figure.subplots_adjust(left=0.075, bottom=0.06, top=0.90)
-    figure.suptitle("Saved-transform MRI/Nissl registration overview — manual anatomical review required")
+    figure.suptitle(
+        "Sparse observed-section reconstruction / sparse support transported onto "
+        "the MRI grid\nOrthogonal appearance is not a direct anatomical registration "
+        "QC prior to densification"
+    )
     overview = POST_DIR / "mri_nissl_registration_overview.png"
     _atomic_figure(overview, figure)
     figure, panels = plt.subplots(2, 3, figsize=(14, 9))
@@ -2100,7 +2114,11 @@ def _mri_nissl_figures(
         panels[1, column].imshow(mview.T, origin="lower", extent=extent, aspect="auto", cmap="gray")
         panels[0, column].set_title(f"registered Nissl — axis {column}")
         panels[1, column].set_title(f"MRI — axis {column}")
-    figure.suptitle(f"{grid_name.capitalize()}-grid orthogonal views with physical extents")
+    figure.suptitle(
+        f"{grid_name.capitalize()} MRI-grid sparse observed-section reconstruction "
+        "/ sparse transported support\nOrthogonal appearance is not a direct "
+        "anatomical registration QC prior to densification"
+    )
     orthogonal = POST_DIR / "registered_nissl_orthogonal_overview.png"
     _atomic_figure(orthogonal, figure)
     return {"registration_overview": str(overview), "orthogonal_overview": str(orthogonal)}
@@ -2569,7 +2587,8 @@ def postprocess(*, native_resolution: bool = False):
             section_support[observed],
             [xJ[0][observed], row_um, column_um],
             registered_histology_figure,
-            "Observed-left Nissl: MRI affine + A2d, v=0, registered histology frame",
+            "Observed-left registered Nissl only (final A2d; no MRI sampled)\n"
+            "Frame/orientation check, not direct MRI/Nissl anatomical QC",
         )
     if observed_left and velocity_max > 1e-7:
         raise RuntimeError(
@@ -2623,7 +2642,7 @@ def postprocess(*, native_resolution: bool = False):
     if registered_histology_figure is not None:
         figures.append(registered_histology_figure)
     manual_review_items = [
-        "MRI/Nissl anatomical plausibility",
+        "sparse observed-section support transport on the MRI grid (not direct anatomical QC)",
         "orientation and physical extents",
         "deformation interpretation in the stated map direction",
     ]
@@ -2673,6 +2692,11 @@ def postprocess(*, native_resolution: bool = False):
         "flagged_section_gauge_invariant_comparisons": comparisons,
         "nissl": {
             "reconstruction": str(nissl_path),
+            "description": (
+                "Sparse observed-section reconstruction / sparse support transported "
+                "onto the MRI grid. Orthogonal appearance is not direct anatomical "
+                "registration QC prior to densification."
+            ),
             "support": str(nissl_support_path),
             **nissl_figures,
             **(

@@ -1161,3 +1161,175 @@ def test_restart_does_not_skip_a_missing_earlier_scale(tmp_path: Path) -> None:
         lineage=lineage, resume=True,
     )
     assert [call["scale_tag"] for call in resumed.calls] == [0, 1, 2]
+
+
+def test_direct_section_qc_v0_affine_and_nonlinear_samples_match() -> None:
+    em = pinned_emlddmm()
+    axes = [np.arange(7, dtype=np.float32) for _ in range(3)]
+    velocity = np.zeros((2, 3, 7, 7, 7), dtype=np.float32)
+    inverse_field = native._integrate_saved_deformation(
+        em, axes, velocity, direction=native.INVERSE_DEFORMATION
+    )
+    affine_query, nonlinear_query = native._registered_plane_mri_queries(
+        em, np.eye(4), axes, inverse_field, 3.0, axes[1], axes[2]
+    )
+    volume = np.arange(7 ** 3, dtype=np.float32).reshape(7, 7, 7)
+    (affine_mri, nonlinear_mri), _ = native._sample_mri_queries_from_proxy(
+        em, volume, axes, [affine_query, nonlinear_query]
+    )
+    np.testing.assert_allclose(nonlinear_query, affine_query, atol=1e-6, rtol=0.0)
+    np.testing.assert_allclose(nonlinear_mri, affine_mri, atol=1e-5, rtol=0.0)
+
+
+def test_pinned_saved_forward_and_inverse_deformations_compose() -> None:
+    em = pinned_emlddmm()
+    axes = [np.arange(7, dtype=np.float32) for _ in range(3)]
+    velocity = np.zeros((2, 3, 7, 7, 7), dtype=np.float32)
+    velocity[:, 0] = 0.2
+    velocity[:, 1] = -0.1
+    forward = native._integrate_saved_deformation(
+        em, axes, velocity, direction=native.FORWARD_DEFORMATION
+    )
+    inverse = native._integrate_saved_deformation(
+        em, axes, velocity, direction=native.INVERSE_DEFORMATION
+    )
+    composed = native._sample_position_field(em, axes, inverse, forward)
+    identity = torch.stack(torch.meshgrid(
+        [torch.as_tensor(axis) for axis in axes], indexing="ij"
+    ))
+    np.testing.assert_allclose(
+        composed.cpu().numpy(), identity.cpu().numpy(), atol=1e-5, rtol=0.0
+    )
+
+
+def test_final_a2d_gauge_reframing_preserves_affine_section_composite() -> None:
+    baseline = np.array(
+        [[1.0, 0.0, 319900.0], [0.0, 1.0, -479900.0], [0.0, 0.0, 1.0]]
+    )
+    residual = np.array(
+        [[0.9998, -0.02, 150.0], [0.02, 0.9998, -75.0], [0.0, 0.0, 1.0]]
+    )
+    final = baseline @ residual
+    A = np.array(
+        [
+            [0.0, -1.0, 0.0, 420000.0],
+            [0.0, 0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+
+    def embed(matrix: np.ndarray) -> np.ndarray:
+        result = np.eye(4)
+        result[1:3, 1:3] = matrix[:2, :2]
+        result[1:3, 3] = matrix[:2, 2]
+        return result
+
+    gauge = embed(baseline)
+    section = embed(final)
+    reframed_A = gauge @ A
+    reframed_section = section @ np.linalg.inv(gauge)
+    points = np.array(
+        [[480000.0, 420000.0, 320000.0, 1.0], [500000.0, 430000.0, 300000.0, 1.0]]
+    ).T
+    np.testing.assert_allclose(
+        section @ A @ points,
+        reframed_section @ reframed_A @ points,
+        atol=1e-8,
+        rtol=0.0,
+    )
+
+
+def test_direct_qc_selection_uses_only_observed_sections_without_duplicates() -> None:
+    rows = [{"allen_section_number": str(1000 + index)} for index in range(40)]
+    observed = np.arange(0, 40, 2, dtype=np.int64)
+    representative, flagged = native._select_direct_qc_sections(
+        observed, rows, flagged_allen=(1004, 1016, 1030)
+    )
+    assert len(representative) == 9
+    assert set(map(int, representative)).issubset(set(map(int, observed)))
+    assert set(map(int, flagged)).issubset(set(map(int, observed)))
+    assert not set(map(int, representative)).intersection(map(int, flagged))
+    np.testing.assert_array_equal(flagged, [4, 16, 30])
+
+
+def test_registered_nissl_boundary_extraction_is_nonempty() -> None:
+    support = np.zeros((32, 36), dtype=np.float32)
+    support[4:28, 5:31] = 1.0
+    nissl = np.ones((3, 32, 36), dtype=np.float32)
+    nissl[:, 11:22, 13:25] = 0.2
+
+    support_boundary, intensity_boundary = native._registered_nissl_boundaries(
+        nissl, support
+    )
+
+    assert support_boundary.shape == support.shape
+    assert intensity_boundary.shape == support.shape
+    assert np.any(support_boundary)
+    assert np.any(intensity_boundary)
+    assert not np.any(intensity_boundary[~(support > 0.05)])
+
+
+def test_boundary_montage_writes_tiny_synthetic_figure(tmp_path: Path) -> None:
+    height, width = 24, 28
+    support = np.zeros((height, width), dtype=np.float32)
+    support[3:-3, 4:-4] = 1.0
+    nissl = np.ones((3, height, width), dtype=np.float32)
+    nissl[:, 8:17, 9:20] = np.asarray([0.3, 0.15, 0.45])[:, None, None]
+    grid = np.linspace(0.0, 1.0, height * width, dtype=np.float32).reshape(
+        height, width
+    )
+    record = {
+        "allen_section": 1089,
+        "physical_index": 1053,
+        "serial_z_um": -18500.0,
+        "nissl": nissl,
+        "support": support,
+        "affine_mri": grid,
+        "nonlinear_mri": np.flip(grid, axis=1).copy(),
+    }
+    output = tmp_path / "boundaries.png"
+
+    native._write_section_montage(
+        [record],
+        output,
+        np.arange(height, dtype=np.float64) * 200.0,
+        np.arange(width, dtype=np.float64) * 200.0,
+        title="synthetic direct boundary QC",
+        boundaries=True,
+    )
+
+    assert output.is_file()
+    assert native.coarse._validate_pngs([output])[str(output)]["nonblank"] is True
+
+
+def test_direct_qc_output_is_additive_and_cli_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    post = tmp_path / "postprocessed_qc"
+    post.mkdir()
+    unrelated = post / "existing-qc.png"
+    unrelated.write_bytes(b"preserve")
+    output, paths = native._prepare_direct_qc_directory(post)
+    assert output == post / native.DIRECT_SECTION_QC_DIRECTORY
+    assert output.is_dir()
+    assert unrelated.read_bytes() == b"preserve"
+    assert not any(path.exists() for path in paths.values())
+    preserved = {
+        key: f"preserve {key}".encode()
+        for key in ("representative_figure", "flagged_figure", "tsv", "json")
+    }
+    for key, content in preserved.items():
+        paths[key].write_bytes(content)
+    _, rerun_paths = native._prepare_direct_qc_directory(post)
+    for key, content in preserved.items():
+        assert rerun_paths[key].read_bytes() == content
+
+    calls = []
+    monkeypatch.setattr(native, "section_qc", lambda: calls.append("section-qc"))
+    monkeypatch.setattr(
+        sys, "argv", ["run_allen_emlddmm_full_resolution_nissl.py", "section-qc"]
+    )
+    assert native.main() == 0
+    assert calls == ["section-qc"]
+    assert unrelated.read_bytes() == b"preserve"

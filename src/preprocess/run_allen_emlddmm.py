@@ -73,6 +73,27 @@ def pinned_emlddmm() -> ModuleType:
     return module
 
 
+def mri_physical_axes_from_provenance(
+    provenance: dict[str, Any],
+) -> list[np.ndarray]:
+    """Return the separable MRI physical axes used by the pinned loader adapter."""
+    if provenance.get("status") != "ready" or provenance.get("units") != "millimeter":
+        raise RuntimeError("MRI provenance must be ready with millimetre geometry")
+    dimensions = tuple(int(value) for value in provenance["dimensions"])
+    affine = np.asarray(provenance["voxel_to_physical_affine_mm"], dtype=np.float64)
+    if affine.shape != (4, 4):
+        raise ValueError("MRI provenance affine must be 4x4")
+    linear = affine[:3, :3]
+    if not np.allclose(linear, np.diag(np.diag(linear)), atol=1e-8):
+        raise ValueError(
+            "Pinned separable-coordinate adapter cannot represent oblique MRI axes"
+        )
+    return [
+        (affine[axis, 3] + np.arange(size) * linear[axis, axis]) * 1000.0
+        for axis, size in enumerate(dimensions)
+    ]
+
+
 def load_pinned_mri_image(
     emlddmm: ModuleType,
     *,
@@ -89,8 +110,7 @@ def load_pinned_mri_image(
     micrometre coordinate unit.
     """
 
-    if provenance.get("status") != "ready" or provenance.get("units") != "millimeter":
-        raise RuntimeError("MRI provenance must be ready with millimetre geometry")
+    physical_axes = mri_physical_axes_from_provenance(provenance)
     original_load = emlddmm.nibabel.load
 
     def compatible_nibabel_load(filename: str, **kwargs: Any) -> Any:
@@ -104,19 +124,10 @@ def load_pinned_mri_image(
         )
     finally:
         emlddmm.nibabel.load = original_load
-    dimensions = tuple(int(value) for value in provenance["dimensions"])
+    dimensions = tuple(map(len, physical_axes))
     if tuple(image.data.shape[1:]) != dimensions:
         raise ValueError("Pinned MRI loader dimensions differ from provenance")
-    affine = np.asarray(provenance["voxel_to_physical_affine_mm"], dtype=np.float64)
-    linear = affine[:3, :3]
-    if not np.allclose(linear, np.diag(np.diag(linear)), atol=1e-8):
-        raise ValueError(
-            "Pinned separable-coordinate adapter cannot represent oblique MRI axes"
-        )
-    image.x = [
-        (affine[axis, 3] + np.arange(size) * linear[axis, axis]) * 1000.0
-        for axis, size in enumerate(dimensions)
-    ]
+    image.x = physical_axes
     image.coordinate_units = "um"
     image.geometry_source = "mri_provenance_affine"
     return image
