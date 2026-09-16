@@ -26,6 +26,9 @@ seaad-omics-download = "cli.omics_download:main"
 seaad-omics-inspect = "cli.omics_inspect:main"
 seaad-omics-prepare = "cli.omics_prepare:main"
 seaad-omics-extract-genes = "cli.omics_extract_genes:main"
+seaad-omics-build-signature-registry = "cli.omics_build_signature_registry:main"
+seaad-omics-state-scores = "cli.omics_state_scores:main"
+seaad-omics-competitive-scores = "cli.omics_competitive_scores:main"
 
 [tool.setuptools]
 include-package-data = true
