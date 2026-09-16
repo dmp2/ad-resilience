@@ -21,9 +21,19 @@ dependencies = [
 
 [project.scripts]
 seaad-mtg = "seaad_mtg.cli:main"
+seaad-omics-inventory = "acquisition.fetch_seaad_omics_inventory:main"
+seaad-omics-download = "cli.omics_download:main"
+seaad-omics-inspect = "cli.omics_inspect:main"
+seaad-omics-prepare = "cli.omics_prepare:main"
+seaad-omics-extract-genes = "cli.omics_extract_genes:main"
 
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["seaad_mtg*", "acquisition*", "omics*", "cli*"]
+
 [tool.setuptools.package-data]
 seaad_mtg = ["bundled_scripts/*.py"]
+acquisition = ["selections/*.json", "selections/*.csv"]

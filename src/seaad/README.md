@@ -157,3 +157,59 @@ docker compose run --rm seaad-mtg crosswalk --data-dir /work/data --work-dir /wo
 - If you launch compose from Windows, use a Windows path like `C:\Users\...` in `.env`.
 - If you launch compose from WSL2, use the mounted Linux path like `/mnt/c/Users/...` in `.env`.
 - Since your `which docker` in WSL points to Docker Desktop's Windows-managed binary, WSL2 should work fine as long as Docker Desktop file sharing is enabled for that drive.
+
+## Multiregion 2026 pseudobulk acquisition
+
+The inventory command retains its 8 MB default cap for metadata and probe files. Reuse the saved inventory with:
+
+```bash
+PYTHONPATH=src/seaad python -m acquisition.fetch_seaad_omics_inventory --skip-listing
+```
+
+The reviewed glial selection contains exactly the Immune, Astrocyte, Oligodendrocyte, and OPC subclass pseudobulk objects. Review and download it with:
+
+```bash
+PYTHONPATH=src/seaad python -m cli.omics_download \
+  --selection src/seaad/acquisition/selections/glial_pseudobulk_multiregion_2026.json \
+  --dry-run
+
+PYTHONPATH=src/seaad python -m cli.omics_download \
+  --selection src/seaad/acquisition/selections/glial_pseudobulk_multiregion_2026.json
+```
+
+Inspect H5AD structure, released taxonomy, and donor by ROI coverage with:
+
+```bash
+PYTHONPATH=src/seaad python -m cli.omics_inspect \
+  --selection src/seaad/acquisition/selections/glial_pseudobulk_multiregion_2026.json
+```
+
+An editable install (`python -m pip install -e src/seaad`) also provides `seaad-omics-inventory`, `seaad-omics-download`, and `seaad-omics-inspect`. Downloaded objects stay under `data/raw/sea-ad/multiregion_2026/`; size verification provenance and inspection tables go under `data/derivatives/sea-ad/`.
+
+The neuronal candidate inventory is recorded at `acquisition/selections/neuronal_pseudobulk_candidates_multiregion_2026.csv`. Its rows are explicitly marked `download_authorized=false` and are not accepted as a downloader selection manifest. Candidate regions come from the released taxonomy table's per-region presence flags.
+
+The release objects retain `library_prep`: repeated donor-region-supertype combinations are separate library-level rows. Inspection therefore reports unique donors, unique donor-supertype combinations, raw pseudobulk rows, and nuclei totals separately.
+
+## Prepare regional pseudobulk counts for R/Quarto
+
+Prepare all four reviewed source objects as validated raw integer counts. Single-row keys are already at donor × brain region × released supertype grain; repeated keys remain at their released sample/library grain because their sampling semantics are unresolved:
+
+```bash
+PYTHONPATH=src/seaad python -m cli.omics_prepare \
+  --selection src/seaad/acquisition/selections/glial_pseudobulk_multiregion_2026.json
+```
+
+The command writes four H5ADs below `data/derivatives/sea-ad/omics_prepared/multiregion_2026/` plus compact index, coverage, taxonomy, aggregation-audit, support-distribution, gene-catalog, and provenance files in the parent directory. It refuses to overwrite derived H5ADs unless `--force` is supplied. `X` remains exact integer raw UMI counts; preparation applies no normalization, gene filtering, observation filtering, support threshold, or region restriction.
+
+The released H5ADs contain no specimen or tissue-block field. `sample_name`, `ar_id`, `load_name`, `exp_component_vendor_name`, and `rna_amplification` are each one-to-one with `library_prep` in all four sources, but their physical aliquot semantics are not defined in the release README. Repeated `(Donor ID, Brain Region, Supertype)` keys therefore have `aggregation_status=ambiguous` and remain separate. Prepared objects retain all identifiers and assay methods, and the aggregation audit records every source row.
+
+Extract exact gene symbols or Ensembl IDs as an R-friendly raw-count table with:
+
+```bash
+PYTHONPATH=src/seaad python -m cli.omics_extract_genes \
+  --genes candidate_genes.txt \
+  --lineage Astrocyte \
+  --output astrocyte_candidate_genes.csv.gz
+```
+
+Matching is case-sensitive and exact against both the AnnData `var/index` gene symbol/name and `var/gene_ids` Ensembl ID. Missing requests are printed in the command summary and written beside the output as `<output>.missing_genes.txt`.

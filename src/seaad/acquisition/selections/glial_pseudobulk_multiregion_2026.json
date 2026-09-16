@@ -1,0 +1,39 @@
+{
+  "source_bucket": "https://sea-ad-single-cell-profiling.s3.us-west-2.amazonaws.com/",
+  "inventory_manifest": "data/derivatives/sea-ad/omics_inventory/s3_object_manifest.csv",
+  "provenance_path": "data/derivatives/sea-ad/omics_inventory/glial_pseudobulk_download_provenance.json",
+  "items": [
+    {
+      "release": "Multiregion 2026 (2026-06-22)",
+      "object_family": "subclass pseudobulk",
+      "lineage": "Immune",
+      "s3_key": "Multiregion_2026/pseudobulk_objects/SEAAD_Immune_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad",
+      "size_bytes": 123541128,
+      "local_path": "data/raw/sea-ad/multiregion_2026/pseudobulk_objects/SEAAD_Immune_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad"
+    },
+    {
+      "release": "Multiregion 2026 (2026-06-22)",
+      "object_family": "subclass pseudobulk",
+      "lineage": "Astrocyte",
+      "s3_key": "Multiregion_2026/pseudobulk_objects/SEAAD_Astrocyte_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad",
+      "size_bytes": 169149269,
+      "local_path": "data/raw/sea-ad/multiregion_2026/pseudobulk_objects/SEAAD_Astrocyte_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad"
+    },
+    {
+      "release": "Multiregion 2026 (2026-06-22)",
+      "object_family": "subclass pseudobulk",
+      "lineage": "Oligodendrocyte",
+      "s3_key": "Multiregion_2026/pseudobulk_objects/SEAAD_Oligodendrocyte_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad",
+      "size_bytes": 147165901,
+      "local_path": "data/raw/sea-ad/multiregion_2026/pseudobulk_objects/SEAAD_Oligodendrocyte_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad"
+    },
+    {
+      "release": "Multiregion 2026 (2026-06-22)",
+      "object_family": "subclass pseudobulk",
+      "lineage": "OPC",
+      "s3_key": "Multiregion_2026/pseudobulk_objects/SEAAD_OPC_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad",
+      "size_bytes": 83809413,
+      "local_path": "data/raw/sea-ad/multiregion_2026/pseudobulk_objects/SEAAD_OPC_HIP_MEC_LEC_ITG_MTG_FI_STG_DFC_AnG_V1C_RNAseq_final-nuclei_pseudobulked.2026-06-22.h5ad"
+    }
+  ]
+}
