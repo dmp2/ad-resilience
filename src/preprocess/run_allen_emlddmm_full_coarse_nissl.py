@@ -159,6 +159,26 @@ PROFILE_OVERRIDES = {
     "example-standard-sigmaR5e6": {"sigmaR": 5e6},
     }
 
+# Contrast-only counterfactual; inherit every other production setting.
+PROFILE_OVERRIDES["example-standard-sigmaR5e4-a2000-dv4000-order2-per-slice"] = {
+    **copy.deepcopy(PROFILE_OVERRIDES["example-standard-sigmaR5e4-a2000-dv4000-lc188"]),
+    "local_contrast": [[], [], []],
+    "order": [2, 2, 2],
+}
+
+# PV residual section fit: fixed aligned Nissl, moving PV, no global/MRI update.
+PROFILE_OVERRIDES["pv-to-aligned-nissl-rigid-local-contrast"] = {
+    **copy.deepcopy(PROFILE_OVERRIDES["example-standard-sigmaR5e4-a2000-dv4000-lc188"]),
+    "downI": [[1, 4, 4], [1, 2, 2], [1, 1, 1]],
+    "downJ": [[1, 4, 4], [1, 2, 2], [1, 1, 1]],
+    "eA": 0.0,
+    "Amode": 0,
+    "v_start": [100001, 100001, 100001],
+    "slice_deformation": False,
+    "eA2d": 1e3,
+    "rigid_procrustes": False,
+}
+
 LOCAL_CONTRAST_TARGET_SHAPES = ((32, 45), (65, 91), (130, 182))
 
 _THREE_LEVEL_SCALARS = (
@@ -217,6 +237,13 @@ def resolve_registration_profile(name: str) -> dict:
     for level, (value, target_shape) in enumerate(zip(
         resolved["local_contrast"], LOCAL_CONTRAST_TARGET_SHAPES, strict=True
     )):
+        order = resolved["order"][level]
+        if type(order) is not int or order < 1:
+            raise ValueError(f"order[{level}] must be a positive integer")
+        if isinstance(value, list) and not value:
+            continue
+        if order != 1:
+            raise ValueError("Local contrast requires first-order contrast")
         if not isinstance(value, list) or len(value) != 3:
             raise ValueError(f"local_contrast[{level}] must contain three dimensions")
         if any(type(dimension) is not int or dimension <= 0 for dimension in value):
@@ -236,8 +263,6 @@ def resolve_registration_profile(name: str) -> dict:
             )
     if any(value[0] != 1 for value in resolved["downJ"]):
         raise ValueError("Histology serial lattice must not be downsampled")
-    if resolved["order"] != [1, 1, 1]:
-        raise ValueError("Local contrast requires first-order contrast")
     return resolved
 
 

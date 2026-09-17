@@ -282,7 +282,10 @@ def test_stop_after_scale_is_forwarded_only_to_symmetric_registration(
     )
 
     assert native.main() == 0
-    assert calls == [{"restart_interrupted": False, "stop_after_scale": 2}]
+    assert calls == [{
+        "restart_interrupted": False, "stop_after_scale": 2,
+        "profile": native.FINAL_PROFILE,
+    }]
 
 
 def test_stop_after_scale_is_rejected_for_other_stages(
@@ -331,7 +334,9 @@ def test_original_reader_rejects_non_authoritative_derivatives(monkeypatch) -> N
         )
 
 
-@pytest.mark.parametrize("profile", [native.HEMI_PROFILE, native.FINAL_PROFILE])
+@pytest.mark.parametrize("profile", [
+    native.HEMI_PROFILE, native.FINAL_PROFILE, native.CONTRAST_ORDER2_PROFILE,
+])
 def test_atlas_to_slice_configuration_is_native_and_preserves_A2d(profile) -> None:
     I = np.zeros((1, 3, 4, 5), np.float32)
     J = np.zeros((3, 6, 7, 8), np.float32)
@@ -679,7 +684,7 @@ def test_symmetric_registration_uses_only_corrected_main_path() -> None:
         "HIST_NISSL_SYMMETRIC_SECTION_ALIGNED_to_MRI_7T_WHOLE"
     )
     source = inspect.getsource(native.symmetric_registration)
-    assert "CLEAN_SYMMETRIC_DATASET, None, SYMMETRIC_ROOT" in source
+    assert "CLEAN_SYMMETRIC_DATASET, None, output" in source
     assert 'a2d_initialization="identity"' in source
     for forbidden in (
         "HEMI_ROOT",
@@ -1333,3 +1338,119 @@ def test_direct_qc_output_is_additive_and_cli_dispatches(
     assert native.main() == 0
     assert calls == ["section-qc"]
     assert unrelated.read_bytes() == b"preserve"
+
+
+
+def test_quadratic_profile_changes_only_contrast_parameters() -> None:
+    baseline = native.coarse.resolve_registration_execution(native.FINAL_PROFILE)
+    experimental = native.coarse.resolve_registration_execution(
+        native.CONTRAST_ORDER2_PROFILE
+    )
+    assert baseline.keys() == experimental.keys()
+    assert {key for key in baseline if baseline[key] != experimental[key]} == {
+        "local_contrast", "order",
+    }
+    assert experimental["local_contrast"] == [[], [], []]
+    assert experimental["order"] == [2, 2, 2]
+    assert experimental["slice_matching"] == [True, True, True]
+    experimental["local_contrast"][0].append(1)
+    assert native.coarse.resolve_registration_execution(
+        native.CONTRAST_ORDER2_PROFILE
+    )["local_contrast"] == [[], [], []]
+    assert baseline == native.coarse.resolve_registration_execution(native.FINAL_PROFILE)
+
+
+@pytest.mark.parametrize("order", [0, -1, 1.5, True])
+def test_nonlocal_profile_rejects_invalid_polynomial_order(monkeypatch, order) -> None:
+    override = copy.deepcopy(native.coarse.PROFILE_OVERRIDES[native.CONTRAST_ORDER2_PROFILE])
+    override["order"][0] = order
+    monkeypatch.setitem(native.coarse.PROFILE_OVERRIDES, "invalid-order", override)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        native.coarse.resolve_registration_profile("invalid-order")
+
+
+def test_local_quadratic_profile_is_still_rejected(monkeypatch) -> None:
+    override = copy.deepcopy(native.coarse.PROFILE_OVERRIDES[native.FINAL_PROFILE])
+    override["order"] = [2, 2, 2]
+    monkeypatch.setitem(native.coarse.PROFILE_OVERRIDES, "local-quadratic", override)
+    with pytest.raises(ValueError, match="Local contrast requires first-order"):
+        native.coarse.resolve_registration_profile("local-quadratic")
+
+
+@pytest.mark.parametrize("profile", [native.FINAL_PROFILE, native.CONTRAST_ORDER2_PROFILE])
+def test_symmetric_profile_routes_output_and_preserves_initialization(monkeypatch, profile):
+    A = np.eye(4)
+    audit = {"status": "compatible"}
+    calls = []
+    monkeypatch.setattr(
+        native, "_load_validated_symmetric_initial_affine",
+        lambda dataset: (A, audit),
+    )
+    monkeypatch.setattr(
+        native, "_registration",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    native.symmetric_registration(
+        profile=profile, restart_interrupted=True, stop_after_scale=2,
+    )
+    args, kwargs = calls[0]
+    expected_root = (
+        native.CONTRAST_ORDER2_ROOT
+        if profile == native.CONTRAST_ORDER2_PROFILE else native.SYMMETRIC_ROOT
+    )
+    assert args == (native.CLEAN_SYMMETRIC_DATASET, None, expected_root)
+    assert native.CONTRAST_ORDER2_ROOT == native.SYMMETRIC_ROOT.with_name(
+        native.SYMMETRIC_ROOT.name + "_contrast_order2_per_slice"
+    )
+    assert kwargs["initial_A"] is A
+    assert kwargs["initial_A_validation"] is audit
+    assert kwargs["a2d_initialization"] == "identity"
+    assert kwargs["profile"] == profile
+    assert kwargs["restart_interrupted"] is True
+    assert kwargs["stop_after_scale"] == 2
+
+
+def test_quadratic_profile_cli_forwarding_and_stage_restriction(monkeypatch):
+    calls = []
+    monkeypatch.setattr(native, "symmetric_registration", lambda **kw: calls.append(kw))
+    argv = [
+        "runner", "symmetric-registration", "--profile", native.CONTRAST_ORDER2_PROFILE,
+        "--stop-after-scale", "2", "--restart-interrupted",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert native.main() == 0
+    assert calls == [{
+        "profile": native.CONTRAST_ORDER2_PROFILE,
+        "stop_after_scale": 2, "restart_interrupted": True,
+    }]
+    monkeypatch.setattr(sys, "argv", [
+        "runner", "hemi-registration", "--profile", native.CONTRAST_ORDER2_PROFILE,
+    ])
+    with pytest.raises(SystemExit, match="2"):
+        native.main()
+    assert len(calls) == 1
+
+
+def test_quadratic_resume_preserves_production_scale_parameters(tmp_path):
+    config = _checkpoint_config()
+    config.update(native.coarse.resolve_registration_execution(native.CONTRAST_ORDER2_PROFILE))
+    lineage = _checkpoint_lineage(config, profile_name=native.CONTRAST_ORDER2_PROFILE)
+    with pytest.raises(MemoryError):
+        native.checkpointed_multiscale(
+            _FakeEM(fail_scale=1), config=config, checkpoint_dir=tmp_path,
+            lineage=lineage, resume=False, stop_after_scale=2,
+        )
+    resumed = _FakeEM()
+    _, histories = native.checkpointed_multiscale(
+        resumed, config=config, checkpoint_dir=tmp_path,
+        lineage=lineage, resume=True, stop_after_scale=2,
+    )
+    assert len(resumed.calls) == 1 and len(histories) == 2
+    call = resumed.calls[0]
+    assert call["scale_tag"] == 1
+    assert call["n_iter"] == 50
+    assert call["local_contrast"] == [] and call["order"] == 2
+    assert call["downI"] == [2, 2, 2] and call["downJ"] == [1, 2, 2]
+    for key in ("A", "A2d", "v"):
+        assert isinstance(call[key], torch.Tensor)
+    assert not native._scale_checkpoint_paths(tmp_path, 2)[1].exists()

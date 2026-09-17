@@ -37,6 +37,7 @@ from preprocess.run_allen_emlddmm import (
     load_pinned_mri_image, mri_physical_axes_from_provenance, pinned_emlddmm,
 )
 from preprocess import run_allen_emlddmm_full_coarse_nissl as coarse
+from preprocess.prepare_allen_pv_rigid import pairing_and_initializers, load_fixed_nissl
 
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -74,7 +75,23 @@ THROUGH_SCALE_DIRECTORY = "registration_through_400um"
 SPACING_UM = 200.0
 HEMI_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-lc188-linear-no-v"
 FINAL_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-lc188"
+CONTRAST_ORDER2_PROFILE = "example-standard-sigmaR5e4-a2000-dv4000-order2-per-slice"
+CONTRAST_ORDER2_ROOT = SYMMETRIC_ROOT.with_name(
+    SYMMETRIC_ROOT.name + "_contrast_order2_per_slice"
+)
 SCALE_CHECKPOINT_SCHEMA = "allen-native-emlddmm-scale-v1"
+PV_PROFILE = "pv-to-aligned-nissl-rigid-local-contrast"
+PV_PREPARATION = PROJECT / "results/allen/specimen_708424/pv_nissl_rigid_preflight"
+PV_OUTPUT = CLEAN_ROOT / "PV_to_NISSL_HEMISPHERE_SECTION_ALIGNED"
+PV_PREFLIGHT_OUTPUT = PV_OUTPUT.with_name(PV_OUTPUT.name + "_preflight")
+PV_UNILATERAL_DATASET = PROJECT / (
+    "data/derivatives/allen/specimen_708424/"
+    "histology_pv_native_200um_section_aligned"
+)
+PV_SYMMETRIC_DATASET = PROJECT / (
+    "data/derivatives/allen/specimen_708424/"
+    "histology_symmetric_pv_native_200um_section_aligned"
+)
 
 
 def native_source_axes(shape_yx: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
@@ -260,7 +277,7 @@ def native_multiscale_configuration(
     profile: str,
 ) -> dict[str, Any]:
     """Construct the direct native call and preserve the preset verbatim."""
-    if profile not in {HEMI_PROFILE, FINAL_PROFILE}:
+    if profile not in {HEMI_PROFILE, FINAL_PROFILE, CONTRAST_ORDER2_PROFILE, PV_PROFILE}:
         raise RuntimeError(f"Unsupported clean native profile: {profile}")
     preset = coarse.resolve_registration_execution(profile)
     unchanged = copy.deepcopy(preset)
@@ -887,6 +904,8 @@ def _serialize_through_scale_product(
 def _registration_lineage(
     *, stage: str, profile: str, dataset: Path, I: np.ndarray, J: np.ndarray,
     W0: np.ndarray, initial_A: np.ndarray, initializer: dict[str, Any],
+    fixed_spacings_um: tuple[float, float, float] = (200.0, 200.0, 200.0),
+    moving_spacings_um: tuple[float, float, float] = (50.0, 200.0, 200.0),
 ) -> dict[str, Any]:
     return {
         "stage": stage,
@@ -896,8 +915,8 @@ def _registration_lineage(
             "I": list(I.shape), "J": list(J.shape), "W0": list(W0.shape),
         },
         "native_spacings_um": {
-            "I": [200.0, 200.0, 200.0],
-            "J": [50.0, 200.0, 200.0],
+            "I": list(fixed_spacings_um),
+            "J": list(moving_spacings_um),
         },
         "initializer_lineage_sha256": _json_sha256(initializer),
         "initializer_checksums": initializer.get("checksums", {}),
@@ -2003,13 +2022,19 @@ def construct_symmetric_annotations(
 
 def symmetric_registration(
     *, restart_interrupted: bool = False, stop_after_scale: int | None = None,
+    profile: str = FINAL_PROFILE,
 ) -> dict[str, Any]:
+    if profile not in {FINAL_PROFILE, CONTRAST_ORDER2_PROFILE}:
+        raise ValueError(f"Unsupported symmetric registration profile: {profile}")
+    output = (
+        CONTRAST_ORDER2_ROOT if profile == CONTRAST_ORDER2_PROFILE else SYMMETRIC_ROOT
+    )
     initial_A, initial_A_validation = _load_validated_symmetric_initial_affine(
         CLEAN_SYMMETRIC_DATASET
     )
     return _registration(
-        CLEAN_SYMMETRIC_DATASET, None, SYMMETRIC_ROOT,
-        stage="symmetric-registration", profile=FINAL_PROFILE,
+        CLEAN_SYMMETRIC_DATASET, None, output,
+        stage="symmetric-registration", profile=profile,
         initial_A=initial_A,
         a2d_initialization="identity",
         initial_A_validation=initial_A_validation,
@@ -2697,13 +2722,391 @@ def postprocess() -> None:
             coarse.RUN_TMP = saved_tmp
 
 
+
+def _pv_registration_inputs(*, representative: bool) -> tuple[
+    list[dict[str, Any]], list[int], list[np.ndarray], np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, np.ndarray, dict[str, Any],
+]:
+    """Route paired PV/Nissl planes into the existing EM-LDDMM I/J/A2d call."""
+    pairs, recomputed_initial = pairing_and_initializers()
+    initial_path = PV_PREPARATION / "pv_nissl_rigid_initial_A2d.npy"
+    pairing_path = PV_PREPARATION / "pv_nissl_pairs.tsv"
+    pair_initial = np.load(initial_path, allow_pickle=False)
+    saved_pairs, _ = _read_rows(pairing_path)
+    if not np.array_equal(pair_initial, recomputed_initial) or len(saved_pairs) != len(pairs):
+        raise RuntimeError("Prepared PV pairing or initial A2d changed")
+    for saved, current in zip(saved_pairs, pairs, strict=True):
+        for key in ("pv_source_section_id", "nissl_source_section_id",
+                    "pairing_qc_status", "initial_matrix_index"):
+            if str(saved[key]) != str(current[key]):
+                raise RuntimeError(f"Prepared PV pairing changed: {key}")
+    ready = [i for i, pair in enumerate(pairs) if pair["pairing_qc_status"] == "ready"]
+    if len(ready) != 285:
+        raise RuntimeError("PV pairing QC inventory changed")
+    if representative:
+        middle = len(ready) // 2
+        selected = ready[middle - 3:middle + 4]
+    else:
+        selected = ready
+    transforms = CLEAN_SYMMETRIC_DATASET / "metadata/transforms"
+    serial = np.load(transforms / "serial_axis_um.npy")
+    row_axis = np.load(transforms / "row_axis_um.npy")
+    left_axis = np.load(transforms / "left_lr_axis_um.npy")
+    start = min(int(pairs[i]["nissl_physical_index"]) for i in selected) if representative else 0
+    stop = max(int(pairs[i]["nissl_physical_index"]) for i in selected) + 1 if representative else len(serial)
+    x = [serial[start:stop], row_axis, left_axis]
+    shape = (len(x[0]), len(row_axis), len(left_axis))
+    I = np.zeros((3, *shape), np.float32)
+    J = np.zeros((3, *shape), np.float32)
+    W0 = np.zeros(shape, np.float32)
+    A2d = np.broadcast_to(np.eye(3, dtype=np.float64), (shape[0], 3, 3)).copy()
+    used = set()
+    for pair_index in selected:
+        pair = pairs[pair_index]
+        physical = int(pair["nissl_physical_index"])
+        local = physical - start
+        if local in used:
+            raise RuntimeError(f"Duplicate PV target Nissl position: {physical}")
+        used.add(local)
+        nissl, y, lr = load_fixed_nissl(int(pair["nissl_source_section_id"]))
+        if not np.array_equal(y, row_axis) or not np.array_equal(lr, left_axis):
+            raise RuntimeError("Fixed Nissl axes changed")
+        pv_path = NATIVE_DATASET / pair["pv_prepared_relative_path"]
+        pv = tifffile.imread(pv_path)
+        if pv.shape != nissl.shape or pv.shape != (len(row_axis), len(left_axis), 3):
+            raise RuntimeError(f"Paired PV/Nissl image shape changed: {pv_path}")
+        I[:, local] = nissl.transpose(2, 0, 1).astype(np.float32) / 255.0
+        J[:, local] = pv.transpose(2, 0, 1).astype(np.float32) / 255.0
+        W0[local] = (pv[..., 0] > 0).astype(np.float32)
+        A2d[local] = pair_initial[pair_index]
+    initializer = {
+        "type": "paired_nissl_atlas_free_A2d",
+        "source": str(initial_path),
+        "checksums": {
+            "prepared_initial_A2d": coarse.checksum(initial_path),
+            "prepared_pairing": coarse.checksum(pairing_path),
+            "atlas_free_expanded_A2d": coarse.checksum(
+                transforms / "atlas_free_expanded_A2d.npy"
+            ),
+        },
+        "selected_pair_count": len(selected),
+        "physical_index_start": start,
+        "initial_A2d_sha256": _array_sha256(A2d),
+        "excluded_pairing_review_sections": [
+            p["pv_source_section_id"] for p in pairs
+            if p["pairing_qc_status"] != "ready"
+        ],
+    }
+    return pairs, selected, x, I, J, W0, A2d, serial, initializer
+
+
+def pv_registration(
+    *,
+    representative: bool = False,
+    restart_interrupted: bool = False,
+    stop_after_scale: int | None = None,
+) -> dict[str, Any]:
+    """Run the existing checkpointed EM-LDDMM scales with PV as moving J."""
+    output = PV_PREFLIGHT_OUTPUT if representative else PV_OUTPUT
+    _prepare_registration_output(output, restart_interrupted=restart_interrupted)
+    pairs, selected, x, I, J, W0, A2d, serial, initializer = (
+        _pv_registration_inputs(representative=representative)
+    )
+    em = pinned_emlddmm()
+    A = np.eye(4, dtype=np.float64)
+    config = native_multiscale_configuration(
+        I=I, xI=x, J=J, xJ=x, W0=W0, A=A, A2d=A2d, profile=PV_PROFILE,
+    )
+    lineage = _registration_lineage(
+        stage="pv-registration", profile=PV_PROFILE, dataset=NATIVE_DATASET,
+        I=I, J=J, W0=W0, initial_A=A, initializer=initializer,
+        fixed_spacings_um=(50.0, 200.0, 200.0),
+    )
+    checkpoints = output / "checkpoints"
+    reg = output / "registration"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    reg.mkdir(parents=True, exist_ok=True)
+    running = {
+        "stage": "pv-registration",
+        "status": "running",
+        "profile": PV_PROFILE,
+        "kind": "representative" if representative else "full",
+        "completed_scales": 1 if representative else 3,
+        "fixed_space": "HIST_NISSL_HEMISPHERE_SECTION_ALIGNED_NATIVE_200UM",
+        "moving_space": "HIST_PV_RAW_NATIVE_200UM",
+        "fixed_source": str(CLEAN_SYMMETRIC_DATASET),
+        "moving_source": str(NATIVE_DATASET),
+        "initializer": initializer,
+        "selected_pair_indices": selected,
+        "selected_pairs": [pairs[i] for i in selected],
+        "serial_axis_start": min(int(pairs[i]["nissl_physical_index"])
+                                 for i in selected) if representative else 0,
+        "native_shapes": {"I": list(I.shape), "J": list(J.shape),
+                          "W0": list(W0.shape)},
+        "geometry_frozen": {"A": "identity, eA=0",
+                            "v": "zero, v_start beyond all iterations"},
+    }
+    coarse.atomic_json(checkpoints / "registration.json", running)
+    outputs, histories = checkpointed_multiscale(
+        em,
+        config=config,
+        checkpoint_dir=checkpoints,
+        lineage=lineage,
+        resume=restart_interrupted,
+        stop_after_scale=1 if representative else stop_after_scale,
+    )
+    expected_scales = (
+        1 if representative
+        else stop_after_scale
+        if stop_after_scale is not None
+        else _multiscale_count(config)
+    )
+    if len(histories) != expected_scales:
+        raise RuntimeError("PV fit did not complete the requested scales")
+    final = outputs[-1]
+    A_final = coarse.finite("PV final global A", final["A"]).astype(np.float64)
+    v_final = coarse.finite("PV final v", final["v"])
+    A2d_final = coarse.finite("PV final A2d", final["A2d"]).astype(np.float64)
+    if not np.allclose(A_final, A, atol=1e-5, rtol=0.0):
+        raise RuntimeError("PV fit changed the frozen global affine")
+    if np.max(np.abs(v_final)) > 1e-6:
+        raise RuntimeError("PV fit changed the frozen velocity")
+    if A2d_final.shape != A2d.shape:
+        raise RuntimeError("PV final A2d shape changed")
+    local_start = min(int(pairs[i]["nissl_physical_index"])
+                      for i in selected) if representative else 0
+    if any(np.linalg.det(A2d_final[int(pairs[i]["nissl_physical_index"]) -
+                                      local_start, :2, :2]) <= 0
+           for i in selected):
+        raise RuntimeError("PV fit produced a reflected section transform")
+    numerical = reg / "pv_to_aligned_nissl_numerical_outputs.npz"
+    np.savez_compressed(
+        numerical, A=A_final, A2d=A2d_final, v=v_final,
+        x0=x[0], x1=x[1], x2=x[2],
+        selected_pair_indices=np.asarray(selected, dtype=np.int64),
+        physical_index_start=local_start,
+    )
+    done = {**running, "status": "complete", "numerical": str(numerical),
+            "raw_Esave": [str(checkpoints / f"registration_scale-{i+1:02d}.npz")
+                          for i in range(len(histories))]}
+    coarse.atomic_json(checkpoints / "registration.json", done)
+    return done
+
+
+def pv_postprocess() -> dict[str, Any]:
+    """Reuse saved-section resampling, stack QC, and exact Nissl reflection."""
+    checkpoint = json.loads((PV_OUTPUT / "checkpoints/registration.json").read_text())
+    if checkpoint.get("status") != "complete" or checkpoint.get("kind") != "full":
+        raise RuntimeError("PV postprocess requires complete full PV fit")
+    if PV_UNILATERAL_DATASET.exists() or PV_SYMMETRIC_DATASET.exists():
+        raise FileExistsError("Refusing to overwrite a PV derivative")
+    pairs = checkpoint["selected_pairs"]
+    if len(pairs) != 285:
+        raise RuntimeError("Full PV fit did not retain all ready pairs")
+    with np.load(checkpoint["numerical"], allow_pickle=False) as saved:
+        final = saved["A2d"]
+        row_axis, left_axis = saved["x1"], saved["x2"]
+        start = int(saved["physical_index_start"])
+    nissl_axes = CLEAN_SYMMETRIC_DATASET / "metadata/transforms"
+    serial = np.load(nissl_axes / "serial_axis_um.npy")
+    symmetric_axis = np.load(nissl_axes / "symmetric_lr_axis_um.npy")
+    if (not np.array_equal(row_axis, np.load(nissl_axes / "row_axis_um.npy"))
+            or not np.array_equal(left_axis, np.load(nissl_axes / "left_lr_axis_um.npy"))
+            or len(serial) != len(final) or start != 0):
+        raise RuntimeError("PV fit output is not on the aligned Nissl grid")
+    parent = PV_UNILATERAL_DATASET.parent
+    unilateral_stage = Path(tempfile.mkdtemp(prefix=".pv-unilateral.", dir=parent))
+    symmetric_stage = Path(tempfile.mkdtemp(prefix=".pv-symmetric.", dir=parent))
+    try:
+        unilateral_view = unilateral_stage / "inputs/views/HIST_PV"
+        symmetric_view = symmetric_stage / "inputs/views/HIST_PV"
+        unilateral_support = unilateral_stage / "support/pv"
+        symmetric_support = symmetric_stage / "support/pv"
+        for folder in (unilateral_view, symmetric_view, unilateral_support,
+                       symmetric_support, unilateral_stage / "metadata",
+                       symmetric_stage / "metadata"):
+            folder.mkdir(parents=True)
+        by_physical = {}
+        qc_u, qc_s, qc_wu, qc_ws, qc_z = [], [], [], [], []
+        qc_positions = set(np.linspace(0, len(pairs) - 1, 9, dtype=int))
+        for order, pair in enumerate(pairs):
+            physical = int(pair["nissl_physical_index"])
+            if physical in by_physical:
+                raise RuntimeError(f"Duplicate PV canonical slot {physical}")
+            by_physical[physical] = pair
+            pv = tifffile.imread(NATIVE_DATASET / pair["pv_prepared_relative_path"])
+            if pv.shape != (len(row_axis), len(left_axis), 3):
+                raise RuntimeError(f"PV input shape changed for {pair['pv_source_section_id']}")
+            moving = pv.transpose(2, 0, 1).astype(np.float32) / 255.0
+            support = (pv[..., 0] > 0).astype(np.float32)
+            aligned, validity = coarse._warp_saved_section(
+                moving, support, final[physical], row_axis, left_axis,
+                source_row_um=row_axis, source_column_um=left_axis,
+            )
+            bilateral, bilateral_support = reflect_observed_half(aligned, validity)
+            width = len(left_axis)
+            if (bilateral.shape != (3, len(row_axis), len(symmetric_axis))
+                    or not np.array_equal(bilateral[:, :, width:], aligned)
+                    or not np.array_equal(bilateral[:, :, :width],
+                                          aligned[:, :, ::-1])):
+                raise RuntimeError("PV exact reflection failed")
+            name = f"allen_708424_pv_{int(pair['nissl_source_section_id']):04d}.tif"
+            for view, support_dir, data, mask, axis in (
+                (unilateral_view, unilateral_support, aligned, validity, left_axis),
+                (symmetric_view, symmetric_support, bilateral,
+                 bilateral_support, symmetric_axis),
+            ):
+                rgb = np.rint(np.clip(data, 0.0, 1.0) * 255.0).astype(np.uint8)
+                Image.fromarray(rgb.transpose(1, 2, 0)).save(
+                    view / name, format="TIFF", compression="tiff_deflate"
+                )
+                tifffile.imwrite(support_dir / name, mask.astype(np.float32))
+                _write_image_sidecar(
+                    view / name, shape_yx=(len(row_axis), len(axis)),
+                    origin_xy_um=(float(axis[0]), float(row_axis[0])),
+                    z_um=float(pair["canonical_nissl_z_mm"]) * 1000.0,
+                    pixel_size_um=SPACING_UM,
+                )
+            if order in qc_positions:
+                qc_u.append(aligned * validity[None])
+                qc_s.append(bilateral * bilateral_support[None])
+                qc_wu.append(validity)
+                qc_ws.append(bilateral_support)
+                qc_z.append(float(pair["canonical_nissl_z_mm"]) * 1000.0)
+        geometry_checked = 0
+        for pair in pairs:
+            section = int(pair["nissl_source_section_id"])
+            pv_name = f"allen_708424_pv_{section:04d}.json"
+            nissl_name = f"allen_708424_nissl_{section:04d}.json"
+            reference = json.loads((
+                CLEAN_SYMMETRIC_DATASET / "inputs/views/HIST_NISSL" / nissl_name
+            ).read_text(encoding="utf-8"))
+            symmetric_pv = json.loads((symmetric_view / pv_name).read_text(
+                encoding="utf-8"
+            ))
+            unilateral_pv = json.loads((unilateral_view / pv_name).read_text(
+                encoding="utf-8"
+            ))
+            for key in ("Dimension", "Space", "SpaceDimension",
+                        "SpaceDirections", "SpaceUnits", "Sizes", "SpaceOrigin"):
+                if symmetric_pv[key] != reference[key]:
+                    raise RuntimeError(f"PV/Nissl symmetric geometry differs at {section}: {key}")
+            expected_unilateral = dict(reference)
+            expected_unilateral["Sizes"] = list(reference["Sizes"])
+            expected_unilateral["Sizes"][1] = len(left_axis)
+            expected_unilateral["SpaceOrigin"] = list(reference["SpaceOrigin"])
+            expected_unilateral["SpaceOrigin"][0] = float(left_axis[0])
+            for key in ("Dimension", "Space", "SpaceDimension",
+                        "SpaceDirections", "SpaceUnits", "Sizes", "SpaceOrigin"):
+                if unilateral_pv[key] != expected_unilateral[key]:
+                    raise RuntimeError(f"PV/Nissl unilateral geometry differs at {section}: {key}")
+            geometry_checked += 1
+        for stage in (unilateral_stage, symmetric_stage):
+            _json(stage / "metadata/geometry_check.json", {
+                "status": "passed", "sections_checked": geometry_checked,
+                "canonical_serial_positions": len(serial),
+                "reference": str(CLEAN_SYMMETRIC_DATASET),
+            })
+        nissl_rows, _ = _read_rows(
+            CLEAN_SYMMETRIC_DATASET / "metadata/physical_sections.tsv"
+        )
+        for stage, view, shape, axis in (
+            (unilateral_stage, unilateral_view, [len(row_axis), len(left_axis)], left_axis),
+            (symmetric_stage, symmetric_view, [len(row_axis), len(symmetric_axis)],
+             symmetric_axis),
+        ):
+            samples = []
+            geometry_rows = []
+            for index, row in enumerate(nissl_rows):
+                pair = by_physical.get(index)
+                name = f"allen_708424_pv_{int(row['allen_section_number']):04d}.tif"
+                samples.append({
+                    "sample_id": name, "participant_id": "708424",
+                    "species": "human", "status": "present" if pair else "absent",
+                })
+                geometry_rows.append({
+                    "physical_index": index,
+                    "canonical_nissl_section_id": row["allen_section_number"],
+                    "canonical_z_mm": row["serial_z_center_mm"],
+                    "pv_source_section_id": pair["pv_source_section_id"] if pair else "",
+                    "pv_source_z_mm": pair["pv_source_z_mm"] if pair else "",
+                    "serial_section_offset": pair["serial_section_offset"] if pair else "",
+                    "estimated_separation_um": pair["estimated_separation_um"] if pair else "",
+                    "pairing_qc_status": pair["pairing_qc_status"] if pair else "absent",
+                })
+            _write_rows(view / "samples.tsv", samples, list(samples[0]))
+            _write_rows(stage / "metadata/section_geometry.tsv",
+                        geometry_rows, list(geometry_rows[0]))
+            _json(stage / "dataset.json", {
+                "dataset": "native 200-um PV aligned to Nissl" +
+                           (" and reflected" if stage == symmetric_stage else ""),
+                "space_name": "HIST_PV_SYMMETRIC_NATIVE_200UM" if stage == symmetric_stage
+                              else "HIST_NISSL_HEMISPHERE_SECTION_ALIGNED_NATIVE_200UM",
+                "shape_yx": shape,
+                "physical_serial_positions": len(serial),
+                "present_count": len(pairs),
+                "spacing_um": [50.0, 200.0, 200.0],
+                "origin_xy_um": [float(axis[0]), float(row_axis[0])],
+                "axis_order": "serial,row,left-right",
+                "units": "um",
+                "source_fit": str(PV_OUTPUT),
+                "reflection": "exact existing Nissl reflection"
+                              if stage == symmetric_stage else None,
+            })
+        all_pairs, _ = pairing_and_initializers()
+        pair_rows = []
+        for pair in all_pairs:
+            record = dict(pair)
+            physical = int(pair["nissl_physical_index"])
+            record["final_matrix_index"] = (
+                physical if pair["pairing_qc_status"] == "ready" else ""
+            )
+            record["transform_status"] = (
+                "fitted" if pair["pairing_qc_status"] == "ready"
+                else "not_fitted_review_pairing"
+            )
+            pair_rows.append(record)
+        for stage in (unilateral_stage, symmetric_stage):
+            _write_rows(stage / "metadata/pv_nissl_pairs.tsv",
+                        pair_rows, list(pair_rows[0]))
+            np.save(stage / "metadata/pv_to_nissl_pullback_A2d.npy", final)
+        em = pinned_emlddmm()
+        for stage, images, supports, axis, label in (
+            (unilateral_stage, qc_u, qc_wu, left_axis, "unilateral"),
+            (symmetric_stage, qc_s, qc_ws, symmetric_axis, "symmetric"),
+        ):
+            coarse._emlddmm_stack_draw_qc(
+                em, np.stack(images, axis=1), np.stack(supports),
+                [np.asarray(qc_z), row_axis, axis],
+                stage / f"pv_{label}_stack_qc.png",
+                f"PV {label} on aligned Nissl section coordinates",
+            )
+        os.replace(unilateral_stage, PV_UNILATERAL_DATASET)
+        os.replace(symmetric_stage, PV_SYMMETRIC_DATASET)
+    except BaseException:
+        shutil.rmtree(unilateral_stage, ignore_errors=True)
+        shutil.rmtree(symmetric_stage, ignore_errors=True)
+        raise
+    return {
+        "status": "complete",
+        "unilateral": str(PV_UNILATERAL_DATASET),
+        "symmetric": str(PV_SYMMETRIC_DATASET),
+        "present_count": len(pairs),
+        "excluded_pairing_review_sections": [1765, 2130],
+    }
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", choices=(
         "hemi-atlas-free", "hemi-registration", "construct-symmetric",
         "construct-annotations", "symmetric-atlas-free",
         "symmetric-registration", "postprocess", "section-qc",
+        "pv-preflight", "pv-registration", "pv-postprocess",
     ))
+    parser.add_argument(
+        "--profile", choices=(FINAL_PROFILE, CONTRAST_ORDER2_PROFILE),
+        help="named production profile for symmetric-registration only",
+    )
     parser.add_argument(
         "--restart-interrupted", action="store_true",
         help=(
@@ -2718,13 +3121,19 @@ def main() -> int:
         help="stop successfully after this one-based configured scale number",
     )
     args = parser.parse_args()
-    registration_stages = {"hemi-registration", "symmetric-registration"}
+    if args.profile is not None and args.stage != "symmetric-registration":
+        parser.error("--profile applies only to symmetric-registration")
+    registration_stages = {"hemi-registration", "symmetric-registration",
+                           "pv-preflight", "pv-registration"}
     if args.restart_interrupted and args.stage not in registration_stages:
         parser.error("--restart-interrupted applies only to registration stages")
-    if args.stop_after_scale is not None and args.stage != "symmetric-registration":
+    if (
+    args.stop_after_scale is not None
+    and args.stage not in {"symmetric-registration", "pv-registration"}
+    ):
         parser.error(
-            "--stop-after-scale applies only to symmetric-registration"
-        )
+            "--stop-after-scale applies only to symmetric-registration or pv-registration"
+    )
     actions = {
         "hemi-atlas-free": lambda: estimate_slice_initializer(NATIVE_DATASET, HEMI_ROOT),
         "hemi-registration": lambda: hemisphere_registration(
@@ -2738,9 +3147,19 @@ def main() -> int:
         "symmetric-registration": lambda: symmetric_registration(
             restart_interrupted=args.restart_interrupted,
             stop_after_scale=args.stop_after_scale,
+            profile=args.profile or FINAL_PROFILE,
         ),
         "postprocess": postprocess,
         "section-qc": section_qc,
+        "pv-preflight": lambda: pv_registration(
+            representative=True,
+            restart_interrupted=args.restart_interrupted,
+        ),
+        "pv-registration": lambda: pv_registration(
+            restart_interrupted=args.restart_interrupted,
+            stop_after_scale=args.stop_after_scale,
+        ),
+        "pv-postprocess": pv_postprocess,
     }
     actions[args.stage]()
     return 0
