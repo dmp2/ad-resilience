@@ -175,7 +175,7 @@ PROFILE_OVERRIDES["pv-to-aligned-nissl-rigid-local-contrast"] = {
     "Amode": 0,
     "v_start": [100001, 100001, 100001],
     "slice_deformation": False,
-    "eA2d": 1e3,
+    "eA2d": 1e1, # too large a value - leads to large gradients - leads to reflections [O(2) instead of SO(2)]
     "rigid_procrustes": False,
 }
 

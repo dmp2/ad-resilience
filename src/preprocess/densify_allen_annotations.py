@@ -1763,6 +1763,7 @@ def process_pair(
     right_ordinal = ordinal_by_physical[right_index]
     z0_um = float(context.axes[0][left_index])
     z1_um = float(context.axes[0][right_index])
+    # rgb imaging 
     left_image = np.asarray(anchor_root["nissl"][left_ordinal], dtype=np.float32)
     right_image = np.asarray(anchor_root["nissl"][right_ordinal], dtype=np.float32)
     left_weight = np.asarray(
@@ -1771,6 +1772,15 @@ def process_pair(
     right_weight = np.asarray(
         anchor_root["nissl_weight"][right_ordinal], dtype=np.float32
     )
+    # # annotations
+    # left_labels = np.asarray(anchor_root["groups"][str(group)][left_ordinal], dtype=np.uint32)
+    # right_labels = np.asarray(anchor_root["groups"][str(group)][right_ordinal], dtype=np.uint32)
+
+    # left_image = render_labels_to_rgb(left_labels).astype(np.float32)
+    # right_image = render_labels_to_rgb(right_labels).astype(np.float32)
+
+    # left_weight = (left_labels != 0).astype(np.float32)
+    # right_weight = (right_labels != 0).astype(np.float32)
     start_rss = _peak_rss_kib()
     started = time.monotonic()
     left_flow, right_flow, map_report, em, torch = fit_pair_trajectories(
