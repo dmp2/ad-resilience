@@ -89,3 +89,7 @@ Thumbs.db
 # Local compiled caches
 /.cache/
 .claude/settings.json
+.RData
+.gitignore
+.Rhistory
+Rplots.pdf
