@@ -391,6 +391,11 @@ def _save_support_aware_orthogonal(
     planes: dict[int, list[tuple[int, np.ndarray, np.ndarray]]],
     axes: list[np.ndarray],
     threshold: float,
+    *,
+    title: str | None = None,
+    supported_label: str = "interpolated with support",
+    draw_support_boundary: bool = True,
+    image_interpolation: str | None = None,
 ) -> None:
     figure, panels = plt.subplots(3, N_SLICES, figsize=(18, 11), squeeze=False)
     for axis in range(3):
@@ -399,8 +404,15 @@ def _save_support_aware_orthogonal(
             supported = coverage >= threshold
             shown[~supported] = 0.16
             panel = panels[axis, column]
-            panel.imshow(shown, extent=_extent(axes, axis), aspect="equal")
-            if np.any(supported) and np.any(~supported):
+            panel.imshow(
+                shown, extent=_extent(axes, axis), aspect="equal",
+                interpolation=image_interpolation,
+            )
+            if (
+                draw_support_boundary
+                and np.any(supported)
+                and np.any(~supported)
+            ):
                 panel.contour(
                     supported.astype(np.uint8),
                     levels=[0.5],
@@ -413,17 +425,21 @@ def _save_support_aware_orthogonal(
             panel.set_yticks([])
     figure.legend(
         handles=[
-            Patch(facecolor="white", edgecolor="#00e5ff", label="interpolated with support"),
+            Patch(
+                facecolor="white",
+                edgecolor=("#00e5ff" if draw_support_boundary else "white"),
+                label=supported_label,
+            ),
             Patch(facecolor="0.16", edgecolor="0.16", label="unsupported (not zero anatomy)"),
         ],
         loc="lower center",
         ncol=2,
     )
-    figure.suptitle(
+    figure.suptitle(title or (
         "Support-aware histology → MRI (400 µm QC)\n"
         "RGB = interp(W0 × J) / interp(W0); cyan boundary = coverage ≥ "
         f"{threshold:g}. These samples are interpolated, not observed tissue."
-    )
+    ))
     figure.tight_layout(rect=(0, 0.05, 1, 0.94))
     figure.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(figure)
@@ -434,6 +450,10 @@ def _save_coverage_orthogonal(
     planes: dict[int, list[tuple[int, np.ndarray, np.ndarray]]],
     axes: list[np.ndarray],
     threshold: float,
+    *,
+    title: str | None = None,
+    colorbar_label: str = "interpolated W0 coverage",
+    image_interpolation: str | None = None,
 ) -> None:
     cmap = plt.get_cmap("viridis").copy()
     cmap.set_under("0.16")
@@ -448,6 +468,7 @@ def _save_coverage_orthogonal(
                 vmax=1.0,
                 extent=_extent(axes, axis),
                 aspect="equal",
+                interpolation=image_interpolation,
             )
             panel.set_title(f"axis {axis}: {axes[axis][index] / 1000.0:.1f} mm")
             panel.set_xticks([])
@@ -458,11 +479,11 @@ def _save_coverage_orthogonal(
         fraction=0.018,
         pad=0.015,
     )
-    colorbar.set_label("interpolated W0 coverage")
-    figure.suptitle(
+    colorbar.set_label(colorbar_label)
+    figure.suptitle(title or (
         "Histology support transported to MRI grid (400 µm QC)\n"
         f"gray = unsupported (coverage < {threshold:g}); colored = interpolation support, not observed tissue"
-    )
+    ))
     figure.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(figure)
 
