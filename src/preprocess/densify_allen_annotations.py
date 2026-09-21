@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Dense registered-histology Allen annotations on the canonical section lattice.
 
-The implemented baseline is two-sided Nissl-driven diffeomorphic interpolation
-of categorical Allen annotations using two endpoint-conditioned WSI trajectories.
-Only already section-aligned symmetric inputs and the accepted final A2d placement
-are consumed; this module does not estimate section placement or transfer data to
-MRI space.
+Two-sided diffeomorphic interpolation can be driven by either placed Nissl images
+or pair-local binary Allen ROI memberships. Both modes use the same WSI fitting,
+source-flow evaluation, and categorical output estimator. Only already
+section-aligned symmetric inputs and the accepted final A2d placement are consumed;
+this module does not estimate section placement or transfer data to MRI space.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -50,14 +50,19 @@ DEFAULT_OUTPUT = PROJECT / (
     "data/derivatives/allen/specimen_708424/"
     "annotations_dense_registered_histology_200um"
 )
+DEFAULT_ANNOTATION_OUTPUT = PROJECT / (
+    "data/derivatives/allen/specimen_708424/"
+    "annotations_dense_registered_histology_200um_annotation_groups_31_265297118"
+)
+DEFAULT_ANNOTATION_GROUPS = (31, 265297118)
 DEFAULT_PAIR_CONFIG = PROJECT / "configs/allen_dense_pairwise.json"
 DEFAULT_WSI_REPOSITORY = PROJECT.parent / "wsi-tissue-pipeline"
 DEFAULT_EMLDDMM_REPOSITORY = PROJECT.parent / "emlddmm"
 WSI_PIN = "d4d118a47d08700c8c30cf852b855e14e411bbdf"
 
-SCHEMA = "allen-dense-registered-histology-v3"
+SCHEMA = "allen-dense-registered-histology-v4"
 ANCHOR_SCHEMA = "allen-final-registered-annotation-anchors-v1"
-PAIR_SCHEMA = "allen-dense-pair-v3"
+PAIR_SCHEMA = "allen-dense-pair-v4"
 TIFF_STORE_SCHEMA = "allen-dense-tiff-store-v1"
 
 UNSUPPORTED = 0
@@ -519,6 +524,24 @@ def semantic_state(context: SourceContext, section: int, group: int) -> str:
     )
 
 
+def select_graphic_groups(
+    context: SourceContext, requested_groups: Sequence[int] | None
+) -> SourceContext:
+    """Return a context restricted to validated groups in catalog order."""
+    if requested_groups is None:
+        return context
+    requested = tuple(map(int, requested_groups))
+    if len(requested) != len(set(requested)):
+        raise RuntimeError("Duplicate graphic group IDs requested")
+    unknown = set(requested) - set(context.graphic_groups)
+    if unknown:
+        raise RuntimeError(f"Unknown graphic groups: {sorted(unknown)}")
+    selected = tuple(group for group in context.graphic_groups if group in requested)
+    if not selected:
+        raise RuntimeError("No graphic groups selected")
+    return replace(context, graphic_groups=selected)
+
+
 def _zarr_array(
     group: Any,
     name: str,
@@ -740,6 +763,8 @@ def build_endpoint_sequences(
     by_group: dict[int, list[int]] = {group: [] for group in groups}
     for row in anchor_rows:
         group = int(row["graphic_group"])
+        if group not in by_group:
+            continue
         if row["semantic_state"] in {SEMANTIC_LABELED, SEMANTIC_VALID_EMPTY}:
             by_group[group].append(int(row["physical_index"]))
     pair_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -751,6 +776,123 @@ def build_endpoint_sequences(
     return by_group, {
         pair: tuple(groups) for pair, groups in sorted(pair_groups.items())
     }
+
+
+def _describe_annotation_pair_driver(
+    anchor_root: Any,
+    left_ordinal: int,
+    right_ordinal: int,
+    groups: Sequence[int],
+) -> tuple[
+    dict[int, np.ndarray],
+    dict[int, np.ndarray],
+    tuple[tuple[int, int], ...],
+    np.ndarray,
+    np.ndarray,
+    dict[str, Any],
+]:
+    """Load endpoint labels and describe a joint pair-local ROI representation."""
+    ordered_groups = tuple(map(int, groups))
+    if not ordered_groups:
+        raise RuntimeError("Annotation registration requires at least one pair group")
+    if len(ordered_groups) != len(set(ordered_groups)):
+        raise RuntimeError("Annotation registration pair groups contain duplicates")
+    group_root = anchor_root["groups"]
+    left_maps: dict[int, np.ndarray] = {}
+    right_maps: dict[int, np.ndarray] = {}
+    driver_keys: list[tuple[int, int]] = []
+    left_support: np.ndarray | None = None
+    right_support: np.ndarray | None = None
+    for group in ordered_groups:
+        key = str(group)
+        if key not in group_root:
+            raise RuntimeError(f"Placed anchor cache lacks graphic group {group}")
+        left = np.asarray(group_root[key][left_ordinal], dtype=np.uint32)
+        right = np.asarray(group_root[key][right_ordinal], dtype=np.uint32)
+        if left.shape != right.shape or left.ndim != 2:
+            raise RuntimeError(
+                f"Annotation endpoint geometry differs for graphic group {group}"
+            )
+        left_maps[group] = left
+        right_maps[group] = right
+        ids = sorted(
+            (
+                set(map(int, np.unique(left)))
+                | set(map(int, np.unique(right)))
+            )
+            - {0}
+        )
+        driver_keys.extend((group, allen_id) for allen_id in ids)
+        group_left_support = left != 0
+        group_right_support = right != 0
+        left_support = (
+            group_left_support
+            if left_support is None
+            else left_support | group_left_support
+        )
+        right_support = (
+            group_right_support
+            if right_support is None
+            else right_support | group_right_support
+        )
+    assert left_support is not None and right_support is not None
+    keys = tuple(driver_keys)
+    report = {
+        "registration_representation": "pair-local joint binary ROI memberships",
+        "channel_semantics": "(graphic_group, original Allen ID)",
+        "pair_driver_groups": list(ordered_groups),
+        "ordered_roi_channel_keys": [list(key) for key in keys],
+        "driver_channel_count": len(keys),
+        "registration_support": (
+            "endpoint foreground union across selected ROI channels"
+        ),
+        "left_support_pixels": int(np.count_nonzero(left_support)),
+        "right_support_pixels": int(np.count_nonzero(right_support)),
+    }
+    return (
+        left_maps,
+        right_maps,
+        keys,
+        left_support.astype(np.float32),
+        right_support.astype(np.float32),
+        report,
+    )
+
+
+def build_annotation_pair_driver(
+    anchor_root: Any,
+    left_ordinal: int,
+    right_ordinal: int,
+    groups: Sequence[int],
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[tuple[int, int], ...],
+    dict[str, Any],
+]:
+    """Build matching float32 CHW binary ROI channels for one endpoint pair."""
+    left_maps, right_maps, keys, left_weight, right_weight, report = (
+        _describe_annotation_pair_driver(
+            anchor_root, left_ordinal, right_ordinal, groups
+        )
+    )
+    if not keys:
+        raise RuntimeError(
+            "Annotation registration driver has no nonzero ROI channels for "
+            f"ordinals {left_ordinal}-{right_ordinal}, groups {list(groups)}; "
+            f"diagnostic={json.dumps(report, sort_keys=True)}"
+        )
+    left_image = np.stack(
+        [left_maps[group] == allen_id for group, allen_id in keys], axis=0
+    ).astype(np.float32)
+    right_image = np.stack(
+        [right_maps[group] == allen_id for group, allen_id in keys], axis=0
+    ).astype(np.float32)
+    if left_image.shape != right_image.shape:
+        raise RuntimeError("Annotation driver endpoint channel shapes differ")
+    return left_image, right_image, left_weight, right_weight, keys, report
 
 
 def _load_pair_config(path: Path) -> dict[str, Any]:
@@ -1598,6 +1740,7 @@ def initialize_dense(
     output: Path,
     store: DenseAnnotationStore,
     recoverable_planes: set[tuple[int, int]],
+    checkpoint_identities: Mapping[tuple[int, int], Mapping[str, Any]],
 ) -> dict[int, int]:
     anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
     anchor_rows = _read_tsv(output / "metadata/anchors.tsv")
@@ -1620,7 +1763,7 @@ def initialize_dense(
             OBSERVED_LABELS if state == SEMANTIC_LABELED else OBSERVED_VALID_EMPTY,
         )
     if isinstance(store, TiffDenseAnnotationStore):
-        _restore_tiff_checkpoint_states(store, output)
+        _restore_tiff_checkpoint_states(store, output, checkpoint_identities)
         zero = np.zeros(store.shape, dtype=np.uint32)
         for group in store.groups:
             for physical in range(len(store.canonical_z_um)):
@@ -1659,7 +1802,9 @@ def _existing_pair_status_path(
 
 
 def _restore_tiff_checkpoint_states(
-    store: TiffDenseAnnotationStore, output: Path
+    store: TiffDenseAnnotationStore,
+    output: Path,
+    checkpoint_identities: Mapping[tuple[int, int], Mapping[str, Any]],
 ) -> None:
     directory = output / "metadata/pairs/tiff"
     if not directory.is_dir():
@@ -1669,6 +1814,15 @@ def _restore_tiff_checkpoint_states(
         if status.get("status") != "complete" or status.get("output_format") != "tiff":
             continue
         left, right = map(int, status["pair"])
+        pair = (left, right)
+        expected = checkpoint_identities.get(pair)
+        if expected is None or not (
+            _checkpoint_matches(status, expected)
+            or _legacy_nissl_checkpoint_matches(status, expected)
+        ):
+            continue
+        if list(status.get("groups", ())) != expected["pair_driver_groups"]:
+            continue
         for group in map(int, status["groups"]):
             for canonical_index in range(left + 1, right):
                 if not store.verify_plane(canonical_index, group=group):
@@ -1697,6 +1851,124 @@ def _peak_rss_kib() -> int:
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
+def _stable_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _authoritative_source_identity(context: SourceContext) -> dict[str, Any]:
+    identity = {
+        "source_hashes": dict(context.source_hashes),
+        "registration_identifier": context.registration_identifier,
+    }
+    return {**identity, "sha256": _stable_json_sha256(identity)}
+
+
+def _checkpoint_identity(
+    context: SourceContext,
+    *,
+    driver: str,
+    pair_groups: Sequence[int],
+    driver_keys: Sequence[Any],
+    driver_report: Mapping[str, Any],
+    config: Mapping[str, Any],
+    wsi_commit: str,
+) -> dict[str, Any]:
+    configuration_sha256 = _stable_json_sha256(config)
+    serializable_keys = [
+        list(key) if isinstance(key, tuple) else key for key in driver_keys
+    ]
+    return {
+        "driver": driver,
+        "selected_graphic_groups": list(context.graphic_groups),
+        "pair_driver_groups": list(map(int, pair_groups)),
+        "driver_channel_keys": serializable_keys,
+        "driver_channel_count": len(serializable_keys),
+        "registration_support": driver_report["registration_support"],
+        "solver_configuration": dict(config),
+        "solver_configuration_sha256": configuration_sha256,
+        "wsi_commit": wsi_commit,
+        "authoritative_source_identity": _authoritative_source_identity(context),
+    }
+
+
+def _checkpoint_matches(
+    status: Mapping[str, Any], expected_identity: Mapping[str, Any]
+) -> bool:
+    recorded = status.get("checkpoint_identity")
+    recorded_sha = status.get("checkpoint_identity_sha256")
+    expected_sha = _stable_json_sha256(expected_identity)
+    return recorded == expected_identity and recorded_sha == expected_sha
+
+
+def _legacy_nissl_checkpoint_matches(
+    status: Mapping[str, Any], expected_identity: Mapping[str, Any]
+) -> bool:
+    """Recognize only legacy Nissl checkpoints whose identity is recoverable."""
+    if expected_identity["driver"] != "nissl" or status.get("driver") not in {
+        None,
+        "nissl",
+    }:
+        return False
+    map_report = status.get("map_convention", {})
+    return (
+        list(status.get("groups", ())) == expected_identity["pair_driver_groups"]
+        and status.get("configuration_sha256")
+        == expected_identity["solver_configuration_sha256"]
+        and map_report.get("wsi_commit") == expected_identity["wsi_commit"]
+    )
+
+
+def _nissl_driver_description() -> tuple[tuple[str, ...], dict[str, Any]]:
+    keys = ("nissl_red", "nissl_green", "nissl_blue")
+    return keys, {
+        "registration_representation": "accepted final-A2d placed RGB Nissl",
+        "channel_semantics": "RGB Nissl intensity",
+        "ordered_roi_channel_keys": [],
+        "driver_channel_count": len(keys),
+        "registration_support": (
+            "accepted final-A2d placement of the prepared Nissl mask channel"
+        ),
+    }
+
+
+def _pair_checkpoint_identity(
+    context: SourceContext,
+    anchor_root: Any,
+    ordinal_by_physical: Mapping[int, int],
+    pair: tuple[int, int],
+    groups: Sequence[int],
+    config: Mapping[str, Any],
+    *,
+    driver: str,
+    wsi_commit: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if driver == "nissl":
+        driver_keys, driver_report = _nissl_driver_description()
+    elif driver == "annotation":
+        _, _, driver_keys, _, _, driver_report = _describe_annotation_pair_driver(
+            anchor_root,
+            ordinal_by_physical[pair[0]],
+            ordinal_by_physical[pair[1]],
+            groups,
+        )
+    else:
+        raise ValueError(f"Unsupported registration driver: {driver}")
+    return (
+        _checkpoint_identity(
+            context,
+            driver=driver,
+            pair_groups=groups,
+            driver_keys=driver_keys,
+            driver_report=driver_report,
+            config=config,
+            wsi_commit=wsi_commit,
+        ),
+        driver_report,
+    )
+
+
 def process_pair(
     context: SourceContext,
     output: Path,
@@ -1705,16 +1977,65 @@ def process_pair(
     groups: Sequence[int],
     config: Mapping[str, Any],
     *,
+    driver: str,
+    checkpoint_identity: Mapping[str, Any],
     nt_source: str,
     wsi_repository: Path,
     device: str,
     overwrite: bool,
 ) -> dict[str, Any]:
     nt = int(config["nt"])
-    configuration_sha256 = hashlib.sha256(
-        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    configuration_sha256 = _stable_json_sha256(config)
     left_index, right_index = pair
+    anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
+    ordinal_by_physical = {
+        context.physical_by_section[section]: ordinal
+        for ordinal, section in enumerate(context.annotation_sections)
+    }
+    left_ordinal = ordinal_by_physical[left_index]
+    right_ordinal = ordinal_by_physical[right_index]
+    z0_um = float(context.axes[0][left_index])
+    z1_um = float(context.axes[0][right_index])
+    if driver == "nissl":
+        left_image = np.asarray(
+            anchor_root["nissl"][left_ordinal], dtype=np.float32
+        )
+        right_image = np.asarray(
+            anchor_root["nissl"][right_ordinal], dtype=np.float32
+        )
+        left_weight = np.asarray(
+            anchor_root["nissl_weight"][left_ordinal], dtype=np.float32
+        )
+        right_weight = np.asarray(
+            anchor_root["nissl_weight"][right_ordinal], dtype=np.float32
+        )
+        driver_keys, driver_report = _nissl_driver_description()
+    elif driver == "annotation":
+        (
+            left_image,
+            right_image,
+            left_weight,
+            right_weight,
+            driver_keys,
+            driver_report,
+        ) = build_annotation_pair_driver(
+            anchor_root, left_ordinal, right_ordinal, groups
+        )
+    else:
+        raise ValueError(f"Unsupported registration driver: {driver}")
+    actual_identity = _checkpoint_identity(
+        context,
+        driver=driver,
+        pair_groups=groups,
+        driver_keys=driver_keys,
+        driver_report=driver_report,
+        config=config,
+        wsi_commit=str(checkpoint_identity["wsi_commit"]),
+    )
+    if actual_identity != checkpoint_identity:
+        raise RuntimeError(
+            f"Pair {_pair_id(pair)} driver identity changed after preflight"
+        )
     existing_status_path = _existing_pair_status_path(output, pair, store.output_format)
     status_path = _pair_status_path(output, pair, store.output_format)
     if existing_status_path is not None and not overwrite:
@@ -1733,54 +2054,42 @@ def process_pair(
                 f"Existing pair status belongs to {recorded_format}, not "
                 f"{store.output_format}: {existing_status_path}"
             )
-        if (
-            status.get("nt") != nt
-            or status.get("configuration_sha256") != configuration_sha256
-        ):
+        exact_match = _checkpoint_matches(status, checkpoint_identity)
+        legacy_match = _legacy_nissl_checkpoint_matches(status, checkpoint_identity)
+        if not exact_match and not legacy_match:
             raise RuntimeError(
-                f"Existing pair status uses another nt/configuration: "
+                "Existing pair checkpoint is incompatible with the requested "
+                f"{driver} driver, channel semantics, groups, sources, or solver: "
                 f"{existing_status_path}"
+            )
+        if list(status.get("groups", ())) != list(map(int, groups)):
+            raise RuntimeError(
+                f"Existing pair checkpoint has different pair groups: {existing_status_path}"
             )
         for group in groups:
             for physical in range(left_index + 1, right_index):
-                if store.state(group, physical) != INFERRED or not store.verify_plane(
-                    physical, group=group
-                ):
+                if not store.verify_plane(physical, group=group):
                     raise RuntimeError(
                         "Pair checkpoint exists without its completed "
                         f"{store.output_format} output: {existing_status_path}"
                     )
+                store.set_state(group, physical, INFERRED)
+        status = {
+            **status,
+            "schema": PAIR_SCHEMA,
+            "driver": driver,
+            "selected_graphic_groups": list(context.graphic_groups),
+            "pair_driver_groups": list(map(int, groups)),
+            "driver_channel_keys": checkpoint_identity["driver_channel_keys"],
+            "driver_channel_count": checkpoint_identity["driver_channel_count"],
+            "registration_support": checkpoint_identity["registration_support"],
+            "checkpoint_identity": dict(checkpoint_identity),
+            "checkpoint_identity_sha256": _stable_json_sha256(checkpoint_identity),
+        }
         if existing_status_path != status_path:
             status = {**status, "output_format": store.output_format}
-            _json(status_path, status)
+        _json(status_path, status)
         return status
-    anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
-    ordinal_by_physical = {
-        context.physical_by_section[section]: ordinal
-        for ordinal, section in enumerate(context.annotation_sections)
-    }
-    left_ordinal = ordinal_by_physical[left_index]
-    right_ordinal = ordinal_by_physical[right_index]
-    z0_um = float(context.axes[0][left_index])
-    z1_um = float(context.axes[0][right_index])
-    # rgb imaging 
-    left_image = np.asarray(anchor_root["nissl"][left_ordinal], dtype=np.float32)
-    right_image = np.asarray(anchor_root["nissl"][right_ordinal], dtype=np.float32)
-    left_weight = np.asarray(
-        anchor_root["nissl_weight"][left_ordinal], dtype=np.float32
-    )
-    right_weight = np.asarray(
-        anchor_root["nissl_weight"][right_ordinal], dtype=np.float32
-    )
-    # # annotations
-    # left_labels = np.asarray(anchor_root["groups"][str(group)][left_ordinal], dtype=np.uint32)
-    # right_labels = np.asarray(anchor_root["groups"][str(group)][right_ordinal], dtype=np.uint32)
-
-    # left_image = render_labels_to_rgb(left_labels).astype(np.float32)
-    # right_image = render_labels_to_rgb(right_labels).astype(np.float32)
-
-    # left_weight = (left_labels != 0).astype(np.float32)
-    # right_weight = (right_labels != 0).astype(np.float32)
     start_rss = _peak_rss_kib()
     started = time.monotonic()
     left_flow, right_flow, map_report, em, torch = fit_pair_trajectories(
@@ -1794,6 +2103,7 @@ def process_pair(
         device=device,
     )
     group_reports: dict[str, Any] = {}
+    group_endpoints: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for group in groups:
         endpoint_left = np.asarray(
             anchor_root["groups"][str(group)][left_ordinal], dtype=np.uint32
@@ -1806,14 +2116,22 @@ def process_pair(
             | set(map(int, np.unique(endpoint_right)))
             | {0}
         )
-        written = 0
-        for physical in range(left_index + 1, right_index):
+        group_endpoints[group] = (endpoint_left, endpoint_right)
+        group_reports[str(group)] = {
+            "pair_local_vocabulary": vocabulary,
+            "inferred_canonical_planes_written": 0,
+            "compatible_existing_planes_reused": 0,
+        }
+    for physical in range(left_index + 1, right_index):
+        t = (float(context.axes[0][physical]) - z0_um) / (z1_um - z0_um)
+        phi_left = left_flow.evaluate(t)
+        phi_right = right_flow.evaluate(1.0 - t)
+        for group in groups:
             current = store.state(group, physical)
             if current in {OBSERVED_LABELS, OBSERVED_VALID_EMPTY}:
                 continue
-            t = (float(context.axes[0][physical]) - z0_um) / (z1_um - z0_um)
-            phi_left = left_flow.evaluate(t)
-            phi_right = right_flow.evaluate(1.0 - t)
+            endpoint_left, endpoint_right = group_endpoints[group]
+            vocabulary = group_reports[str(group)]["pair_local_vocabulary"]
             plane = categorical_pair_plane(
                 endpoint_left,
                 endpoint_right,
@@ -1829,18 +2147,20 @@ def process_pair(
             if isinstance(store, TiffDenseAnnotationStore) and current == UNSUPPORTED:
                 existing = store.read_group_plane(group, physical)
                 replace_placeholder = not np.any(existing)
-            store.write_group_plane(
+            did_write = store.write_group_plane(
                 group,
                 physical,
                 plane,
                 overwrite=overwrite or replace_placeholder,
             )
             store.set_state(group, physical, INFERRED)
-            written += 1
-        group_reports[str(group)] = {
-            "pair_local_vocabulary": vocabulary,
-            "inferred_canonical_planes_written": written,
-        }
+            report = group_reports[str(group)]
+            key = (
+                "inferred_canonical_planes_written"
+                if did_write
+                else "compatible_existing_planes_reused"
+            )
+            report[key] += 1
     elapsed = time.monotonic() - started
     cuda_peak = None
     if torch.cuda.is_available():
@@ -1861,11 +2181,17 @@ def process_pair(
             "authoritative canonical z; t=(z-z0)/(z1-z0); arbitrary-t flow integration"
         ),
         "groups": list(groups),
+        "driver": driver,
+        "selected_graphic_groups": list(context.graphic_groups),
+        "pair_driver_groups": list(map(int, groups)),
+        "driver_channel_keys": checkpoint_identity["driver_channel_keys"],
+        "driver_channel_count": checkpoint_identity["driver_channel_count"],
+        "driver_report": driver_report,
+        "registration_support": checkpoint_identity["registration_support"],
         "configuration_sha256": configuration_sha256,
-        "weight_construction": (
-            "accepted final-A2d placement of the prepared Nissl mask channel; "
-            "left and right endpoint planes supplied separately as W0"
-        ),
+        "weight_construction": driver_report["registration_support"],
+        "checkpoint_identity": dict(checkpoint_identity),
+        "checkpoint_identity_sha256": _stable_json_sha256(checkpoint_identity),
         "map_convention": map_report,
         "categorical_estimator": "two-sided unweighted one-hot membership fusion; no Jacobian",
         "tie_rule": (
@@ -1944,6 +2270,8 @@ def finalize_dense(
     anchor_report: Mapping[str, Any],
     config: Mapping[str, Any],
     pair_reports: Sequence[Mapping[str, Any]],
+    *,
+    driver: str,
 ) -> dict[str, Any]:
     missing_status = [
         pair
@@ -1990,6 +2318,23 @@ def finalize_dense(
         if store.output_format == "zarr"
         else str(output / "metadata/physical_sections.tsv")
     )
+    if driver == "annotation":
+        method = "two-sided annotation-driven diffeomorphic interpolation"
+        registration_representation = "pair-local joint binary ROI memberships"
+        channel_semantics = "(graphic_group, original Allen ID)"
+        registration_support = (
+            "endpoint foreground union across selected ROI channels"
+        )
+    else:
+        method = (
+            "two-sided Nissl-driven diffeomorphic interpolation of categorical "
+            "Allen annotations using two endpoint-conditioned WSI trajectories"
+        )
+        registration_representation = "accepted final-A2d placed RGB Nissl"
+        channel_semantics = "RGB Nissl intensity"
+        registration_support = (
+            "accepted final-A2d placement of the prepared Nissl mask channel"
+        )
     report = {
         "schema": SCHEMA,
         "status": "complete",
@@ -1997,10 +2342,16 @@ def finalize_dense(
         "tiff_compression": (
             store.compression if isinstance(store, TiffDenseAnnotationStore) else None
         ),
-        "method": (
-            "two-sided Nissl-driven diffeomorphic interpolation of categorical Allen "
-            "annotations using two endpoint-conditioned WSI trajectories"
+        "driver": driver,
+        "method": method,
+        "registration_representation": registration_representation,
+        "channel_semantics": channel_semantics,
+        "registration_support": registration_support,
+        "categorical_interpolation": (
+            "two-sided transported one-hot membership fusion"
         ),
+        "hardening": "deterministic argmax",
+        "jacobian_weighting": False,
         "canonical_lattice": {
             "positions": context.canonical_count,
             "physical_z_um_source": str(
@@ -2059,6 +2410,8 @@ def finalize_dense(
                 key: report.get(key)
                 for key in (
                     "pair_id",
+                    "driver",
+                    "driver_channel_count",
                     "delta_z_um",
                     "nt",
                     "canonical_output_planes_between_endpoints",
@@ -2098,12 +2451,72 @@ with `--output-format zarr` and remains in `dense.zarr/` when present.
     os.replace(temporary, path)
 
 
+def build_preflight_report(
+    context: SourceContext,
+    output: Path,
+    sequences: Mapping[int, Sequence[int]],
+    pair_groups: Mapping[tuple[int, int], Sequence[int]],
+    checkpoint_identities: Mapping[tuple[int, int], Mapping[str, Any]],
+    *,
+    driver: str,
+    output_format: str,
+) -> dict[str, Any]:
+    """Summarize actual anchor topology and pair-local driver capacity."""
+    pairs = []
+    zero_channel_pairs = []
+    inferred_group_planes = 0
+    for pair, groups in pair_groups.items():
+        identity = checkpoint_identities[pair]
+        left, right = pair
+        entry = {
+            "pair_id": _pair_id(pair),
+            "left_physical_index": left,
+            "right_physical_index": right,
+            "endpoint_physical_index_gap": right - left,
+            "endpoint_delta_z_um": float(context.axes[0][right] - context.axes[0][left]),
+            "pair_driver_groups": list(map(int, groups)),
+            "driver_channel_count": identity["driver_channel_count"],
+            "estimated_inferred_planes": (right - left - 1) * len(groups),
+        }
+        pairs.append(entry)
+        inferred_group_planes += entry["estimated_inferred_planes"]
+        if identity["driver_channel_count"] == 0:
+            zero_channel_pairs.append(entry)
+    known_mapping = {
+        str(section): context.physical_by_section.get(section)
+        for section in (1042, 1117)
+    }
+    report = {
+        "schema": "allen-dense-preflight-v1",
+        "driver": driver,
+        "selected_graphic_groups": list(context.graphic_groups),
+        "observed_annotation_anchors_by_group": {
+            str(group): len(sequences[group]) for group in context.graphic_groups
+        },
+        "unique_required_endpoint_pairs": len(pair_groups),
+        "pairs": pairs,
+        "zero_usable_channel_pair_count": len(zero_channel_pairs),
+        "zero_usable_channel_pairs": zero_channel_pairs,
+        "estimated_inferred_group_planes": inferred_group_planes,
+        "expected_output_groups": list(context.graphic_groups),
+        "expected_output_directory": str(output),
+        "output_format": output_format,
+        "known_section_to_physical_index": known_mapping,
+        "authoritative_source_identity": _authoritative_source_identity(context),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _json(output / "metadata/preflight.json", report)
+    return report
+
+
 def run(
     *,
     dataset: Path,
     registration: Path,
     annotations: Path | None,
     output: Path,
+    driver: str = "nissl",
+    graphic_groups: Sequence[int] | None = None,
     pair: tuple[int, int] | None,
     pair_config: Path,
     wsi_repository: Path,
@@ -2114,7 +2527,12 @@ def run(
     output_format: str = "tiff",
     tiff_compression: str = "deflate",
 ) -> dict[str, Any]:
-    context = discover_inputs(dataset, registration, annotations)
+    if driver not in {"nissl", "annotation"}:
+        raise ValueError(f"Unsupported registration driver: {driver}")
+    context = select_graphic_groups(
+        discover_inputs(dataset, registration, annotations), graphic_groups
+    )
+    print(f"Selected graphic groups: {context.graphic_groups}")
     _copy_file_transactionally(
         context.dataset / "metadata/physical_sections.tsv",
         output / "metadata/physical_sections.tsv",
@@ -2137,6 +2555,27 @@ def run(
     if nt_override is not None and pair is None:
         raise RuntimeError("An nt override requires one explicitly selected pair")
     base_config = _load_pair_config(pair_config.resolve())
+    wsi_commit = _verify_wsi_repository(wsi_repository)
+    anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
+    ordinal_by_physical = {
+        context.physical_by_section[section]: ordinal
+        for ordinal, section in enumerate(context.annotation_sections)
+    }
+    checkpoint_identities: dict[tuple[int, int], dict[str, Any]] = {}
+    for endpoint_pair, groups in pair_groups.items():
+        selected_override = nt_override if endpoint_pair == pair else None
+        solver_config = pair_solver_config(base_config, selected_override)
+        identity, _ = _pair_checkpoint_identity(
+            context,
+            anchor_root,
+            ordinal_by_physical,
+            endpoint_pair,
+            groups,
+            solver_config,
+            driver=driver,
+            wsi_commit=wsi_commit,
+        )
+        checkpoint_identities[endpoint_pair] = identity
 
     pair_table = []
     for endpoint_pair, groups in pair_groups.items():
@@ -2162,6 +2601,13 @@ def run(
                     if selected_override is not None
                     else "configured_temporal_discretization"
                 ),
+                "driver": driver,
+                "driver_channel_count": checkpoint_identities[endpoint_pair][
+                    "driver_channel_count"
+                ],
+                "registration_support": checkpoint_identities[endpoint_pair][
+                    "registration_support"
+                ],
                 "left_block_id": left_row["block_id"],
                 "right_block_id": right_row["block_id"],
                 "graphic_groups": json.dumps(list(groups), separators=(",", ":")),
@@ -2181,23 +2627,43 @@ def run(
                 output / "metadata/physical_sections.tsv"
             ),
             "configured_lddmm_nt": int(base_config["nt"]),
+            "driver": driver,
+            "selected_graphic_groups": list(context.graphic_groups),
             "output_time_rule": "t=(z-z0)/(z1-z0) at each canonical physical z",
             "output_format": output_format,
         },
+    )
+    preflight = build_preflight_report(
+        context,
+        output,
+        sequences,
+        pair_groups,
+        checkpoint_identities,
+        driver=driver,
+        output_format=output_format,
     )
     planning = {
         "unique_endpoint_pairs": len(pair_groups),
         "canonical_output_positions": context.canonical_count,
         "endpoint_pair_table": str(pair_table_path),
         "configured_lddmm_nt": int(base_config["nt"]),
+        "driver": driver,
+        "selected_graphic_groups": list(context.graphic_groups),
         "output_time_rule": "t=(z-z0)/(z1-z0)",
         "output_format": output_format,
+        "preflight_report": str(output / "metadata/preflight.json"),
     }
+    if driver == "annotation" and preflight["zero_usable_channel_pair_count"]:
+        raise RuntimeError(
+            "Annotation-driver preflight found endpoint pairs with no nonzero ROI "
+            f"channels; see {output / 'metadata/preflight.json'}"
+        )
     if anchors_only:
         return {
             "status": "anchors_and_plan_complete",
             **anchor_report,
             "planning": planning,
+            "preflight": preflight,
         }
 
     selected = list(pair_groups) if pair is None else [pair]
@@ -2215,7 +2681,13 @@ def run(
         tiff_compression=tiff_compression,
         groups=context.graphic_groups,
     )
-    initialize_dense(context, output, store, recoverable_planes)
+    initialize_dense(
+        context,
+        output,
+        store,
+        recoverable_planes,
+        checkpoint_identities,
+    )
     reports = []
     for endpoint_pair in selected:
         selected_override = nt_override if endpoint_pair == pair else None
@@ -2228,6 +2700,8 @@ def run(
                 endpoint_pair,
                 pair_groups[endpoint_pair],
                 solver_config,
+                driver=driver,
+                checkpoint_identity=checkpoint_identities[endpoint_pair],
                 nt_source=(
                     "command_line_override"
                     if selected_override is not None
@@ -2261,6 +2735,7 @@ def run(
         anchor_report,
         base_config,
         reports,
+        driver=driver,
     )
 
 
@@ -2287,7 +2762,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         default=None,
-        help="output root (required for a non-default --dataset)",
+        help=(
+            "output root (required for a non-default --dataset; annotation mode "
+            "uses a dedicated default root)"
+        ),
+    )
+    parser.add_argument(
+        "--driver",
+        choices=("nissl", "annotation"),
+        default="nissl",
+        help="representation used to estimate pairwise deformation (default: nissl)",
     )
     parser.add_argument(
         "--output-format",
@@ -2300,6 +2784,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=("deflate", "none"),
         default="deflate",
         help="lossless TIFF compression (used only for TIFF output)",
+    )
+    parser.add_argument(
+        "--graphic-groups",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Process only these Allen annotation graphic groups",
     )
     parser.add_argument(
         "--pair",
@@ -2321,7 +2812,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="recompute a selected completed pair; observed anchors remain immutable",
     )
-    parser.add_argument("--anchors-only", action="store_true")
+    parser.add_argument(
+        "--anchors-only",
+        "--preflight",
+        dest="anchors_only",
+        action="store_true",
+        help="materialize anchors and write the full planning/preflight report only",
+    )
     return parser
 
 
@@ -2335,7 +2832,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output is None and not using_default_dataset:
         parser.error("--output is required with a non-default --dataset")
     registration = args.registration_run or DEFAULT_REGISTRATION
-    output = args.output or DEFAULT_OUTPUT
+    graphic_groups = args.graphic_groups
+    if args.driver == "annotation" and graphic_groups is None:
+        graphic_groups = list(DEFAULT_ANNOTATION_GROUPS)
+    if (
+        args.driver == "annotation"
+        and args.output is None
+        and tuple(sorted(graphic_groups or ()))
+        != tuple(sorted(DEFAULT_ANNOTATION_GROUPS))
+    ):
+        parser.error("--output is required for non-default annotation graphic groups")
+    output = args.output or (
+        DEFAULT_ANNOTATION_OUTPUT if args.driver == "annotation" else DEFAULT_OUTPUT
+    )
     if args.overwrite and args.pair is None:
         parser.error("--overwrite is limited to an explicitly selected --pair")
     if args.nt is not None and args.pair is None:
@@ -2345,6 +2854,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         registration=registration,
         annotations=args.annotations,
         output=output.expanduser().resolve(),
+        driver=args.driver,
+        graphic_groups=graphic_groups,
         pair=args.pair,
         pair_config=args.pair_config,
         wsi_repository=args.wsi_repository,
