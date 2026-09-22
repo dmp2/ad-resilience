@@ -15,6 +15,9 @@ exec > >(tee -a "$LOG") 2>&1
 
 trap 'status=$?; echo "EXIT STATUS: $status at $(date -Is)"' EXIT
 
+# pyjnius_activate.sh expects CLASSPATH to exist.
+export CLASSPATH="${CLASSPATH:-}"
+
 source /cis/home/dpadova/miniconda3/etc/profile.d/conda.sh
 
 conda activate wsi-pipeline

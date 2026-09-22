@@ -2555,6 +2555,31 @@ def run(
     if nt_override is not None and pair is None:
         raise RuntimeError("An nt override requires one explicitly selected pair")
     base_config = _load_pair_config(pair_config.resolve())
+
+    if driver == "annotation":
+        profile = coarse.PROFILE_OVERRIDES[
+            "section-to-section-diffeo"
+        ]
+
+        for key in (
+            "a",
+            "dv",
+            "eA",
+            "eA2d",
+            "sigmaR",
+        ):
+            base_config[key] = [float(profile[key])]
+
+        base_config["Amode"] = int(profile["Amode"])
+        base_config["slice_matching"] = [
+            bool(profile["slice_matching"])
+        ]
+
+        assert base_config["Amode"] == 0
+        assert base_config["eA"] == [0.0]
+        assert base_config["eA2d"] == [0.0]
+        assert base_config["slice_matching"] == [False]
+
     wsi_commit = _verify_wsi_repository(wsi_repository)
     anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
     ordinal_by_physical = {
@@ -2804,7 +2829,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="expert nt override for one explicit --pair (use a dedicated output)",
     )
-    parser.add_argument("--pair-config", type=Path, default=DEFAULT_PAIR_CONFIG)
+    # parser.add_argument("--pair-config", type=Path, default=DEFAULT_PAIR_CONFIG)
+    parser.add_argument(
+        "--pair-config",
+        type=str,
+        default="section-to-section-diffeo",
+        choices=tuple(coarse.PROFILE_OVERRIDES),
+        help="EM-LDDMM registration profile for pairwise densification",
+    )
     parser.add_argument("--wsi-repository", type=Path, default=DEFAULT_WSI_REPOSITORY)
     parser.add_argument("--device", default="auto")
     parser.add_argument(

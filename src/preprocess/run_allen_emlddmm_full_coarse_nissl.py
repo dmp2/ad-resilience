@@ -110,12 +110,6 @@ PROFILE_OVERRIDES = {
         "muA": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
         "muB": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
     },
-    "example-standard-sigmaR5e5": {"sigmaR": 5e5},
-    "example-standard-sigmaR5e5-contrast-stable-fine100": {
-        "sigmaR": 5e5,
-        "n_iter": [100, 50, 40],
-        "local_contrast": [[1, 32, 45], [1, 65, 91], [1, 65, 91]],
-    },
     "example-standard-sigmaR5e5-contrast-stable-fine100": {
         "sigmaR": 5e5,
         # Preserve the exact completed-profile values here.
@@ -126,16 +120,6 @@ PROFILE_OVERRIDES = {
             [1, 65, 91],
         ],
     },
-    "example-standard-sigmaR5e4-a2000-dv4000": {
-            "a": 2000.0,
-            "dv": 4000.0,
-            "eA": 1e6,
-            "sigmaR": 5e4,
-            "n_iter": [100, 50, 40],
-            "local_contrast": [[1, 16, 16], [1, 16, 16], [1, 16, 16]],
-            "muA": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], # estimate of the intensitiy of artifacts (black)
-            "muB": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], # estimate of the intensity of the background (white)
-         }, 
     "example-standard-sigmaR5e4-a2000-dv4000-lc188": {
                 "a": 2000.0,
                 "dv": 4000.0,
@@ -146,17 +130,16 @@ PROFILE_OVERRIDES = {
                 "muA": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], # estimate of the intensitiy of artifacts (black)
                 "muB": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], # estimate of the intensity of the background (white)
             }, 
-    "example-standard-sigmaR5e4-a1500-dv3000": {
-        "a": 1500.0,
-        "dv": 3000.0,
-        "eA": 1e6,
-        "sigmaR": 5e4,
+    "section-to-section-diffeo": {
+        "a": 1000.0,
+        "dv": [50.0, 2000.0, 2000.0], # keep [50.0, 2000.0, 2000.0], until we fix wsi-tissue-pipeline
         "n_iter": [100, 50, 40],
-        "local_contrast": [[1, 16, 16], [1, 16, 16], [1, 16, 16]],
-        "muA": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], # estimate of the intensitiy of artifacts (black)
-        "muB": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], # estimate of the intensity of the background (white)
-     }, 
-    "example-standard-sigmaR5e6": {"sigmaR": 5e6},
+        "eA": 0,
+        "Amode": 0,
+        "eA2d": 0,
+        "slice_matching": False,
+        "sigmaR": 1e5,
+        },
     }
 
 # Contrast-only counterfactual; inherit every other production setting.
@@ -175,9 +158,10 @@ PROFILE_OVERRIDES["pv-to-aligned-nissl-rigid-local-contrast"] = {
     "Amode": 0,
     "v_start": [100001, 100001, 100001],
     "slice_deformation": False,
-    "eA2d": 1e1, # too large a value - leads to large gradients - leads to reflections [O(2) instead of SO(2)]
+    "eA2d": 1e1, # too large a value leads to large gradients - leads to reflections [O(2) instead of SO(2)]
     "rigid_procrustes": False,
 }
+
 
 LOCAL_CONTRAST_TARGET_SHAPES = ((32, 45), (65, 91), (130, 182))
 
@@ -281,7 +265,7 @@ def registration_output_root(name: str, *, native_qc: bool = False) -> Path:
     suffix = f"_{name}" + ("_native-qc" if native_qc else "")
     return BASELINE_OUTPUT.with_name(f"{BASELINE_OUTPUT.name}{suffix}")
 
-
+# it's helpful to always output these figures
 NATIVE_QC_FIGURES = (
     ("figJ", "01_reconstructed_nissl.png"),
     ("figI", "02_transformed_mri.png"),
