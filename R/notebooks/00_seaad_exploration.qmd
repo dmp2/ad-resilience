@@ -1,0 +1,2234 @@
+---
+title: "SEA-AD exploration: June 2026 quantitative neuropathology, donor metadata and cognition"
+subtitle: "What is available, how it joins, and which QNP variables are defensible candidates"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    df-print: default
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Purpose and scope
+
+This notebook is a **source inventory and measurement dictionary**, not an analysis. It answers
+five questions:
+
+1. What exactly is in the June 2026 SEA-AD quantitative neuropathology (QNP) release?
+2. What anatomical regions and resolutions does each sheet cover?
+3. What donor-level CPS, cognition and covariates are publicly available, and how do they join to QNP?
+4. Which QNP columns are defensible candidates for Aβ (6E10), pTau (AT8), NeuN, IBA1 and GFAP?
+5. **What do those columns actually mean** — numerator, denominator, unit, anatomical grain — and
+   which meanings the SEA-AD documentation does *not* establish?
+
+Sections 1–2 inventory the release. **Section 3 resolves measurement semantics** against the June
+2026 white paper *Information on neuropathology images and image analysis data*, and builds the
+measurement dictionary. Sections 4–7 cover donor metadata, cognition, donor overlap and
+exploratory figures. Section 8 separates resolved from unresolved definitions, and **section 9
+proposes primary metrics for review**.
+
+Deliberately **not** done here: enforcing a metric choice, collapsing layer- or subfield-level
+values, fitting models, or renaming source columns. Every table below carries the *verbatim*
+source column names, and every alternative metric stays visible. Where the documentation is
+silent, the gap is recorded as unresolved rather than filled by analogy.
+
+```{r}
+#| label: setup
+
+my_packages <- c("tidyverse", "readxl", "knitr")
+invisible(lapply(my_packages, library, character.only = TRUE))
+
+# Walk up from the notebook directory to the repository root, then load the
+# small read-only helpers in R/seaad_explore.R.
+find_root <- function(p = getwd()) {
+  while (!dir.exists(file.path(p, ".git"))) {
+    if (identical(dirname(p), p)) stop("project root not found")
+    p <- dirname(p)
+  }
+  p
+}
+PROJECT_ROOT <- find_root()
+source(file.path(PROJECT_ROOT, "R", "seaad_explore.R"))
+
+paths <- seaad_paths(PROJECT_ROOT)
+
+show_table <- function(x, caption = NULL, digits = 4) {
+  kable(x, caption = caption, digits = digits, format.args = list(big.mark = ""))
+}
+```
+
+## Files in scope
+
+```{r}
+#| label: files
+
+file_inventory <- tibble(
+  role = c("QNP (June 2026 release)", "QNP white paper (June 2026)",
+           "QNP white paper (pre-June-2026, bundled)",
+           "Donor metadata (public)", "Harmonized cognition (public)",
+           "Specimen index (carries CPS)", "Caudate QNP summary (pre-June-2026)",
+           "MTG QNP by donor (pre-June-2026)", "MRI volumetrics", "Luminex MTG",
+           "Antemortem imaging availability"),
+  path = c(paths$qnp_2026, paths$qnp_white_paper, paths$qnp_white_paper_pre2026,
+           paths$donor_metadata, paths$cognition, paths$specimen_index,
+           paths$caudate_pre2026, paths$mtg_qnp_pre2026, paths$mri_volumetrics,
+           paths$luminex_mtg, paths$imaging_availability)
+) %>%
+  mutate(
+    file = basename(path),
+    exists = file.exists(path),
+    size_kb = round(file.size(path) / 1024)
+  ) %>%
+  select(role, file, exists, size_kb)
+
+show_table(file_inventory, "Public SEA-AD tabular files present in data/raw/sea-ad/")
+```
+
+The two white-paper revisions are the documentation of record for section 3; the June 2026 one is
+the authority. The MRI, Luminex and imaging-availability files are listed for completeness only;
+they are out of scope.
+
+---
+
+## 1. The June 2026 QNP workbook
+
+### 1.1 Publisher's README, verbatim
+
+```{r}
+#| label: qnp-readme
+#| results: asis
+
+readme_lines <- read_qnp_readme(paths$qnp_2026)
+cat(paste0("> ", readme_lines, collapse = "\n>\n"), "\n")
+```
+
+Three things in that README matter for downstream decisions:
+
+- **`Travaglini 2026 (multi-region)` is a redundant summary**, not new data: it is the grey-matter
+  slice of the nine per-region tabs. Verified in section 1.6.
+- **`Gabitto 2024 (deprecated; MTG)` is superseded** by the `MTG` tab and should not be used.
+- **`Kana 2026 (CaH)` overlaps `CaH`**, differing only in that it adds pTDP-43 (and a tangle
+  density column). Verified in section 1.6.
+
+### 1.2 Sheet inventory
+
+```{r}
+#| label: qnp-read
+
+qnp <- read_qnp_workbook(paths$qnp_2026)
+qnp_inventory <- imap_dfr(qnp, ~ summarize_qnp_sheet(.x, .y))
+
+show_table(
+  qnp_inventory %>%
+    select(sheet, brain_region, resolution, n_analysis_regions, n_rows, n_donors,
+           n_metric_cols, markers),
+  "QNP sheet inventory (June 2026 release)"
+)
+```
+
+Two sheets have no `brain region` / `analysis region` columns. Their region is stated in the
+README rather than in the data, so it is recorded here as an explicit annotation rather than
+inferred:
+
+```{r}
+#| label: qnp-sheet-annotation
+
+sheet_region_annotation <- tribble(
+  ~sheet,                           ~region_source,                 ~brain_region_documented, ~resolution_documented,
+  "Kana 2026 (CaH)",                "README: 'head of the caudate nucleus'", "CaH",            "whole-region (not encoded in sheet)",
+  "Gabitto 2024 (deprecated; MTG)", "README: deprecated MTG data",          "MTG",             "Grey matter + Layer1..Layer5-6, encoded as column-name suffixes"
+)
+show_table(sheet_region_annotation, "Region annotation for the two sheets lacking region columns")
+```
+
+### 1.3 Anatomical grain, kept explicit
+
+`brain region` x `analysis region` for every sheet that encodes them. Nothing is collapsed.
+
+```{r}
+#| label: qnp-region-grid
+
+region_grid <- qnp_region_grid(qnp) %>% filter(!is.na(analysis_region))
+
+show_table(
+  region_grid %>%
+    arrange(sheet, brain_region, analysis_region),
+  "Rows and donors per (sheet, brain region, analysis region)"
+)
+```
+
+The distinct resolution tiers actually present in the release:
+
+```{r}
+#| label: qnp-resolution-tiers
+
+resolution_tiers <- region_grid %>%
+  mutate(tier = case_when(
+    analysis_region == "Grey matter"              ~ "whole-region grey matter",
+    str_detect(analysis_region, "^Layer")         ~ "cortical layer",
+    str_detect(analysis_region, "^(CA[1-4]|DG|Sub)") ~ "hippocampal subfield",
+    str_detect(analysis_region, "^(EC|TEC)")      ~ "entorhinal / transentorhinal subregion",
+    TRUE                                          ~ "other"
+  )) %>%
+  group_by(tier) %>%
+  summarise(
+    sheets = paste(sort(unique(sheet)), collapse = ", "),
+    analysis_regions = paste(sort(unique(analysis_region)), collapse = ", "),
+    n_rows = sum(n_rows),
+    .groups = "drop"
+  )
+
+show_table(resolution_tiers, "Anatomical resolution tiers present in the June 2026 release")
+```
+
+Notes on grain that are easy to get wrong later:
+
+- `Hip-MEC` subfields are **hemisphere-resolved** (`CA1-L` / `CA1-R`, ...). `Grey matter` rows in
+  that sheet are not suffixed, so grey matter and subfield rows are on different footings.
+- `VIC-ESOC` contains **two brain regions** (`V1C`, `ESOC`) at grey-matter resolution only; the
+  tab name's `VIC` corresponds to `V1C` in the data.
+- Under `brain region == "HIP"` the analysis regions include `EC-L` / `EC-R`; under `"MEC"` they
+  include `TEC-L` / `TEC-R`. These are distinct entorhinal samplings and should not be merged.
+
+### 1.4 Column vocabulary: marker matching, shown before it is used
+
+Marker assignment is by explicit regex over source column names. Every matched name is printed
+here so the matching can be reviewed before any column is selected.
+
+```{r}
+#| label: marker-patterns
+
+patterns <- qnp_marker_patterns()
+show_table(
+  tibble(marker = names(patterns), regex = unname(patterns)),
+  "Marker regexes applied to source column names (case-insensitive)"
+)
+```
+
+```{r}
+#| label: marker-matches
+
+all_metric_cols <- qnp %>%
+  map(~ setdiff(names(.x), QNP_ID_COLS)) %>%
+  unlist() %>%
+  unique() %>%
+  sort()
+
+marker_matches <- match_marker_columns(all_metric_cols, patterns)
+
+show_table(
+  marker_matches %>%
+    filter(marker %in% c("Ab (6E10)", "pTau (AT8)", "NeuN", "IBA1", "GFAP")) %>%
+    select(marker, column, is_colocalization) %>%
+    arrange(marker, column),
+  "Every source column matched to the five in-scope markers (review before selecting)"
+)
+```
+
+Columns matching more than one marker are colocalization measures and are flagged rather than
+attributed to a single marker:
+
+```{r}
+#| label: coloc-columns
+
+show_table(
+  marker_matches %>%
+    filter(is_colocalization) %>%
+    distinct(column) %>%
+    arrange(column),
+  "Colocalization columns (match two markers)"
+)
+```
+
+Unmatched metric columns, i.e. columns not attributable to any marker in our vocabulary:
+
+```{r}
+#| label: unmatched-columns
+
+show_table(
+  tibble(column = setdiff(all_metric_cols, unique(marker_matches$column))) %>% arrange(column),
+  "Metric columns not matched by any marker regex"
+)
+```
+
+### 1.5 Metric families and units
+
+Units are taken from **Table 6 of `68deba1b30760d231939c74e_sea-ad_quantitativeneuropathology_awsdocumentationtutorial.pdf`**,
+which ships alongside the workbook. That table documents, e.g., "Number of 6e10 positive objects
+Per μm²" and "Percent NeuN Positive Tissue area". The workbook itself carries no unit row, so
+units below are a documented mapping, not an inference from the values — but see the ambiguity
+list in section 8.
+
+```{r}
+#| label: metric-families
+
+metric_map <- qnp_metric_family(all_metric_cols)
+
+show_table(
+  metric_map %>% count(metric, unit, name = "n_columns") %>% arrange(desc(n_columns)),
+  "Metric families inferred from column-name grammar, with documented units"
+)
+
+unclassified <- metric_map %>% filter(metric == "unclassified - needs review")
+if (nrow(unclassified)) {
+  show_table(unclassified, "Columns with no metric-family rule")
+} else {
+  cat("Every metric column in the workbook matched a rule.\n")
+}
+```
+
+`Luminex biochemical measure` carries no unit: those eight columns (`ripa`/`guhcl` x
+`abeta40`/`abeta42`/`tTau`/`pTau`) sit inside the deprecated Gabitto sheet and no shipped document
+states their units. See section 1.7.
+
+### 1.6 Redundancy checks stated in the README
+
+```{r}
+#| label: redundancy-checks
+
+# Travaglini multi-region vs the per-region tabs, at Grey matter.
+compare_sheets <- function(a, b, key = "Donor ID") {
+  shared <- setdiff(intersect(names(a), names(b)), QNP_ID_COLS)
+  m <- inner_join(select(a, all_of(c(key, shared))),
+                  select(b, all_of(c(key, shared))),
+                  by = key, suffix = c(".a", ".b"))
+  map_dfr(shared, function(cc) {
+    x <- m[[paste0(cc, ".a")]]; y <- m[[paste0(cc, ".b")]]
+    both <- !is.na(x) & !is.na(y)
+    tibble(column = cc,
+           n_compared = sum(both),
+           n_a_only = sum(!is.na(x) & is.na(y)),
+           n_b_only = sum(is.na(x) & !is.na(y)),
+           max_abs_diff = if (any(both)) max(abs(x[both] - y[both])) else NA_real_)
+  })
+}
+
+travaglini <- qnp[["Travaglini 2026 (multi-region)"]]
+region_tabs <- c("AnG", "CaH", "DFC", "FI", "ITG", "MTG", "STG")
+
+travaglini_check <- map_dfr(region_tabs, function(s) {
+  a <- travaglini %>% filter(`brain region` == s)
+  b <- qnp[[s]] %>% filter(`analysis region` == "Grey matter")
+  compare_sheets(a, b) %>%
+    summarise(sheet = s,
+              n_shared_columns = n(),
+              n_agree_to_1e_6 = sum(!is.na(max_abs_diff) & max_abs_diff < 1e-6),
+              n_disagree = sum(!is.na(max_abs_diff) & max_abs_diff >= 1e-6),
+              n_no_overlapping_values = sum(is.na(max_abs_diff)),
+              worst_abs_diff = formatC(suppressWarnings(max(max_abs_diff, na.rm = TRUE)),
+                                       format = "e", digits = 1))
+})
+
+show_table(travaglini_check,
+           "Travaglini 2026 (multi-region) vs per-region tabs at Grey matter")
+```
+
+```{r}
+#| label: kana-check
+
+kana_check <- compare_sheets(
+  qnp[["Kana 2026 (CaH)"]],
+  travaglini %>% filter(`brain region` == "CaH")
+) %>%
+  mutate(max_abs_diff = formatC(max_abs_diff, format = "e", digits = 1))
+
+show_table(kana_check, "Kana 2026 (CaH) vs Travaglini 2026 CaH, shared columns")
+
+show_table(
+  tibble(kana_only_column = setdiff(names(qnp[["Kana 2026 (CaH)"]]),
+                                    names(travaglini))),
+  "Columns present in Kana 2026 (CaH) but not in Travaglini 2026"
+)
+```
+
+Columns counted as `n_no_overlapping_values` are those where one side is entirely `NA` (e.g.
+pTDP-43 in the Travaglini CaH rows), not columns that disagree.
+
+### 1.7 The deprecated Gabitto 2024 sheet is a *superset* for MTG
+
+The README says to use the 2026 `MTG` tab instead. That is correct for the metrics both tabs
+share — but the deprecated sheet also carries MTG columns that the 2026 release **drops**.
+
+```{r}
+#| label: gabitto-superset
+
+gabitto <- qnp[["Gabitto 2024 (deprecated; MTG)"]]
+gabitto_split <- qnp_split_region_suffix(setdiff(names(gabitto), "Donor ID"))
+
+mtg26_cols <- setdiff(names(qnp$MTG), QNP_ID_COLS)
+gabitto_only <- setdiff(unique(gabitto_split$base_column), mtg26_cols)
+
+show_table(
+  qnp_metric_family(gabitto_only) %>%
+    left_join(match_marker_columns(gabitto_only, patterns) %>% distinct(column, marker),
+              by = "column") %>%
+    transmute(base_column = column, marker = replace_na(marker, "-"), metric, unit) %>%
+    arrange(marker, base_column),
+  "Concepts in the deprecated Gabitto 2024 MTG sheet that are absent from the 2026 MTG tab"
+)
+```
+
+```{r}
+#| label: gabitto-agreement
+
+# Agreement on concepts both sheets carry, at Grey matter.
+mtg26_grey <- qnp$MTG %>% filter(`analysis region` == "Grey matter")
+shared_concepts <- intersect(unique(gabitto_split$base_column), mtg26_cols)
+
+gabitto_agreement <- map_dfr(shared_concepts, function(cc) {
+  suffixed <- paste0(cc, "_Grey matter")
+  if (!suffixed %in% names(gabitto)) return(NULL)
+  j <- inner_join(gabitto %>% select(`Donor ID`, old = all_of(suffixed)),
+                  mtg26_grey %>% select(`Donor ID`, new = all_of(cc)), by = "Donor ID")
+  both <- !is.na(j$old) & !is.na(j$new)
+  tibble(base_column = cc, n_compared = sum(both),
+         max_abs_diff = if (any(both)) max(abs(j$old[both] - j$new[both])) else NA_real_)
+})
+
+show_table(
+  gabitto_agreement %>%
+    summarise(n_shared_concepts = n(),
+              n_agree_to_1e_6 = sum(max_abs_diff < 1e-6, na.rm = TRUE),
+              worst_abs_diff = formatC(max(max_abs_diff, na.rm = TRUE),
+                                       format = "e", digits = 1)),
+  "Gabitto 2024 vs 2026 MTG tab at Grey matter, shared concepts"
+)
+```
+
+Two consequences worth recording:
+
+- The two MTG sources agree to floating-point noise, so the deprecated sheet is not *wrong* for
+  MTG — it is simply superseded in scope and provenance.
+- **GFAP has more than one metric, but only in the deprecated sheet**: `average GFAP positive
+  branch area` and `average GFAP positive branch length` (both layer-resolved, 84 donors) exist
+  only there. The 2026 release ships `percent GFAP positive area` alone.
+- The deprecated sheet also embeds **MTG Luminex biochemistry** (`ripa`/`guhcl` × `abeta40`,
+  `abeta42`, `tTau`, `pTau`), which duplicates the separate Luminex workbook. Units are not
+  documented in either. Out of scope for this task but noted.
+
+**Working conclusion:** the nine per-region tabs are the primary source. `Travaglini 2026
+(multi-region)` is a convenience view of their grey-matter rows; `Kana 2026 (CaH)` is the source
+for caudate pTDP-43 and for `tangle_per_tissue_area_um^2`; `Gabitto 2024` should be used *only*
+as a documented fallback for MTG GFAP morphology, with its deprecated status stated.
+
+---
+
+## 2. Candidate QNP measurements for the five in-scope markers
+
+```{r}
+#| label: candidates
+
+focus_markers <- c("Ab (6E10)", "pTau (AT8)", "NeuN", "IBA1", "GFAP")
+primary_sheets <- c("AnG", "CaH", "DFC", "FI", "Hip-MEC", "ITG", "MTG", "STG", "VIC-ESOC")
+
+qnp_candidates <- qnp_candidate_features(qnp[primary_sheets], markers = focus_markers)
+
+cat("Candidate rows (sheet x brain region x analysis region x column):", nrow(qnp_candidates), "\n")
+cat("Distinct source columns:", n_distinct(qnp_candidates$source_column), "\n")
+```
+
+### 2.1 Availability matrix: which marker metrics exist in which sheet
+
+```{r}
+#| label: availability-matrix
+
+availability <- qnp_candidates %>%
+  filter(!is_colocalization) %>%
+  distinct(marker, source_column, sheet) %>%
+  mutate(present = "X") %>%
+  pivot_wider(names_from = sheet, values_from = present, values_fill = "") %>%
+  arrange(marker, source_column)
+
+show_table(availability, "Marker metric availability by sheet (X = column present)")
+```
+
+Not every marker is measured in every region. The gaps that matter most:
+
+```{r}
+#| label: availability-gaps
+
+gaps <- qnp_candidates %>%
+  filter(!is_colocalization) %>%
+  distinct(marker, sheet) %>%
+  mutate(present = TRUE) %>%
+  complete(marker, sheet, fill = list(present = FALSE)) %>%
+  filter(!present) %>%
+  group_by(marker) %>%
+  summarise(sheets_without_this_marker = paste(sort(sheet), collapse = ", "), .groups = "drop")
+
+show_table(gaps, "Sheets with no non-colocalization column for a given marker")
+```
+
+`AnG` and `FI` are the thin tabs: 11 metric columns each, covering only Aβ (6E10) and pTau (AT8)
+directly. IBA1 appears there only inside the two 6E10/IBA1 colocalization columns, which measure
+plaque-associated microglia rather than microglial burden, so they are not IBA1 substitutes.
+
+### 2.2 Candidate features at whole-region grey matter
+
+One row per (sheet, brain region, column). Missingness and distribution are reported as observed.
+
+```{r}
+#| label: candidates-grey
+
+candidates_grey <- qnp_candidates %>%
+  filter(analysis_region == "Grey matter") %>%
+  transmute(marker, sheet, brain_region,
+            resolution = "whole-region grey matter",
+            source_column, metric, unit,
+            n_donors, n_nonmissing,
+            pct_missing = round(100 * (1 - n_nonmissing / n_donors), 1),
+            n_zero, min, median, max) %>%
+  arrange(marker, source_column, sheet)
+
+show_table(candidates_grey,
+           "Candidate QNP features, whole-region grey matter, all sheets")
+```
+
+**Column presence is not the same as data presence.** Several columns exist but are partly or
+entirely empty for a given brain region, so the availability matrix above overstates coverage:
+
+```{r}
+#| label: present-but-empty
+
+show_table(
+  qnp_candidates %>%
+    filter(analysis_region == "Grey matter", !is_colocalization,
+           n_nonmissing < n_donors) %>%
+    transmute(marker, sheet, brain_region, source_column,
+              n_donors, n_nonmissing,
+              status = if_else(n_nonmissing == 0, "column present, NO data",
+                               "column present, incomplete")) %>%
+    arrange(n_nonmissing, marker, sheet),
+  "Grey-matter candidate columns that are empty or incomplete"
+)
+```
+
+The one to watch is `number of AT8 positive cells per area` in **ESOC**: the column exists in the
+`VIC-ESOC` sheet but holds no values for the ESOC rows, so pTau density is simply not available
+there. `percent AT8 positive area` is complete for ESOC, which means the two AT8 metrics are not
+substitutable region-by-region.
+
+### 2.3 Side-by-side metrics for the same marker
+
+Multiple plausible metrics exist for four of the five markers. They are shown together here,
+at MTG grey matter, so that the choice is made with the alternatives in view. **No canonical
+metric is selected in this notebook.**
+
+```{r}
+#| label: side-by-side
+
+side_by_side <- qnp_candidates %>%
+  filter(sheet == "MTG", analysis_region == "Grey matter") %>%
+  transmute(marker, source_column, metric, unit, n_nonmissing,
+            n_zero, min, q25, median, q75, max) %>%
+  arrange(marker, metric, source_column)
+
+show_table(side_by_side,
+           "All candidate metrics per marker at MTG / Grey matter (n donors = 84)")
+```
+
+```{r}
+#| label: metrics-per-marker
+
+show_table(
+  qnp_candidates %>%
+    filter(!is_colocalization) %>%
+    group_by(marker) %>%
+    summarise(n_distinct_columns = n_distinct(source_column),
+              columns = paste(sort(unique(source_column)), collapse = " | "),
+              .groups = "drop"),
+  "Number of distinct candidate columns per marker (colocalization excluded)"
+)
+```
+
+### 2.4 Finer-grain candidates, kept separate
+
+Layer-, subfield- and subregion-level rows are **not** merged into the grey-matter rows.
+
+```{r}
+#| label: candidates-fine
+
+candidates_fine <- qnp_candidates %>%
+  filter(analysis_region != "Grey matter") %>%
+  group_by(marker, sheet, brain_region, analysis_region) %>%
+  summarise(n_columns = n_distinct(source_column),
+            n_donors = max(n_donors),
+            min_nonmissing = min(n_nonmissing),
+            max_nonmissing = max(n_nonmissing),
+            .groups = "drop") %>%
+  arrange(marker, sheet, analysis_region)
+
+show_table(candidates_fine,
+           "Finer-than-grey-matter candidate coverage (layers, subfields, subregions)")
+```
+
+Subfield rows are not complete for every donor — the per-subfield donor counts differ, which
+constrains any later subfield-level model:
+
+```{r}
+#| label: hipmec-coverage
+
+show_table(
+  region_grid %>%
+    filter(sheet == "Hip-MEC") %>%
+    select(brain_region, analysis_region, n_rows, n_donors) %>%
+    arrange(brain_region, analysis_region),
+  "Hip-MEC donor coverage by subfield (84 donors is the ceiling)"
+)
+```
+
+---
+
+## 3. Measurement semantics
+
+Sections 1 and 2 established *what columns exist*. This section establishes *what they mean*,
+using the SEA-AD documentation as the authority and the data only to confirm or refute a
+documented statement — never to invent one.
+
+### 3.1 Documentation inspected
+
+```{r}
+#| label: doc-sources
+
+doc_sources <- tribble(
+  ~short_name, ~title_on_sea_ad_download_page, ~file, ~status,
+  "WP2026",
+  "Information on neuropathology images and image analysis data",
+  "6a4584cb0e0018d98867f61c_sea-ad_quantitativeneuropathology_awsdocumentationtutorial_063026.pdf",
+  "June 2026 release; downloaded to data/raw/sea-ad/documentation/",
+
+  "WP-pre2026",
+  "Information on neuropathology images and image analysis data (earlier revision)",
+  "68deba1b30760d231939c74e_sea-ad_quantitativeneuropathology_awsdocumentationtutorial.pdf",
+  "shipped in the Brain Knowledge Platform bundle; superseded",
+
+  "README",
+  "README sheet of the QNP workbook",
+  "6a4579d1d67150b0e69ad044_sea-ad-quantitative-neuropathology-063026.xlsx",
+  "authoritative for sheet provenance; points to WP2026 for per-column definitions",
+
+  "DataElements",
+  "Donor metadata brief descriptions",
+  "sea-ad_donorindex_dataelementbriefdescriptions_063026.pdf",
+  "donor metadata only; contains no QNP column definitions"
+)
+
+show_table(doc_sources %>% select(short_name, title_on_sea_ad_download_page, status),
+           "Documentation consulted for measurement semantics")
+```
+
+```{r}
+#| label: doc-present
+
+wp_2026 <- file.path(PROJECT_ROOT, "data", "raw", "sea-ad", "documentation",
+                     "6a4584cb0e0018d98867f61c_sea-ad_quantitativeneuropathology_awsdocumentationtutorial_063026.pdf")
+cat("June 2026 white paper present locally:", file.exists(wp_2026), "\n")
+cat("size (KB):", round(file.size(wp_2026) / 1024), "\n")
+```
+
+The workbook README names this white paper explicitly ("See the referenced papers and the white
+paper on *Information on neuropathology images and image analysis data* for full methods and
+per-column definitions"). The copy bundled with the data download is the **pre-June-2026**
+revision and does **not** contain the data-dictionary section; the June 2026 revision does. Only
+this one file was downloaded, into a new `data/raw/sea-ad/documentation/` directory; no existing
+file was modified.
+
+### 3.2 What the June 2026 white paper actually defines
+
+Verbatim, from the "Quantitative neuropathology data dictionary" section of WP2026:
+
+> The **analysis region** field subdivides each region into **the area over which features were
+> quantified**. For neocortical regions these are cortical layers; for the hippocampus and
+> entorhinal cortex they are anatomical subfields/subdivisions (left/right where applicable); and
+> for regions quantified as a whole the value is "Grey matter".
+
+> For each numeric feature, the dataset provides values in both raw (unnormalized) and
+> area-normalized forms where applicable; **"per area" variants and "percent" variants are
+> normalized, while totals, counts, and "area analyzed" values are unnormalized.**
+
+Each stain group in the schema owns a **separate** `area analyzed` column — `AT8 and pTDP43 area
+analyzed`, `Iba1 and 6e10 area analyzed`, `NeuN area analyzed`, `GFAP area analyzed`, `aSyn area
+analyzed`, `Hematoxylin area analyzed`. Table 6 names the tissue mask as "Tissue area analyzed
+(µm²)" and the percent features as "percent *X* positive **tissue area**".
+
+Three consequences follow directly from the text, with no inference:
+
+1. The denominator of a percent feature is the **tissue area analysed for that stain's slide**,
+   not a shared anatomical mask and not the whole section.
+2. Because `analysis region` *is* the area over which features were quantified, a layer row's
+   denominator is that layer's analysed area.
+3. Because each stain has its own `area analyzed`, percent features for different markers on the
+   same donor and region are normalised to **different** denominators (different serial sections).
+
+On whether SEA-AD designates a preferred burden measure, WP2026 says only:
+
+> Across the entire dataset, neuropathological features are quantified in both normalized and raw
+> counts, so **please consider whether the appropriate feature (column) is being used for a given
+> analysis.**
+
+That is an explicit declination. **No measure is designated by SEA-AD as the preferred or default
+quantitative burden measure**, and the tutorial's worked example (Normalized AT8+ Cell Count) is
+presented as an illustration, not a recommendation.
+
+Not defined anywhere in WP2026: the dense-core / diffuse / fibrillar plaque classifier or its
+denominator; the criteria separating activated from inactivated IBA1 cells; what constitutes an
+IBA1 "process"; the units of the per-cell IBA1 morphology features; the units of the GFAP branch
+features. These are recorded as unresolved below.
+
+### 3.3 Verifying the documented definitions against the data
+
+The 2026 per-region tabs ship **only** the normalized features — the `area analyzed`, `total ...
+positive area` and raw-count columns are omitted. The deprecated Gabitto 2024 MTG sheet ships all
+of them, and §1.7 showed it agrees with the 2026 MTG tab to ~1e-8. It is therefore usable as a
+*test bed* for the denominator arithmetic, without being used as a data source.
+
+```{r}
+#| label: denominator-verification
+
+gab <- qnp[["Gabitto 2024 (deprecated; MTG)"]]
+gab_regions <- c("Grey matter", "Layer1", "Layer2", "Layer3", "Layer4", "Layer5-6")
+
+pct_spec <- tribble(
+  ~marker,      ~total,                      ~percent,                      ~denominator,
+  "pTau (AT8)", "total AT8 positive area",   "percent AT8 positive area",   "AT8 and pTDP43 area analyzed",
+  "Ab (6E10)",  "total 6e10 positive area",  "percent 6e10 positive area",  "Iba1 and 6e10 area analyzed",
+  "IBA1",       "total Iba1 positive area",  "percent Iba1 positive area",  "Iba1 and 6e10 area analyzed",
+  "NeuN",       "total NeuN positive area",  "percent NeuN positive area",  "NeuN area analyzed",
+  "GFAP",       "total GFAP positive area",  "percent GFAP positive area",  "GFAP area analyzed"
+)
+
+pct_check <- pmap_dfr(pct_spec, function(marker, total, percent, denominator) {
+  map_dfr(gab_regions, function(r) {
+    tc <- paste0(total, "_", r); pc <- paste0(percent, "_", r); dc <- paste0(denominator, "_", r)
+    if (!all(c(tc, pc, dc) %in% names(gab))) return(NULL)
+    obs <- gab[[pc]]; pred <- 100 * gab[[tc]] / gab[[dc]]
+    tibble(marker = marker, analysis_region = r,
+           median_rel_err = median(abs(obs - pred) / pmax(obs, 1e-12), na.rm = TRUE))
+  })
+})
+
+show_table(
+  pct_check %>%
+    pivot_wider(names_from = analysis_region, values_from = median_rel_err),
+  "Median relative error of `percent X positive area` vs 100 x total / (same-region area analyzed)"
+)
+```
+
+The identity holds. AT8, NeuN and GFAP agree to ~1e-7 or better; 6E10 and IBA1 agree to ~1e-3,
+consistent with the Object Colocalization module reporting its ROI area at coarser precision
+(Table 5 of WP2026 gives that module's total ROI area in mm², the others in µm²).
+
+Does a layer row use the *layer's* denominator, or the whole grey-matter denominator? The two
+hypotheses are far apart, so the data answers decisively:
+
+```{r}
+#| label: layer-denominator-test
+
+layer_test <- pmap_dfr(pct_spec, function(marker, total, percent, denominator) {
+  map_dfr(setdiff(gab_regions, "Grey matter"), function(r) {
+    tc <- paste0(total, "_", r); pc <- paste0(percent, "_", r)
+    d_layer <- paste0(denominator, "_", r); d_grey <- paste0(denominator, "_Grey matter")
+    if (!all(c(tc, pc, d_layer, d_grey) %in% names(gab))) return(NULL)
+    tibble(marker = marker, analysis_region = r,
+           max_err_layer_denom = max(abs(gab[[pc]] - 100 * gab[[tc]] / gab[[d_layer]]), na.rm = TRUE),
+           max_err_grey_denom  = max(abs(gab[[pc]] - 100 * gab[[tc]] / gab[[d_grey]]),  na.rm = TRUE))
+  })
+})
+
+show_table(
+  layer_test %>%
+    group_by(marker) %>%
+    summarise(worst_err_if_layer_specific = max(max_err_layer_denom),
+              worst_err_if_grey_matter    = max(max_err_grey_denom), .groups = "drop"),
+  "Layer rows: layer-specific denominator vs grey-matter denominator (percentage points)"
+)
+```
+
+**Layer-level percent-positive-area values use layer-specific denominators.** Assuming a shared
+grey-matter denominator would be wrong by up to several percentage points — larger than most of
+the between-donor signal.
+
+Is "Grey matter" a separate annotation, or the union of the layers?
+
+```{r}
+#| label: grey-matter-union
+
+union_test <- map_dfr(c("AT8 and pTDP43 area analyzed", "NeuN area analyzed",
+                        "GFAP area analyzed", "Iba1 and 6e10 area analyzed"), function(d) {
+  gm <- gab[[paste0(d, "_Grey matter")]]
+  layers <- rowSums(sapply(setdiff(gab_regions, "Grey matter"),
+                           function(r) gab[[paste0(d, "_", r)]]))
+  tibble(denominator = d,
+         median_ratio = median(gm / layers, na.rm = TRUE),
+         max_abs_ratio_minus_1 = max(abs(gm / layers - 1), na.rm = TRUE))
+})
+
+show_table(union_test, "Grey-matter analysed area vs the sum of the five layer analysed areas")
+```
+
+For the layered cortical regions, **`Grey matter` is exactly the union of `Layer1`..`Layer5-6`**.
+Grey matter and layer rows are therefore nested, not independent samples — relevant later, but it
+also means a grey-matter value is an area-weighted aggregate of its layers, not a separate
+measurement.
+
+Now the `per area` features. Are they count divided by that same analysed area, and in what units?
+
+```{r}
+#| label: per-area-verification
+
+count_spec <- tribble(
+  ~marker,      ~count,                                  ~per_area,                                        ~denominator,
+  "pTau (AT8)", "number of AT8 positive cells",          "number of AT8 positive cells per area",           "AT8 and pTDP43 area analyzed",
+  "NeuN",       "number of NeuN positive cells",         "number of NeuN positive cells per area",          "NeuN area analyzed",
+  "IBA1",       "number of Iba1 positive cells",         "number of Iba1 positive cells per area",          "Iba1 and 6e10 area analyzed",
+  "Ab (6E10)",  "number of 6e10 positive objects",       "number of 6e10 positive objects per area",        "Iba1 and 6e10 area analyzed",
+  "Hematoxylin","number of Hematoxylin positive nuclei", "number of Hematoxylin positive nuclei per area",  "Hematoxylin area analyzed"
+)
+
+per_area_check <- pmap_dfr(count_spec, function(marker, count, per_area, denominator) {
+  map_dfr(c("Grey matter", "Layer3"), function(r) {
+    nc <- paste0(count, "_", r); pc <- paste0(per_area, "_", r); dc <- paste0(denominator, "_", r)
+    if (!all(c(nc, pc, dc) %in% names(gab))) return(NULL)
+    ratio <- gab[[pc]] / (gab[[nc]] / gab[[dc]])
+    tibble(marker = marker, source_column = per_area, analysis_region = r,
+           median_ratio = median(ratio, na.rm = TRUE))
+  })
+})
+
+show_table(per_area_check %>% pivot_wider(names_from = analysis_region, values_from = median_ratio),
+           "`per area` / (raw count / same-region area analyzed in um^2); 1.0 confirms the unit")
+```
+
+The ratio is 1.0 for every marker tested, so **`... per area` is the raw count divided by that
+stain's analysed area for that analysis region, expressed per µm²**. WP2026 states this unit
+explicitly only for 6E10 ("number of 6e10 positive objects per µm²"); for AT8, NeuN, IBA1 and
+Hematoxylin the construction is identical in the data but the unit is not written down, so those
+rows are marked `partially_resolved` rather than `resolved`.
+
+#### Do the 6E10 plaque subtypes partition total 6E10?
+
+```{r}
+#| label: plaque-partition
+
+mtg_all <- qnp$MTG
+subtype_cols <- c("percent 6e10 dense core plaque area",
+                  "percent 6e10 diffuse plaque area",
+                  "percent 6e10 fibrilar plaque area")
+
+show_table(
+  mtg_all %>%
+    group_by(analysis_region = `analysis region`) %>%
+    summarise(across(all_of(c(subtype_cols, "percent 6e10 positive area")),
+                     ~ sum(!is.na(.x))), .groups = "drop"),
+  "Donors with a value, by analysis region (MTG): subtypes exist only at Grey matter"
+)
+
+partition <- mtg_all %>%
+  filter(`analysis region` == "Grey matter", `percent 6e10 positive area` > 0) %>%
+  transmute(total = `percent 6e10 positive area`,
+            subtype_sum = .data[[subtype_cols[1]]] + .data[[subtype_cols[2]]] + .data[[subtype_cols[3]]],
+            ratio = subtype_sum / total)
+
+show_table(
+  tibble(n_donors = nrow(partition),
+         median_subtype_sum_over_total = median(partition$ratio),
+         q25 = quantile(partition$ratio, .25), q75 = quantile(partition$ratio, .75),
+         max = max(partition$ratio),
+         n_with_a_subtype_exceeding_total =
+           sum(pmax(mtg_all[[subtype_cols[1]]], mtg_all[[subtype_cols[2]]], mtg_all[[subtype_cols[3]]])[
+             mtg_all$`analysis region` == "Grey matter"] >
+             mtg_all[["percent 6e10 positive area"]][mtg_all$`analysis region` == "Grey matter"],
+             na.rm = TRUE),
+         n_summing_to_100 = sum(abs(partition$subtype_sum - 100) < 1)),
+  "6E10 plaque subtypes vs percent 6e10 positive area, MTG grey matter"
+)
+```
+
+The three subtypes **do not partition** `percent 6e10 positive area`: their sum is typically
+~2.4x the total, individual subtypes frequently exceed the total outright, and they do not sum to
+100 either. They are therefore on a denominator that WP2026 does not state and that is neither
+the analysed tissue area nor the 6E10-positive area. They also exist **only at grey matter**.
+Status: **unresolved** — these three columns cannot be interpreted from the shipped documentation
+and must not be mixed with `percent 6e10 positive area`.
+
+#### Does the IBA1 activation split partition IBA1+ cells?
+
+```{r}
+#| label: iba1-partition
+
+show_table(
+  map_dfr(c("Grey matter", "Layer3"), function(r) {
+    a <- gab[[paste0("number of activated Iba1 positive cells_", r)]]
+    i <- gab[[paste0("number of inactivated Iba1 positive cells_", r)]]
+    t <- gab[[paste0("number of Iba1 positive cells_", r)]]
+    tibble(analysis_region = r, n_donors = sum(!is.na(t)),
+           median_ratio = median((a + i) / t, na.rm = TRUE),
+           max_abs_count_difference = max(abs(a + i - t), na.rm = TRUE))
+  }),
+  "activated + inactivated IBA1 cells vs total IBA1 cells"
+)
+```
+
+The split is an **exact, exhaustive binary partition** of IBA1+ cells. That is a structural fact
+from the data; the *criteria* separating the two classes are still undocumented (WP2026 names only
+the HALO "Microglia module"), so the biological meaning stays **unresolved** even though the
+arithmetic is clean.
+
+### 3.4 Measurement dictionary
+
+One row per candidate metric for the five in-scope markers. `documented_definition` quotes or
+paraphrases only what WP2026 states; anything else is marked unresolved.
+
+```{r}
+#| label: measurement-dictionary
+
+dict_core <- tribble(
+  ~marker, ~source_column, ~measurement_family, ~biological_quantity, ~numerator, ~denominator, ~unit, ~layer_specific_denominator, ~documented_definition, ~documentation_source, ~semantic_status,
+
+  "Ab (6E10)", "percent 6e10 positive area", "areal burden", "fraction of analysed tissue occupied by 6E10+ amyloid",
+  "total 6e10 positive area (um^2)", "Iba1 and 6e10 area analyzed (um^2)", "% of analysed tissue area", "yes",
+  "Table 6: 'percent 6e10 positive tissue area'; schema pairs it with 'Iba1 and 6e10 area analyzed'", "WP2026 Table 6 + schema; arithmetic verified in 3.3", "resolved",
+
+  "Ab (6E10)", "number of 6e10 positive objects per area", "object density", "6E10+ object (plaque) density",
+  "number of 6e10 positive objects", "Iba1 and 6e10 area analyzed (um^2)", "objects per um^2", "yes",
+  "Table 6: 'number of 6e10 positive objects per um2'", "WP2026 Table 6; verified in 3.3", "resolved",
+
+  "Ab (6E10)", "average 6e10 positive object area", "object morphology", "mean size of 6E10+ objects",
+  "sum of 6E10+ object areas", "number of 6E10+ objects (per-object mean)", "um^2", "not applicable",
+  "Table 6: 'average 6e10 positive object area (um2)'", "WP2026 Table 6", "resolved",
+
+  "Ab (6E10)", "average 6e10 positive object median diameter", "object morphology", "mean of per-object median diameter",
+  "per-object median diameter", "number of 6E10+ objects (per-object mean)", "um", "not applicable",
+  "Table 6: 'average 6e10 positive object median diameter (um)'", "WP2026 Table 6", "resolved",
+
+  "Ab (6E10)", "percent 6e10 dense core plaque area", "plaque subtype", "dense-core plaque burden",
+  "not stated", "NOT STATED - not the analysed area and not the 6E10+ area", "percentage of an unstated denominator", "not available (grey matter only)",
+  "Listed in Table 6 and the schema; no classifier and no denominator given", "WP2026 (listed only)", "unresolved",
+
+  "Ab (6E10)", "percent 6e10 diffuse plaque area", "plaque subtype", "diffuse plaque burden",
+  "not stated", "NOT STATED - not the analysed area and not the 6E10+ area", "percentage of an unstated denominator", "not available (grey matter only)",
+  "Listed in Table 6 and the schema; no classifier and no denominator given", "WP2026 (listed only)", "unresolved",
+
+  "Ab (6E10)", "percent 6e10 fibrilar plaque area", "plaque subtype", "fibrillar plaque burden",
+  "not stated", "NOT STATED - not the analysed area and not the 6E10+ area", "percentage of an unstated denominator", "not available (grey matter only)",
+  "Listed in Table 6 and the schema; no classifier and no denominator given", "WP2026 (listed only)", "unresolved",
+
+  "pTau (AT8)", "percent AT8 positive area", "areal burden", "fraction of analysed tissue occupied by AT8+ pTau",
+  "total AT8 positive area (um^2)", "AT8 and pTDP43 area analyzed (um^2)", "% of analysed tissue area", "yes",
+  "Table 6: 'percent AT8 positive tissue'; schema pairs it with 'AT8 and pTDP43 area analyzed'", "WP2026 Table 6 + schema; arithmetic verified in 3.3", "resolved",
+
+  "pTau (AT8)", "number of AT8 positive cells per area", "cell density", "density of AT8+ (tangle-bearing) cells",
+  "number of AT8 positive cells", "AT8 and pTDP43 area analyzed (um^2)", "cells per um^2 (unit not stated in WP2026)", "yes",
+  "Schema lists the column; Table 6 gives 'number of AT8 positive bearing cells' but no unit for the per-area form", "WP2026 schema; unit inferred only from numeric identity in 3.3", "partially_resolved",
+
+  "pTau (AT8)", "average AT8 positive cell area", "object morphology", "mean size of AT8+ cells",
+  "sum of AT8+ cell areas", "number of AT8+ cells (per-object mean)", "um^2", "not applicable",
+  "Table 6: 'average AT8 positive bearing cell area (um2)'", "WP2026 Table 6", "resolved",
+
+  "NeuN", "percent NeuN positive area", "areal burden", "fraction of analysed tissue occupied by NeuN+ signal",
+  "total NeuN positive area (um^2)", "NeuN area analyzed (um^2)", "% of analysed tissue area", "yes",
+  "Table 6: 'percent NeuN positive tissue area'; schema pairs it with 'NeuN area analyzed'", "WP2026 Table 6 + schema; arithmetic verified in 3.3", "resolved",
+
+  "NeuN", "number of NeuN positive cells per area", "cell density", "neuronal density",
+  "number of NeuN positive cells", "NeuN area analyzed (um^2)", "cells per um^2 (unit not stated in WP2026)", "yes",
+  "Schema lists the column; Table 6 gives 'number of NeuN positive cells' but no unit for the per-area form", "WP2026 schema; unit inferred only from numeric identity in 3.3", "partially_resolved",
+
+  "NeuN", "average NeuN positive cell area", "object morphology", "mean neuronal soma size",
+  "sum of NeuN+ cell areas", "number of NeuN+ cells (per-object mean)", "um^2", "not applicable",
+  "Table 6: 'average NeuN positive cell area (um2)'", "WP2026 Table 6", "resolved",
+
+  "IBA1", "percent Iba1 positive area", "areal burden", "fraction of analysed tissue occupied by IBA1+ microglia",
+  "total Iba1 positive area (um^2)", "Iba1 and 6e10 area analyzed (um^2)", "% of analysed tissue area", "yes",
+  "Table 6: 'percent IBA1 positive tissue area'", "WP2026 Table 6 + schema; arithmetic verified in 3.3", "resolved",
+
+  "IBA1", "number of Iba1 positive cells per area", "cell density", "microglial density",
+  "number of Iba1 positive cells", "Iba1 and 6e10 area analyzed (um^2)", "cells per um^2 (unit not stated in WP2026)", "yes",
+  "Schema lists the column; Table 6 gives 'total IBA1 positive cells' but no unit for the per-area form", "WP2026 schema; unit inferred only from numeric identity in 3.3", "partially_resolved",
+
+  "IBA1", "number of activated Iba1 positive cells per area", "activation state", "density of 'activated' microglia",
+  "number of activated Iba1 positive cells", "Iba1 and 6e10 area analyzed (um^2)", "cells per um^2 (unit not stated)", "yes",
+  "Table 6 names 'total activated and inactivated IBA1 positive cells' via the HALO Microglia module; NO classification criteria given", "WP2026 (named only)", "unresolved",
+
+  "IBA1", "number of inactivated Iba1 positive cells per area", "activation state", "density of 'inactivated' microglia",
+  "number of inactivated Iba1 positive cells", "Iba1 and 6e10 area analyzed (um^2)", "cells per um^2 (unit not stated)", "yes",
+  "Table 6 names 'total activated and inactivated IBA1 positive cells' via the HALO Microglia module; NO classification criteria given", "WP2026 (named only)", "unresolved",
+
+  "IBA1", "average Iba1 positive process area per cell", "process morphology", "mean microglial process area per cell",
+  "total Iba1 positive process area", "number of Iba1 positive cells", "um^2 per cell (unit of the per-cell form not stated)", "not applicable",
+  "Table 6 lists 'total IBA1 positive process area (um2)' and 'average IBA1 positive process area per cell'; 'process' is not defined", "WP2026 Table 6", "partially_resolved",
+
+  "IBA1", "average Iba1 positive process length per cell", "process morphology", "mean microglial process length per cell",
+  "total Iba1 positive process length", "number of Iba1 positive cells", "um per cell (unit of the per-cell form not stated)", "not applicable",
+  "Table 6 lists 'total IBA1 positive process length (um)' and 'average IBA1 positive process length per cell'; 'process' is not defined", "WP2026 Table 6", "partially_resolved",
+
+  "GFAP", "percent GFAP positive area", "areal burden", "fraction of analysed tissue occupied by GFAP+ astrocytic signal",
+  "total GFAP positive area (um^2)", "GFAP area analyzed (um^2)", "% of analysed tissue area", "yes",
+  "Table 6: 'percent GFAP positive tissue area'; GFAP quantified with the Microglia module adapted for GFAP+ astrocytic branches", "WP2026 Table 6 + schema; arithmetic verified in 3.3", "resolved",
+
+  "Ab (6E10) / IBA1", "percent of 6e10 positive objects colocalized with Iba1 positive objects", "colocalization", "fraction of plaques with associated microglia",
+  "colocalized objects", "not stated which marker's object count is the denominator", "% of objects", "not applicable",
+  "Table 5: 'Percent of object 1 and 2 colocalized'; which object indexes the denominator is not stated", "WP2026 Table 5", "partially_resolved",
+
+  "Ab (6E10) / IBA1", "number of 6e10 positive objects colocalized with Iba1 positive objects per area", "colocalization", "density of microglia-associated plaques",
+  "number of colocalized objects", "Iba1 and 6e10 area analyzed (um^2)", "objects per um^2 (unit not stated)", "yes",
+  "Schema lists the column; no unit given", "WP2026 schema", "partially_resolved",
+
+  "GFAP", "average GFAP positive branch area", "branch morphology (DEPRECATED SHEET ONLY)", "mean GFAP+ astrocytic branch area",
+  "GFAP+ branch area", "number of branches (per-object mean)", "not stated", "not applicable",
+  "Table 6 lists 'average GFAP positive branch area' as a HALO output, but the 2026 schema omits it from the released GFAP feature set", "WP2026 Table 6 (output list only)", "partially_resolved",
+
+  "GFAP", "average GFAP positive branch length", "branch morphology (DEPRECATED SHEET ONLY)", "mean GFAP+ astrocytic branch length",
+  "GFAP+ branch length", "number of branches (per-object mean)", "not stated", "not applicable",
+  "Table 6 lists 'average GFAP positive length' as a HALO output, but the 2026 schema omits it from the released GFAP feature set", "WP2026 Table 6 (output list only)", "partially_resolved"
+)
+```
+
+```{r}
+#| label: dictionary-assemble
+
+# Which sheets actually carry each column, computed rather than asserted.
+primary_sheets <- c("AnG", "CaH", "DFC", "FI", "Hip-MEC", "ITG", "MTG", "STG", "VIC-ESOC")
+
+sheet_membership <- imap_dfr(qnp, ~ tibble(sheet = .y, source_column = setdiff(names(.x), QNP_ID_COLS))) %>%
+  bind_rows(qnp_split_region_suffix(setdiff(names(qnp[["Gabitto 2024 (deprecated; MTG)"]]), "Donor ID")) %>%
+              transmute(sheet = "Gabitto 2024 (deprecated; MTG)", source_column = base_column)) %>%
+  distinct() %>%
+  group_by(source_column) %>%
+  summarise(
+    source_sheet = paste(sort(intersect(sheet, primary_sheets)), collapse = ", "),
+    in_deprecated_only = !any(sheet %in% primary_sheets),
+    .groups = "drop"
+  )
+
+qnp_measurement_dictionary <- dict_core %>%
+  left_join(sheet_membership, by = "source_column") %>%
+  mutate(
+    source_sheet = if_else(is.na(source_sheet) | source_sheet == "",
+                           "Gabitto 2024 (deprecated; MTG)", source_sheet),
+    anatomical_denominator = case_when(
+      layer_specific_denominator == "yes" ~
+        "the row's own analysis region (Grey matter = union of Layer1..Layer5-6)",
+      layer_specific_denominator == "not applicable" ~
+        "not applicable (not area-normalised: per-object mean or object fraction)",
+      TRUE ~ "not determinable from the documentation"
+    )
+  ) %>%
+  relocate(marker, source_sheet, source_column, measurement_family, biological_quantity,
+           numerator, denominator, unit, anatomical_denominator, layer_specific_denominator,
+           documented_definition, documentation_source, semantic_status)
+
+cat("dictionary rows:", nrow(qnp_measurement_dictionary), "\n")
+show_table(
+  qnp_measurement_dictionary %>% count(semantic_status, name = "n_metrics"),
+  "Measurement dictionary: semantic status tally"
+)
+```
+
+The dictionary is wide, so it is displayed in three parts sharing `marker` + `source_column`.
+
+```{r}
+#| label: dictionary-definition
+
+show_table(
+  qnp_measurement_dictionary %>%
+    select(marker, source_column, measurement_family, biological_quantity,
+           numerator, denominator, unit),
+  "Measurement dictionary (1/3): what is measured"
+)
+```
+
+```{r}
+#| label: dictionary-anatomy
+
+show_table(
+  qnp_measurement_dictionary %>%
+    select(marker, source_column, source_sheet, anatomical_denominator,
+           layer_specific_denominator),
+  "Measurement dictionary (2/3): anatomical denominator and where the column lives"
+)
+```
+
+```{r}
+#| label: dictionary-provenance
+
+show_table(
+  qnp_measurement_dictionary %>%
+    select(marker, source_column, documented_definition, documentation_source, semantic_status),
+  "Measurement dictionary (3/3): documentary basis and semantic status"
+)
+```
+
+### 3.5 A curation claim that the data does not support
+
+WP2026 states that curation validation confirms "that there are no unexpected missing values or
+extreme outliers". Section 2.2 found `number of AT8 positive cells per area` to be entirely empty
+for all 84 ESOC rows, and NeuN incomplete in ITG (29/43) and CaH (37/42). Either the validation
+does not cover those tabs or the gaps are considered expected. Flagged, not resolved.
+
+---
+## 4. Donor metadata (public)
+
+```{r}
+#| label: donor-metadata
+
+donor_meta <- read_excel(paths$donor_metadata, guess_max = 1e5)
+cat("dim:", nrow(donor_meta), "rows x", ncol(donor_meta), "columns;",
+    n_distinct(donor_meta$`Donor ID`), "donors\n")
+
+donor_coverage_all <- summarize_variable_coverage(donor_meta, id_col = "Donor ID")
+show_table(donor_coverage_all, "Full donor-metadata variable coverage (verbatim source columns)")
+```
+
+### 4.1 Concept map for the planned analysis
+
+Source column names are retained verbatim; the `concept` column is a label for us, not a rename.
+
+```{r}
+#| label: concept-map
+
+concept_map <- tribble(
+  ~concept,                              ~source_file,        ~source_column,
+  "SEA-AD Donor ID",                     "donor_metadata",    "Donor ID",
+  "CPS",                                 "specimen_index",    "Continuous Pseudo-progression Score",
+  "Age at death",                        "donor_metadata",    "Age at Death",
+  "Sex",                                 "donor_metadata",    "Sex",
+  "Education (categorical)",             "donor_metadata",    "Highest level of education",
+  "Education (years)",                   "donor_metadata",    "Years of education",
+  "APOE",                                "donor_metadata",    "APOE Genotype",
+  "Last CASI score",                     "donor_metadata",    "Last CASI Score",
+  "Interval last CASI to death (months)","donor_metadata",    "Interval from last CASI in months",
+  "PMI (hours)",                         "donor_metadata",    "PMI",
+  "Cognitive status (DSM-IV)",           "donor_metadata",    "Cognitive Status",
+  "Staging: overall ADNC",               "donor_metadata",    "Overall AD neuropathological Change",
+  "Staging: Thal phase",                 "donor_metadata",    "Thal",
+  "Staging: Braak stage",                "donor_metadata",    "Braak",
+  "Staging: CERAD score",                "donor_metadata",    "CERAD score",
+  "Staging: CAA",                        "donor_metadata",    "Overall CAA Score",
+  "Staging: Lewy body disease",          "donor_metadata",    "Highest Lewy Body Disease",
+  "Staging: LATE-NC",                    "donor_metadata",    "LATE",
+  "Vascular: atherosclerosis",           "donor_metadata",    "Atherosclerosis",
+  "Vascular: arteriolosclerosis",        "donor_metadata",    "Arteriolosclerosis",
+  "Vascular: microinfarcts",             "donor_metadata",    "Total Microinfarcts (not observed grossly)",
+  "Tissue quality: brain pH",            "donor_metadata",    "Brain pH",
+  "Tissue quality: RIN",                 "donor_metadata",    "RIN",
+  "Cohort flag: severely affected",      "donor_metadata",    "Severely Affected Donor"
+)
+
+specimen_index <- read.csv(paths$specimen_index, check.names = FALSE)
+
+coverage_lookup <- bind_rows(
+  summarize_variable_coverage(donor_meta, "Donor ID") %>% mutate(source_file = "donor_metadata"),
+  summarize_variable_coverage(specimen_index, "Donor ID") %>% mutate(source_file = "specimen_index")
+)
+
+donor_metadata_inventory <- concept_map %>%
+  left_join(coverage_lookup %>% select(source_file, source_column, n_donors,
+                                      n_nonmissing, pct_missing, example),
+            by = c("source_file", "source_column"))
+
+show_table(donor_metadata_inventory,
+           "Donor metadata inventory for the planned analysis")
+```
+
+### 4.2 CPS is not in the donor-metadata workbook
+
+The Continuous Pseudo-progression Score is **absent** from
+`sea-ad_cohort_donor_metadata_072524.xlsx`. It is present in `SpecimenMetadata.csv` in the same
+download directory, as `Continuous Pseudo-progression Score`, for all 84 donors.
+
+```{r}
+#| label: cps
+
+cat("specimen_index dim:", nrow(specimen_index), "x", ncol(specimen_index), "\n")
+show_table(
+  summarize_variable_coverage(specimen_index, "Donor ID"),
+  "SpecimenMetadata.csv variable coverage"
+)
+
+cps_summary <- specimen_index %>%
+  summarise(n = sum(!is.na(`Continuous Pseudo-progression Score`)),
+            min = min(`Continuous Pseudo-progression Score`),
+            q25 = quantile(`Continuous Pseudo-progression Score`, .25),
+            median = median(`Continuous Pseudo-progression Score`),
+            q75 = quantile(`Continuous Pseudo-progression Score`, .75),
+            max = max(`Continuous Pseudo-progression Score`))
+show_table(cps_summary, "CPS distribution across all 84 SEA-AD donors")
+```
+
+A second, *different* set of CPS columns exists in the pre-June-2026 caudate summary
+(`CPS`, `CPS_AT8`, `CPS_6E10`, 41 donors). Whether `CPS` there is the same quantity as
+`Continuous Pseudo-progression Score` is **not established by the shipped documentation**, so it
+is checked empirically rather than assumed.
+
+```{r}
+#| label: caudate-cps
+
+caudate_pre <- read.csv(paths$caudate_pre2026, check.names = FALSE)
+names(caudate_pre)[1] <- "Donor ID"
+
+show_table(
+  tibble(column = names(caudate_pre),
+         n_nonmissing = map_int(caudate_pre, ~ sum(!is.na(.x)))),
+  "Pre-June-2026 caudate summary: columns and coverage"
+)
+
+cps_join <- caudate_pre %>%
+  select(`Donor ID`, CPS, CPS_AT8, CPS_6E10) %>%
+  inner_join(specimen_index %>% select(`Donor ID`, `Continuous Pseudo-progression Score`),
+             by = "Donor ID")
+
+cps_agreement <- tibble(
+  n_joined = nrow(cps_join),
+  pearson_r = round(cor(cps_join$CPS,
+                        cps_join$`Continuous Pseudo-progression Score`,
+                        use = "complete.obs"), 4),
+  spearman_rho = round(cor(cps_join$CPS,
+                           cps_join$`Continuous Pseudo-progression Score`,
+                           method = "spearman", use = "complete.obs"), 4),
+  max_abs_diff = round(max(abs(cps_join$CPS -
+                               cps_join$`Continuous Pseudo-progression Score`), na.rm = TRUE), 4)
+)
+show_table(cps_agreement,
+           "Caudate-file CPS vs SpecimenMetadata CPS (agreement check, not a claim of equivalence)")
+```
+
+```{r}
+#| label: cps-verdict
+#| results: asis
+
+cat(sprintf(
+  "On the %d donors they share, the two CPS columns correlate at r = %.2f but differ by up to %.2f on a roughly 0-1 scale. **They are therefore not interchangeable**, and this notebook uses `Continuous Pseudo-progression Score` from `SpecimenMetadata.csv` (all 84 donors) as the CPS of record.\n",
+  cps_agreement$n_joined, cps_agreement$pearson_r, cps_agreement$max_abs_diff))
+```
+
+---
+
+## 5. Harmonized cognition (public)
+
+```{r}
+#| label: cognition
+
+cognition <- read_excel(paths$cognition, guess_max = 1e5)
+
+cognition_summary <- tibble(
+  n_rows_visits   = nrow(cognition),
+  n_donors        = n_distinct(cognition$`Donor ID`),
+  visits_per_donor_min = min(table(cognition$`Donor ID`)),
+  visits_per_donor_median = median(as.numeric(table(cognition$`Donor ID`))),
+  visits_per_donor_max = max(table(cognition$`Donor ID`)),
+  studies         = paste(sort(unique(cognition$study)), collapse = ", "),
+  visit_age_variable = "age_vis",
+  visit_index_variable = "visit"
+)
+show_table(cognition_summary, "Harmonized cognitive scores: shape")
+
+show_table(
+  summarize_variable_coverage(cognition, "Donor ID"),
+  "Harmonized cognition: variable coverage (verbatim source columns)"
+)
+```
+
+Structure of the file, as observed:
+
+- **Visit-level domain scores**: `MEM_E`, `EXF_E`, `LAN_E`, `VSP_E`, each with a paired standard
+  error `*_E_SE`. These vary within donor across `visit` / `age_vis`.
+- **Published slope variables**: `slope_zmem0`, `slope_zexf0`, `slope_zlan0`, `slope_zvsp0`,
+  `slope_zcasi_irt0`. These are constant within donor.
+- `...1` is an unnamed row index carried over from the export.
+
+```{r}
+#| label: cognition-slopes
+
+slope_vars <- c("slope_zmem0", "slope_zexf0", "slope_zlan0", "slope_zvsp0", "slope_zcasi_irt0")
+
+slope_constancy <- cognition %>%
+  group_by(`Donor ID`) %>%
+  summarise(across(all_of(slope_vars), ~ n_distinct(.x, na.rm = TRUE)), .groups = "drop") %>%
+  summarise(across(all_of(slope_vars), ~ max(.x)))
+
+show_table(slope_constancy,
+           "Distinct values per donor for each slope variable (1 = donor-constant)")
+
+slope_donor_level <- cognition %>%
+  select(`Donor ID`, all_of(slope_vars)) %>%
+  distinct()
+
+show_table(
+  map_dfr(slope_vars, ~ bind_cols(tibble(variable = .x),
+                                  tibble(n_donors_with_value =
+                                           sum(!is.na(slope_donor_level[[.x]]))),
+                                  numeric_distribution(slope_donor_level[[.x]]))),
+  "Donor-level distribution of the published slope variables"
+)
+
+show_table(
+  map_dfr(c("MEM_E", "EXF_E", "LAN_E", "VSP_E", "age_vis"),
+          ~ bind_cols(tibble(variable = .x),
+                      tibble(n_visits_with_value = sum(!is.na(cognition[[.x]]))),
+                      numeric_distribution(cognition[[.x]]))),
+  "Visit-level distribution of the harmonized domain scores"
+)
+```
+
+The shipped files contain **no codebook for these slope variables**. `slope_zcasi_irt0` is an
+IRT-scaled CASI slope and `Last CASI Score` in the donor metadata is a raw CASI point score
+(0–100); they are related but not interchangeable, and this notebook does not treat them as
+equivalent. See section 8.
+
+---
+
+## 6. Donor overlap across sources
+
+```{r}
+#| label: donor-sets
+
+qnp_donors <- qnp %>% map(~ unique(.x[["Donor ID"]])) %>% unlist() %>% unique()
+meta_donors <- unique(donor_meta$`Donor ID`)
+cog_donors <- unique(cognition$`Donor ID`)
+cps_donors <- unique(specimen_index$`Donor ID`)
+
+overlap <- tribble(
+  ~set,                                  ~n,
+  "QNP donors (any sheet)",              length(qnp_donors),
+  "Donor-metadata donors",               length(meta_donors),
+  "Cognition donors",                    length(cog_donors),
+  "Specimen-index (CPS) donors",         length(cps_donors),
+  "QNP INT metadata",                    length(intersect(qnp_donors, meta_donors)),
+  "QNP INT cognition",                   length(intersect(qnp_donors, cog_donors)),
+  "QNP INT CPS",                         length(intersect(qnp_donors, cps_donors)),
+  "QNP INT metadata INT cognition",      length(reduce(list(qnp_donors, meta_donors, cog_donors), intersect)),
+  "QNP INT metadata INT cognition INT CPS",
+    length(reduce(list(qnp_donors, meta_donors, cog_donors, cps_donors), intersect))
+)
+show_table(overlap, "Donor-identifier overlap (exact match on the SEA-AD Donor ID)")
+```
+
+```{r}
+#| label: donor-failures
+
+failures <- bind_rows(
+  tibble(donor_id = setdiff(qnp_donors, cog_donors), missing_from = "cognition", present_in = "QNP"),
+  tibble(donor_id = setdiff(meta_donors, cog_donors), missing_from = "cognition", present_in = "donor metadata"),
+  tibble(donor_id = setdiff(cog_donors, meta_donors), missing_from = "donor metadata", present_in = "cognition"),
+  tibble(donor_id = setdiff(qnp_donors, meta_donors), missing_from = "donor metadata", present_in = "QNP"),
+  tibble(donor_id = setdiff(qnp_donors, cps_donors), missing_from = "specimen index (CPS)", present_in = "QNP")
+) %>%
+  distinct()
+
+if (nrow(failures)) {
+  show_table(failures, "Donor identifiers that fail to join (no heuristic matching attempted)")
+} else {
+  cat("All donor identifiers join exactly.\n")
+}
+```
+
+### 6.1 Cross-source donor coverage table
+
+```{r}
+#| label: donor-coverage-table
+
+qnp_per_sheet <- imap_dfr(qnp, ~ tibble(donor_id = unique(.x[["Donor ID"]]), sheet = .y))
+
+donor_coverage <- tibble(donor_id = sort(unique(c(qnp_donors, meta_donors, cog_donors, cps_donors)))) %>%
+  mutate(
+    has_qnp       = donor_id %in% qnp_donors,
+    has_metadata  = donor_id %in% meta_donors,
+    has_cognition = donor_id %in% cog_donors,
+    has_cps       = donor_id %in% cps_donors
+  ) %>%
+  left_join(qnp_per_sheet %>% count(donor_id, name = "n_qnp_sheets"), by = "donor_id") %>%
+  mutate(n_qnp_sheets = replace_na(n_qnp_sheets, 0L))
+
+show_table(
+  donor_coverage %>% count(has_qnp, has_metadata, has_cognition, has_cps, name = "n_donors"),
+  "Cross-source donor coverage, summarised"
+)
+
+show_table(
+  donor_coverage %>% filter(!(has_qnp & has_metadata & has_cognition & has_cps)),
+  "Donors not covered by all four sources"
+)
+
+show_table(
+  donor_coverage %>% count(n_qnp_sheets, name = "n_donors"),
+  "Donors by number of QNP sheets they appear in"
+)
+```
+
+Per-sheet donor counts determine the usable n for any region-specific analysis:
+
+```{r}
+#| label: analysis-n
+
+analysis_n <- qnp_inventory %>%
+  select(sheet, n_donors) %>%
+  mutate(
+    n_with_cps = map_int(sheet, ~ length(intersect(unique(qnp[[.x]][["Donor ID"]]), cps_donors))),
+    n_with_cognition = map_int(sheet, ~ length(intersect(unique(qnp[[.x]][["Donor ID"]]), cog_donors))),
+    n_with_last_casi = map_int(sheet, function(s) {
+      d <- unique(qnp[[s]][["Donor ID"]])
+      sum(!is.na(donor_meta$`Last CASI Score`[donor_meta$`Donor ID` %in% d]))
+    })
+  )
+
+show_table(analysis_n, "Usable donor n per QNP sheet after joining CPS / cognition / CASI")
+```
+
+---
+
+## 7. Exploratory figures
+
+```{r}
+#| label: fig-donor-counts
+#| fig-width: 9
+#| fig-height: 5
+#| fig-cap: "Donors per QNP sheet and brain region, at grey-matter resolution."
+
+region_grid %>%
+  filter(analysis_region == "Grey matter") %>%
+  mutate(label = paste0(sheet, " / ", brain_region)) %>%
+  ggplot(aes(x = reorder(label, n_donors), y = n_donors)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = n_donors), hjust = -0.2, size = 3) +
+  coord_flip() +
+  expand_limits(y = 95) +
+  labs(x = NULL, y = "donors with grey-matter rows",
+       title = "QNP donor coverage by sheet and brain region") +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-coverage-heatmap
+#| fig-width: 10
+#| fig-height: 7
+#| fig-cap: "Non-missing donor counts for each candidate marker column, by sheet, at grey matter."
+
+qnp_candidates %>%
+  filter(analysis_region == "Grey matter", !is_colocalization) %>%
+  mutate(panel = paste0(sheet, "/", brain_region)) %>%
+  ggplot(aes(x = panel, y = source_column, fill = n_nonmissing)) +
+  geom_tile(colour = "white") +
+  scale_fill_viridis_c(option = "mako", direction = -1, na.value = "grey90") +
+  facet_grid(marker ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  labs(x = NULL, y = NULL, fill = "donors with\na value",
+       title = "Candidate marker coverage at grey-matter resolution") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text.y.left = element_text(angle = 0),
+        panel.grid = element_blank())
+```
+
+```{r}
+#| label: fig-distributions
+#| fig-width: 10
+#| fig-height: 6
+#| fig-cap: "Distribution of one percent-area candidate per marker at MTG grey matter (log10 x-axis; zeros dropped by the log scale are annotated)."
+
+pct_area_cols <- c("percent 6e10 positive area", "percent AT8 positive area",
+                   "percent NeuN positive area", "percent Iba1 positive area",
+                   "percent GFAP positive area")
+
+mtg_grey <- qnp$MTG %>% filter(`analysis region` == "Grey matter")
+
+mtg_long <- mtg_grey %>%
+  select(`Donor ID`, all_of(pct_area_cols)) %>%
+  pivot_longer(-`Donor ID`, names_to = "source_column", values_to = "value")
+
+mtg_long %>%
+  filter(value > 0) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 25, fill = "grey30") +
+  scale_x_log10() +
+  facet_wrap(~ source_column, scales = "free", ncol = 3) +
+  labs(x = "% of analysed area (log10)", y = "donors",
+       title = "MTG grey matter: percent-positive-area candidates",
+       caption = paste0("zeros excluded: ",
+                        paste(mtg_long %>% filter(value == 0) %>% count(source_column) %>%
+                                mutate(s = paste0(source_column, " (", n, ")")) %>% pull(s),
+                              collapse = "; "))) +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-layer-grain
+#| fig-width: 9
+#| fig-height: 4.5
+#| fig-cap: "Layer-level values are not exchangeable with the grey-matter summary; both are kept."
+
+qnp$MTG %>%
+  select(`Donor ID`, `analysis region`,
+         `percent 6e10 positive area`, `percent AT8 positive area`) %>%
+  pivot_longer(c(`percent 6e10 positive area`, `percent AT8 positive area`),
+               names_to = "source_column", values_to = "value") %>%
+  mutate(`analysis region` = factor(`analysis region`,
+                                    levels = c("Grey matter", "Layer1", "Layer2", "Layer3",
+                                               "Layer4", "Layer5-6"))) %>%
+  ggplot(aes(x = `analysis region`, y = value)) +
+  geom_boxplot(outlier.size = 0.7, fill = "grey90") +
+  facet_wrap(~ source_column, scales = "free_y") +
+  labs(x = NULL, y = "% of analysed area",
+       title = "MTG: grey matter vs cortical layers") +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-cps
+#| fig-width: 8
+#| fig-height: 4
+#| fig-cap: "CPS among donors that have QNP data, split by clinical cognitive status."
+
+cps_donors_df <- specimen_index %>%
+  filter(`Donor ID` %in% qnp_donors) %>%
+  left_join(donor_meta %>% select(`Donor ID`, `Cognitive Status`), by = "Donor ID")
+
+ggplot(cps_donors_df, aes(x = `Continuous Pseudo-progression Score`, fill = `Cognitive Status`)) +
+  geom_histogram(bins = 25, position = "stack") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = "Continuous Pseudo-progression Score", y = "donors",
+       title = paste0("CPS among the ", nrow(cps_donors_df), " QNP donors")) +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-marker-vs-cps
+#| fig-width: 10
+#| fig-height: 6
+#| fig-cap: "Sanity check only: MTG grey-matter percent-positive-area candidates against CPS. No model is fitted."
+
+mtg_long %>%
+  left_join(specimen_index %>% select(`Donor ID`, CPS = `Continuous Pseudo-progression Score`),
+            by = "Donor ID") %>%
+  ggplot(aes(x = CPS, y = value)) +
+  geom_point(alpha = 0.6, size = 1.6) +
+  geom_smooth(method = "loess", se = FALSE, colour = "firebrick", linewidth = 0.6) +
+  facet_wrap(~ source_column, scales = "free_y", ncol = 3) +
+  labs(x = "Continuous Pseudo-progression Score", y = "% of analysed area",
+       title = "MTG grey matter vs CPS (exploratory)") +
+  theme_minimal()
+```
+
+---
+
+## 8. What still needs scientific review
+
+Section 3 closed several of the questions this notebook opened. What follows separates what the
+June 2026 white paper settled from what remains genuinely open.
+
+### 8.1 Resolved by the June 2026 white paper
+
+```{r}
+#| label: resolved-items
+
+resolved <- tribble(
+  ~item, ~resolution, ~basis,
+
+  "'percent ... positive area' denominator",
+  "The tissue area analysed for that stain's own slide, within the row's own analysis region. Each stain group carries its own 'area analyzed' column, so different markers are normalised to different denominators (~2-4% apart) on the same donor and region.",
+  "WP2026 schema + Table 6; arithmetic verified against the deprecated MTG sheet in 3.3",
+
+  "Layer-specific denominators",
+  "Yes. Layer rows use that layer's analysed area. Using a shared grey-matter denominator instead would be wrong by up to several percentage points.",
+  "WP2026: 'analysis region ... the area over which features were quantified'; contrast test in 3.3",
+
+  "What 'Grey matter' means for layered cortex",
+  "Exactly the union of Layer1..Layer5-6 - the grey-matter analysed area equals the sum of the five layer areas to machine precision. Grey matter and layer rows are nested, not independent.",
+  "Verified in 3.3 (no WP2026 statement either way)",
+
+  "'cells per area' construction",
+  "Raw count divided by that stain's analysed area for that analysis region, per um^2.",
+  "WP2026 Table 6 states the unit for 6E10 only; identity verified numerically for AT8, NeuN, IBA1 and Hematoxylin in 3.3",
+
+  "Do the 6E10 plaque subtypes partition the total?",
+  "No. Their sum is typically ~2.4x 'percent 6e10 positive area', individual subtypes routinely exceed it, and they do not sum to 100 either. They sit on a denominator WP2026 does not state.",
+  "Verified in 3.3",
+
+  "Do activated + inactivated IBA1 cells partition IBA1+ cells?",
+  "Yes, exactly - the two counts sum to the total with zero residual.",
+  "Verified in 3.3",
+
+  "Is a preferred/default burden measure designated by SEA-AD?",
+  "No. WP2026 explicitly puts the choice on the analyst: 'please consider whether the appropriate feature (column) is being used for a given analysis.'",
+  "WP2026, tutorial section"
+)
+
+show_table(resolved, "Questions closed by the June 2026 documentation and direct verification")
+```
+
+### 8.2 Still unresolved
+
+```{r}
+#| label: ambiguities
+
+ambiguities <- tribble(
+  ~item, ~question, ~blocks,
+
+  "6E10 plaque subtype definitions",
+  "'percent 6e10 dense core plaque area', 'diffuse' and 'fibrilar' are listed in WP2026 but neither the classifier nor the denominator is defined. Section 3.3 shows they are not a decomposition of total 6E10. They also exist only at grey matter.",
+  "any use of plaque-subtype variables",
+
+  "IBA1 activated / inactivated classifier",
+  "WP2026 names the HALO 'Microglia module' but gives no morphological criteria or threshold. The split is an exact partition, so the criterion is deterministic - it is simply not published.",
+  "the most interpretable microglial variable",
+
+  "Definition of an IBA1 'process'",
+  "'total IBA1 positive process area/length' and the per-cell averages are listed with units for the totals only. What counts as a process, and the unit of the per-cell forms, are not stated.",
+  "IBA1 morphology as a primary metric",
+
+  "Units of 'per area' for AT8, NeuN and IBA1",
+  "WP2026 states 'per um^2' for 6E10 only. The identical construction is confirmed numerically for the others (3.3), but it is not written down per marker.",
+  "nothing in practice; downgrades those rows to partially_resolved",
+
+  "GFAP branch metrics",
+  "WP2026 Table 6 lists 'average GFAP positive branch area' and 'average GFAP positive length' as HALO outputs, but the 2026 schema omits them from the released GFAP feature set. They survive only in the deprecated Gabitto MTG sheet, without units.",
+  "any GFAP morphology analysis",
+
+  "Colocalization denominator",
+  "'percent of 6e10 positive objects colocalized with Iba1 positive objects' - Table 5 gives 'Percent of object 1 and 2 colocalized' without saying which object indexes the denominator.",
+  "plaque-associated-microglia measures",
+
+  "Empty AT8 density column for ESOC",
+  "'number of AT8 positive cells per area' is present but entirely NA for all 84 ESOC rows while 'percent AT8 positive area' is complete. WP2026 claims curation validation found 'no unexpected missing values'.",
+  "nothing, if percent-area is used for pTau",
+
+  "Partial NeuN coverage in ITG, CaH, ESOC and V1C",
+  "NeuN is non-missing for only 29/43 ITG and 37/42 CaH donors, and 80/84 in ESOC and V1C. The reason is not documented, so the missingness mechanism is unknown and may not be ignorable.",
+  "the NeuN primary term",
+
+  "Why 'percent NeuN positive area' is absent from 6 of 11 regions",
+  "The column simply does not exist for DFC, STG, HIP, MEC, AnG or FI, although 'number of NeuN positive cells per area' does. WP2026 says only that 'not every stain is present for every region', which does not explain a missing feature within a present stain.",
+  "using the percent-area family uniformly across markers",
+
+  "tangle_per_tissue_area_um^2 (Kana 2026)",
+  "Present only in the Kana caudate tab. Its relationship to 'number of AT8 positive cells per area' is not documented.",
+  "caudate-specific pTau analyses",
+
+  "CPS provenance",
+  "'Continuous Pseudo-progression Score' in SpecimenMetadata.csv vs 'CPS' / 'CPS_AT8' / 'CPS_6E10' in the pre-June-2026 caudate file. Section 4.2 shows these disagree materially. Neither file ships a definition, and CPS is absent from the donor-metadata workbook entirely.",
+  "the outcome variable's provenance",
+
+  "slope_zcasi_irt0 vs Last CASI Score",
+  "An IRT-scaled longitudinal slope and a raw last-visit CASI point score. Not treated as interchangeable here; no codebook ships with the cognition workbook.",
+  "the cognition outcome",
+
+  "Hip-MEC entorhinal sampling",
+  "'EC-L'/'EC-R' appear under brain region HIP and 'TEC-L'/'TEC-R' under MEC. Whether these are the same cortical territory sampled on different blocks needs confirmation.",
+  "hippocampal/entorhinal subfield analyses"
+)
+
+show_table(ambiguities, "Open questions requiring scientific review before variable selection")
+```
+
+---
+## 9. Proposed primary metrics
+
+These are **proposals for review, not enforced selections**. Nothing in this notebook filters,
+renames or drops the alternatives; §2 and §3 keep every candidate column visible.
+
+### 9.1 Is the common "percent positive area" family sufficient for cross-region use?
+
+The obvious move is to use one metric family — `percent <marker> positive area` — for all four
+non-microglial markers. Semantically that family is sound: §3.4 marks all four as `resolved`, on
+an identical construction (stain-specific analysed area, own analysis region). The obstacle is
+availability, not meaning.
+
+```{r}
+#| label: percent-family-coverage
+
+percent_family <- c("percent 6e10 positive area", "percent AT8 positive area",
+                    "percent NeuN positive area", "percent GFAP positive area")
+
+grey_coverage <- function(cols) {
+  map_dfr(primary_sheets, function(s) {
+    d <- qnp[[s]] %>% filter(`analysis region` == "Grey matter")
+    map_dfr(unique(d[["brain region"]]), function(br) {
+      x <- d %>% filter(`brain region` == br)
+      map_dfr(cols, function(cc) {
+        tibble(sheet = s, brain_region = br, source_column = cc,
+               present = cc %in% names(x),
+               n_donors = nrow(x),
+               n_nonmissing = if (cc %in% names(x)) sum(!is.na(x[[cc]])) else NA_integer_)
+      })
+    })
+  })
+}
+
+percent_cov <- grey_coverage(percent_family)
+
+show_table(
+  percent_cov %>%
+    mutate(cell = case_when(!present ~ "absent",
+                            n_nonmissing == 0 ~ "empty",
+                            n_nonmissing < n_donors ~ paste0(n_nonmissing, "/", n_donors),
+                            TRUE ~ paste0(n_nonmissing, "/", n_donors))) %>%
+    select(brain_region, source_column, cell) %>%
+    pivot_wider(names_from = source_column, values_from = cell),
+  "Grey-matter coverage of the percent-positive-area family, by brain region"
+)
+
+show_table(
+  percent_cov %>%
+    group_by(source_column) %>%
+    summarise(regions_with_column = sum(present),
+              regions_total = n(),
+              regions_complete = sum(present & n_nonmissing == n_donors, na.rm = TRUE),
+              .groups = "drop"),
+  "Regions covered by each percent-positive-area metric (11 brain regions total)"
+)
+```
+
+**Verdict: the family works for Aβ, pTau and GFAP, and breaks for NeuN.**
+`percent NeuN positive area` exists in only 5 of the 11 brain regions — it is absent from DFC,
+STG, HIP, MEC, AnG and FI — so it cannot carry a cross-region NeuN term. `number of NeuN positive
+cells per area` is present in 9 of 11. The NeuN problem is a coverage problem, not a semantic one.
+
+```{r}
+#| label: neun-alternatives
+
+show_table(
+  grey_coverage(c("percent NeuN positive area", "number of NeuN positive cells per area",
+                  "average NeuN positive cell area")) %>%
+    mutate(cell = if_else(!present, "absent", paste0(n_nonmissing, "/", n_donors))) %>%
+    select(brain_region, source_column, cell) %>%
+    pivot_wider(names_from = source_column, values_from = cell),
+  "NeuN metrics side by side: the density variant has wider regional coverage"
+)
+```
+
+### 9.2 IBA1, treated separately
+
+IBA1 is not one quantity. The release carries three biologically distinct families plus an
+activation split, and they do not stand in for one another.
+
+```{r}
+#| label: iba1-families
+
+iba1_cols <- c("percent Iba1 positive area",
+               "number of Iba1 positive cells per area",
+               "number of activated Iba1 positive cells per area",
+               "number of inactivated Iba1 positive cells per area",
+               "average Iba1 positive process area per cell",
+               "average Iba1 positive process length per cell")
+
+iba1_cov <- grey_coverage(iba1_cols)
+
+show_table(
+  qnp_measurement_dictionary %>%
+    filter(source_column %in% iba1_cols) %>%
+    select(source_column, measurement_family, biological_quantity, semantic_status) %>%
+    left_join(iba1_cov %>%
+                group_by(source_column) %>%
+                summarise(regions_with_column = sum(present), .groups = "drop"),
+              by = "source_column"),
+  "IBA1 measurement families, their semantic status and regional coverage"
+)
+```
+
+Areal burden, cell density and per-cell process morphology can move in opposite directions — a
+region can lose microglia while the survivors ramify, raising process length per cell while cell
+density falls. Collapsing them into "IBA1" would mix those. The activation split is an exact
+partition of IBA1+ cells (§3.3) but its criteria are undocumented, so it cannot be interpreted.
+
+### 9.3 Proposal
+
+```{r}
+#| label: primary-proposal
+
+metric_coverage <- grey_coverage(c(percent_family, iba1_cols,
+                                   "number of NeuN positive cells per area")) %>%
+  group_by(source_column) %>%
+  summarise(cross_region_coverage = sprintf("%d/11 regions; complete in %d",
+                                            sum(present),
+                                            sum(present & n_nonmissing == n_donors, na.rm = TRUE)),
+            .groups = "drop")
+
+proposal <- tribble(
+  ~marker, ~proposed_primary_metric, ~reason, ~remaining_caveat,
+
+  "Ab (6E10)", "percent 6e10 positive area",
+  "Semantics resolved (WP2026 Table 6 + schema, arithmetic verified in 3.3); present and complete in every brain region; same construction as the pTau and GFAP primaries.",
+  "Denominator is the 6E10/IBA1 slide's analysed area, which differs from the AT8 and NeuN slides' by ~2-4%. Percent-area saturates in high-burden donors; the plaque subtypes that might separate plaque types are unresolved.",
+
+  "pTau (AT8)", "percent AT8 positive area",
+  "Semantics resolved; present and complete in all 11 regions. The density alternative is entirely empty for ESOC, so percent-area is strictly better covered.",
+  "Area fraction conflates tangle number with tangle size; 'average AT8 positive cell area' exists only in MTG and STG, so that cannot be adjusted for cross-region.",
+
+  "NeuN", "number of NeuN positive cells per area",
+  "The percent-area variant covers only 5 of 11 regions and cannot support a cross-region term. The density variant covers 9 of 11 and is the closer construct for neuronal loss anyway.",
+  "Unit is only partially_resolved (per um^2 verified numerically on MTG, not stated in WP2026 for NeuN). Incomplete in CaH (37/42), ITG (29/43), ESOC and V1C (80/84); absent in AnG and FI. Missingness mechanism undocumented.",
+
+  "GFAP", "percent GFAP positive area",
+  "Semantics resolved; the only GFAP metric in the 2026 release; present in 9 of 11 regions.",
+  "Absent in AnG and FI (no GFAP stain there), 83/84 in ESOC and V1C. No alternative GFAP metric exists in the current release to cross-check against.",
+
+  "IBA1", "NONE YET - do not enter a single IBA1 term",
+  "IBA1 spans three distinct families (areal burden, cell density, per-cell process morphology) that can move in opposite directions. If one term is required, 'number of Iba1 positive cells per area' has the widest coverage (9 of 11 regions).",
+  "The activated/inactivated split is an exact partition but its criteria are undocumented, so the most interpretable microglial variable is unusable. 'percent Iba1 positive area' is absent in AnG, CaH and FI. Choose the family on scientific grounds before modelling, not on coverage."
+) %>%
+  left_join(metric_coverage %>% rename(proposed_primary_metric = source_column),
+            by = "proposed_primary_metric") %>%
+  mutate(cross_region_coverage = replace_na(cross_region_coverage,
+                                            "n/a - no single metric proposed")) %>%
+  relocate(marker, proposed_primary_metric, reason, cross_region_coverage, remaining_caveat)
+
+show_table(proposal %>% select(marker, proposed_primary_metric, cross_region_coverage),
+           "Proposed primary metrics (1/2)")
+```
+
+```{r}
+#| label: primary-proposal-detail
+
+show_table(proposal %>% select(marker, reason), "Proposed primary metrics: reason")
+show_table(proposal %>% select(marker, remaining_caveat), "Proposed primary metrics: remaining caveat")
+```
+
+### 9.4 Which markers are not ready for the primary model
+
+```{r}
+#| label: readiness
+
+readiness <- tribble(
+  ~marker, ~ready_for_primary_model, ~blocking_issue,
+  "Ab (6E10)", "yes", "none - semantics resolved and coverage complete",
+  "pTau (AT8)", "yes", "none - semantics resolved and coverage complete",
+  "GFAP", "yes, for 9 of 11 regions", "no GFAP stain in AnG or FI; those regions must be dropped from any GFAP term rather than imputed",
+  "NeuN", "conditionally", "the resolved metric (percent positive area) covers 5 of 11 regions; the covering metric (cells per area) has a unit that WP2026 does not state. Needs a decision on which trade-off is acceptable.",
+  "IBA1", "no", "no scientific basis yet for choosing among three distinct measurement families; activation classifier undocumented"
+)
+
+show_table(readiness, "Readiness of each marker for the primary regional analysis")
+```
+
+---
+## 10. Candidate primary regional QNP table
+
+This section constructs the donor x brain-region table that a regional analysis would consume.
+It is a **candidate**: the variable definitions are provisional, the ROI set is deliberately not
+chosen, and nothing here is written to disk.
+
+### 10.1 Definitions and guardrails
+
+```{r}
+#| label: primary-spec
+
+primary_spec <- qnp_primary_spec()
+
+show_table(
+  primary_spec %>%
+    left_join(qnp_measurement_dictionary %>%
+                select(source_column, unit, semantic_status),
+              by = "source_column"),
+  "Provisional primary variable definitions, with the semantics established in section 3"
+)
+```
+
+`block` splits the four into the **P**athology pair (Aβ, pTau) and the **H**ost-response /
+cellular pair (NeuN, GFAP). That grouping is this notebook's shorthand for the `n_complete_P` /
+`n_complete_H` counts below and is not a SEA-AD convention — say so if you meant something else
+by P/H.
+
+Guardrails applied, and asserted in code rather than asserted in prose:
+
+```{r}
+#| label: primary-guardrails
+
+primary_long <- qnp_primary_long(qnp)
+
+stopifnot(
+  "only the nine current-release per-region tabs may be used" =
+    setequal(unique(primary_long$source_sheet), QNP_PRIMARY_SHEETS),
+  "the deprecated Gabitto sheet must not contribute" =
+    !"Gabitto 2024 (deprecated; MTG)" %in% primary_long$source_sheet,
+  "the redundant Travaglini and Kana views must not contribute" =
+    !any(c("Travaglini 2026 (multi-region)", "Kana 2026 (CaH)") %in% primary_long$source_sheet),
+  "only Grey matter rows may be used" =
+    identical(unique(primary_long$analysis_region), "Grey matter"),
+  "IBA1 must not be in the primary set" =
+    !"IBA1" %in% primary_spec$marker
+)
+
+cat("guardrail assertions passed\n")
+cat("donor x region rows at Grey matter:", n_distinct(primary_long$donor_id, primary_long$brain_region), "\n")
+cat("brain regions:", n_distinct(primary_long$brain_region), "\n")
+```
+
+The row count matches the 758 grey-matter rows of the `Travaglini 2026 (multi-region)` summary
+tab (§1.6), which is an independent check that no region or donor has been dropped or duplicated.
+
+### 10.2 CPS source assertion
+
+```{r}
+#| label: cps-assertion
+
+cps_column <- "Continuous Pseudo-progression Score"
+cps_source <- paths$specimen_index
+
+caudate_cps <- read.csv(paths$caudate_pre2026, check.names = FALSE)
+names(caudate_cps)[1] <- "Donor ID"
+
+stopifnot(
+  "CPS must come from SpecimenMetadata.csv" =
+    basename(cps_source) == "SpecimenMetadata.csv",
+  "CPS must appear under its exact source column name" =
+    cps_column %in% names(specimen_index),
+  "CPS must be complete for all 84 SEA-AD donors" =
+    sum(!is.na(specimen_index[[cps_column]])) == 84L,
+  "the pre-June-2026 caudate CPS must not be the source" =
+    !identical(normalizePath(cps_source), normalizePath(paths$caudate_pre2026)),
+  "the caudate CPS is a demonstrably different quantity and must stay excluded" =
+    max(abs(
+      inner_join(caudate_cps %>% select(`Donor ID`, CPS),
+                 specimen_index %>% select(`Donor ID`, all_of(cps_column)),
+                 by = "Donor ID") %>%
+        transmute(d = CPS - .data[[cps_column]]) %>% pull(d)
+    ), na.rm = TRUE) > 0.1
+)
+
+cat("CPS source:", basename(cps_source), "\n")
+cat("CPS column :", cps_column, "\n")
+cat("CPS donors :", sum(!is.na(specimen_index[[cps_column]])), "\n")
+cat("assertions passed - the caudate-file CPS is excluded\n")
+```
+
+The last assertion is deliberately adversarial: it *requires* the two CPS columns to disagree, so
+that if a future release silently reconciles them this chunk fails and forces a re-read rather
+than quietly changing the outcome variable.
+
+### 10.3 Missingness classification
+
+Every donor x region x variable cell is classified. `structurally_unavailable_for_region` means
+the stain has no column at all in that region's tab; `source_metric_unavailable` means the stain
+is present but this particular metric was not released; `assayed_but_missing` means the column
+exists and the value is absent.
+
+```{r}
+#| label: missingness-tally
+
+QNP_MISSINGNESS_LEVELS <- c("observed", "assayed_but_missing",
+                            "source_metric_unavailable",
+                            "structurally_unavailable_for_region")
+
+show_table(
+  primary_long %>%
+    mutate(status = factor(status, levels = QNP_MISSINGNESS_LEVELS)) %>%
+    count(variable, status, name = "n_cells", .drop = FALSE) %>%
+    pivot_wider(names_from = status, values_from = n_cells, values_fill = 0L),
+  "Missingness class by primary variable (758 donor x region cells each)"
+)
+```
+
+```{r}
+#| label: missingness-by-region
+
+show_table(
+  primary_long %>%
+    filter(status != "observed") %>%
+    count(brain_region, variable, status, name = "n_donors") %>%
+    arrange(brain_region, variable),
+  "Where the primary block is incomplete, and why"
+)
+```
+
+`source_metric_unavailable` does not arise for the primary set, because the NeuN *density* column
+exists wherever the NeuN stain does. It is not a hypothetical category, though — it is exactly
+what happens if the NeuN percent-area variant is substituted:
+
+```{r}
+#| label: source-metric-unavailable-demo
+
+neun_pct_spec <- primary_spec %>%
+  mutate(source_column = if_else(variable == "neun_cells_per_area",
+                                 "percent NeuN positive area", source_column))
+
+show_table(
+  qnp_primary_long(qnp, spec = neun_pct_spec) %>%
+    filter(variable == "neun_cells_per_area") %>%
+    count(brain_region, status, name = "n_donors") %>%
+    pivot_wider(names_from = status, values_from = n_donors, values_fill = 0L),
+  "Same classifier with 'percent NeuN positive area' substituted: DFC, HIP, MEC and STG have the NeuN stain but not that metric"
+)
+```
+
+That contrast is the reason the density metric was proposed in §9: in DFC, HIP, MEC and STG the
+NeuN stain *was* run and the percent-area column simply is not released, whereas in AnG and FI
+there is no NeuN at all.
+
+### 10.4 The candidate table
+
+```{r}
+#| label: build-primary-table
+
+qnp_primary_candidate <- qnp_primary_wide(primary_long) %>%
+  left_join(
+    specimen_index %>%
+      select(donor_id = `Donor ID`, CPS = all_of(cps_column)) %>%
+      mutate(cps_source = "SpecimenMetadata.csv :: Continuous Pseudo-progression Score"),
+    by = "donor_id"
+  )
+
+stopifnot(
+  "the join must not duplicate donor x region rows" =
+    nrow(qnp_primary_candidate) == nrow(qnp_primary_wide(primary_long)),
+  "CPS must be present for every row" =
+    all(!is.na(qnp_primary_candidate$CPS)),
+  "no imputation: observed cells must equal non-missing cells" =
+    sum(primary_long$status == "observed") ==
+      sum(!is.na(qnp_primary_candidate[primary_spec$variable]))
+)
+
+cat("rows:", nrow(qnp_primary_candidate), " columns:", ncol(qnp_primary_candidate), "\n")
+cat(paste(names(qnp_primary_candidate), collapse = "\n"), "\n")
+```
+
+```{r}
+#| label: primary-table-preview
+
+show_table(
+  qnp_primary_candidate %>%
+    filter(brain_region %in% c("MTG", "AnG", "ITG")) %>%
+    group_by(brain_region) %>%
+    slice_head(n = 3) %>%
+    ungroup() %>%
+    select(donor_id, brain_region, source_sheet,
+           abeta_percent_positive_area, ptau_percent_positive_area,
+           neun_cells_per_area, gfap_percent_positive_area, CPS),
+  "Candidate table, three donors from each of three contrasting regions"
+)
+
+show_table(
+  qnp_primary_candidate %>%
+    filter(brain_region %in% c("MTG", "AnG", "ITG")) %>%
+    group_by(brain_region) %>%
+    slice_head(n = 3) %>%
+    ungroup() %>%
+    select(donor_id, brain_region, ends_with("_status")),
+  "...and the matching missingness classes"
+)
+```
+
+Provenance is carried three ways: `source_sheet` on every row, a `_status` column per variable,
+and the `source_column` mapping in `primary_spec`. Nothing is renamed away from its source
+without that mapping being visible.
+
+### 10.5 Coverage by brain region
+
+```{r}
+#| label: coverage-by-region
+
+is_obs <- function(x) !is.na(x)
+
+coverage_by_region <- qnp_primary_candidate %>%
+  group_by(brain_region) %>%
+  summarise(
+    n_donors_total = n(),
+    n_abeta = sum(is_obs(abeta_percent_positive_area)),
+    n_ptau  = sum(is_obs(ptau_percent_positive_area)),
+    n_neun  = sum(is_obs(neun_cells_per_area)),
+    n_gfap  = sum(is_obs(gfap_percent_positive_area)),
+    n_complete_P = sum(is_obs(abeta_percent_positive_area) & is_obs(ptau_percent_positive_area)),
+    n_complete_H = sum(is_obs(neun_cells_per_area) & is_obs(gfap_percent_positive_area)),
+    n_complete_PH = sum(is_obs(abeta_percent_positive_area) & is_obs(ptau_percent_positive_area) &
+                        is_obs(neun_cells_per_area) & is_obs(gfap_percent_positive_area)),
+    n_complete_PH_CPS = sum(is_obs(abeta_percent_positive_area) & is_obs(ptau_percent_positive_area) &
+                            is_obs(neun_cells_per_area) & is_obs(gfap_percent_positive_area) &
+                            is_obs(CPS)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_complete_PH_CPS), brain_region)
+
+show_table(coverage_by_region, "Primary-block coverage by brain region (Grey matter only)")
+```
+
+`n_complete_PH_CPS` equals `n_complete_PH` in every region: CPS is complete for all 84 donors, so
+it never costs a row. The binding constraint is entirely the H block.
+
+### 10.6 Requiring all four variables simultaneously
+
+Within a region, "all four" is `n_complete_PH` above. Across regions the picture is harsher,
+because a donor must clear every region in the set:
+
+```{r}
+#| label: simultaneous-donors
+
+ph_cps_ok <- qnp_primary_candidate %>%
+  mutate(ok = is_obs(abeta_percent_positive_area) & is_obs(ptau_percent_positive_area) &
+              is_obs(neun_cells_per_area) & is_obs(gfap_percent_positive_area) & is_obs(CPS))
+
+show_table(
+  ph_cps_ok %>%
+    group_by(donor_id) %>%
+    summarise(n_regions_complete = sum(ok), .groups = "drop") %>%
+    count(n_regions_complete, name = "n_donors") %>%
+    arrange(desc(n_regions_complete)),
+  "Donors by the number of brain regions in which all four QNP variables plus CPS are observed"
+)
+
+donors_complete_in <- function(regions) {
+  ph_cps_ok %>%
+    filter(brain_region %in% regions) %>%
+    group_by(donor_id) %>%
+    summarise(k = sum(ok), .groups = "drop") %>%
+    filter(k == length(regions)) %>%
+    nrow()
+}
+
+all_regions <- sort(unique(qnp_primary_candidate$brain_region))
+
+show_table(
+  tribble(
+    ~region_set, ~regions, ~n_regions,
+    "all regions", all_regions, length(all_regions),
+    "drop AnG, FI (no NeuN/GFAP stain)", setdiff(all_regions, c("AnG", "FI")), length(all_regions) - 2,
+    "drop AnG, FI, CaH, ITG (the reduced-donor tabs)", setdiff(all_regions, c("AnG", "FI", "CaH", "ITG")), length(all_regions) - 4,
+    "84-donor neocortical set", c("DFC", "ESOC", "MTG", "STG", "V1C"), 5
+  ) %>%
+    mutate(n_donors_complete_in_every_region = map_int(regions, donors_complete_in),
+           regions = map_chr(regions, ~ paste(.x, collapse = ", "))),
+  "Donors with the complete primary block plus CPS in EVERY region of the set"
+)
+```
+
+**Requiring all four variables in all eleven regions yields zero donors**, because AnG and FI
+carry no NeuN or GFAP at all. The ROI set therefore has to be chosen before the block can be
+completed — which is a decision for later, not for this notebook.
+
+### 10.7 Layer and subregion data are untouched
+
+```{r}
+#| label: finer-grain-intact
+
+show_table(
+  qnp_region_grid(qnp) %>%
+    filter(sheet %in% QNP_PRIMARY_SHEETS, analysis_region != "Grey matter") %>%
+    group_by(sheet) %>%
+    summarise(n_finer_analysis_regions = n_distinct(analysis_region),
+              analysis_regions = paste(sort(unique(analysis_region)), collapse = ", "),
+              n_rows = sum(n_rows), .groups = "drop"),
+  "Finer-than-grey-matter rows, untouched by this section"
+)
+
+cat("grey-matter rows used here:", nrow(qnp_primary_candidate), "\n")
+cat("finer-grain rows left intact:",
+    sum(map_int(qnp[QNP_PRIMARY_SHEETS], ~ sum(.x[["analysis region"]] != "Grey matter"))), "\n")
+```
+
+### 10.8 Sensitivity inventory
+
+Alternatives preserved for later sensitivity analyses. **Nothing here is modelled, and none of it
+may be substituted into the primary block to fill a gap.**
+
+```{r}
+#| label: sensitivity-inventory
+
+sensitivity_cols <- tribble(
+  ~alternative, ~source_column, ~source,
+  "NeuN percent positive area",        "percent NeuN positive area",                      "current release",
+  "IBA1 percent positive area",        "percent Iba1 positive area",                      "current release",
+  "IBA1 cells per area",               "number of Iba1 positive cells per area",          "current release",
+  "IBA1 activated cells per area",     "number of activated Iba1 positive cells per area", "current release",
+  "IBA1 inactivated cells per area",   "number of inactivated Iba1 positive cells per area", "current release",
+  "IBA1 process area per cell",        "average Iba1 positive process area per cell",     "current release",
+  "IBA1 process length per cell",      "average Iba1 positive process length per cell",   "current release",
+  "MTG-only GFAP branch area",         "average GFAP positive branch area",               "Gabitto 2024 (deprecated; MTG)",
+  "MTG-only GFAP branch length",       "average GFAP positive branch length",             "Gabitto 2024 (deprecated; MTG)"
+)
+
+current_availability <- map_dfr(sensitivity_cols$source_column[sensitivity_cols$source == "current release"],
+  function(cc) {
+    rows <- map_dfr(QNP_PRIMARY_SHEETS, function(s) {
+      d <- qnp[[s]] %>% filter(`analysis region` == "Grey matter")
+      if (!cc %in% names(d)) return(NULL)
+      d %>% group_by(brain_region = `brain region`) %>%
+        summarise(n_obs = sum(!is.na(.data[[cc]])), n_rows = n(), .groups = "drop")
+    })
+    tibble(source_column = cc,
+           n_regions = nrow(rows),
+           n_regions_complete = sum(rows$n_obs == rows$n_rows),
+           n_donor_region_obs = sum(rows$n_obs),
+           regions = paste(sort(rows$brain_region), collapse = ", "))
+  })
+
+deprecated_availability <- map_dfr(
+  sensitivity_cols$source_column[sensitivity_cols$source != "current release"],
+  function(cc) {
+    g <- qnp[["Gabitto 2024 (deprecated; MTG)"]]
+    cols <- grep(paste0("^", cc, "_"), names(g), value = TRUE)
+    tibble(source_column = cc, n_regions = 1L, n_regions_complete = NA_integer_,
+           n_donor_region_obs = if (length(cols)) sum(!is.na(g[[paste0(cc, "_Grey matter")]])) else NA_integer_,
+           regions = paste0("MTG only; ", length(cols), " analysis regions incl. layers"))
+  })
+
+show_table(
+  sensitivity_cols %>%
+    left_join(bind_rows(current_availability, deprecated_availability), by = "source_column") %>%
+    left_join(qnp_measurement_dictionary %>% select(source_column, semantic_status), by = "source_column") %>%
+    select(alternative, source, source_column, semantic_status, n_regions,
+           n_regions_complete, n_donor_region_obs, regions),
+  "Secondary QNP alternatives preserved for later sensitivity analysis"
+)
+```
+
+```{r}
+#| label: sensitivity-luminex
+
+luminex_cols <- grep("^(ripa|guhcl) ", names(qnp[["Gabitto 2024 (deprecated; MTG)"]]), value = TRUE)
+
+show_table(
+  tibble(source_column = luminex_cols) %>%
+    mutate(n_donors_with_value = map_int(source_column,
+             ~ sum(!is.na(qnp[["Gabitto 2024 (deprecated; MTG)"]][[.x]]))),
+           source = "Gabitto 2024 (deprecated; MTG)",
+           unit = "not documented"),
+  "MTG Luminex metrics embedded in the deprecated sheet"
+)
+```
+
+These Luminex columns duplicate the standalone
+`sea-ad_cohort_mtg-tissue_extractions-luminex_data.xlsx` workbook, which is a separate assay and
+out of scope here. Their units are not documented in either place (§1.5, §8.2).
+
+### 10.9 Stop-condition answers
+
+```{r}
+#| label: stop-conditions
+
+show_table(
+  tribble(
+    ~question, ~answer,
+
+    "1. For which regions and donors can the primary P/H block be constructed?",
+    paste0("The P block (Ab, pTau) is complete for every donor in all ", length(all_regions),
+           " brain regions (758/758 cells). The full P+H block is complete in 7 regions at full donor count ",
+           "(DFC, HIP, MEC, MTG, STG plus ESOC and V1C at 79/84), reduced in CaH (37/42) and ITG (29/43), ",
+           "and impossible in AnG and FI. Requiring all four in every region simultaneously leaves 0 donors; ",
+           "dropping AnG and FI leaves 27; dropping AnG, FI, CaH and ITG leaves 78."),
+
+    "2. What missingness prevents complete construction?",
+    paste0("Two distinct causes. (a) structurally_unavailable_for_region: AnG and FI carry no NeuN or GFAP ",
+           "stain at all (86 cells each). (b) assayed_but_missing: NeuN is absent for 27 donor-region cells ",
+           "(ITG 14, CaH 5, ESOC 4, V1C 4) and GFAP for 2 (ESOC 1, V1C 1) within regions that were otherwise ",
+           "measured; the mechanism is undocumented. CPS contributes no missingness."),
+
+    "3. Which secondary QNP alternatives remain available?",
+    paste0("All IBA1 families (areal burden, cell density, activation split, process morphology) across up to ",
+           "9 regions; the NeuN percent-area variant in 5 regions; MTG-only GFAP branch area and length and ",
+           "the MTG Luminex panel, both only in the deprecated sheet. None may be substituted into the ",
+           "primary block.")
+  ),
+  "Stop-condition answers"
+)
+```
+
+---
+## 11. Session info
+
+```{r}
+#| label: session
+
+sessionInfo()
+```
