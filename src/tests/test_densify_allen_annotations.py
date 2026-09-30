@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -181,8 +184,8 @@ def test_annotation_pair_driver_has_joint_ordered_group_id_channels(tmp_path):
         },
     )
 
-    left, right, wleft, wright, keys, report = (
-        dense.build_annotation_pair_driver(root, 0, 1, (31, 99))
+    left, right, wleft, wright, keys, report = dense.build_annotation_pair_driver(
+        root, 0, 1, (31, 99)
     )
 
     assert keys == ((31, 5), (31, 7), (99, 5))
@@ -301,6 +304,41 @@ def test_pair_config_uses_modest_configurable_temporal_nt():
     assert config["eA2d"] == [0.0]
 
 
+def test_gpu_memory_calibration_uses_measured_fit_and_device_reserve():
+    pilots = []
+    for pair_id, structural, reserved, free in (
+        ("low", 100, 150, 900),
+        ("mid", 200, 250, 850),
+        ("high", 300, 350, 875),
+    ):
+        pilots.append(
+            {
+                "pair_id": pair_id,
+                "numerically_valid": True,
+                "configuration_kind": "corrected-production",
+                "effective_solver_configuration_sha256": "same",
+                "image_shape_yx": [10, 20],
+                "cuda_total_bytes": 1000,
+                "cuda_free_before_bytes": free,
+                "peak_cuda_reserved_bytes": reserved,
+                "memory_estimate": {"structural_estimated_bytes": structural},
+            }
+        )
+
+    calibration = dense.fit_gpu_memory_calibration(
+        pilots,
+        safety_factor=1.1,
+        free_memory_reserve_fraction=0.1,
+        minimum_free_memory_reserve_bytes=100,
+    )
+
+    assert calibration["structural_score_coefficient"] == pytest.approx(1.0)
+    assert calibration["intercept_bytes"] == pytest.approx(50.0)
+    assert calibration["positive_residual_margin_bytes"] == pytest.approx(0.0)
+    assert calibration["gpu_admission_budget_bytes"] == 750
+    assert dense.calibrated_gpu_memory_bytes(400, calibration) == 496
+
+
 def test_unknown_endpoint_id_is_rejected_before_transport():
     left = np.array([[10]], dtype=np.uint32)
     right = np.array([[20]], dtype=np.uint32)
@@ -407,9 +445,7 @@ def test_process_pair_preserves_nissl_inputs_reuses_partial_outputs_and_skips(
         },
     )
     nissl = np.arange(24, dtype=np.float32).reshape(2, 3, 2, 2) / 24.0
-    weights = np.array(
-        [[[1, 0], [1, 1]], [[0, 1], [1, 1]]], dtype=np.float32
-    )
+    weights = np.array([[[1, 0], [1, 1]], [[0, 1], [1, 1]]], dtype=np.float32)
     root.create_array("nissl", data=nissl, chunks=(1, 3, 2, 2))
     root.create_array("nissl_weight", data=weights, chunks=(1, 2, 2))
     store = dense.TiffDenseAnnotationStore(
@@ -419,7 +455,10 @@ def test_process_pair_preserves_nissl_inputs_reuses_partial_outputs_and_skips(
         compression="none",
         groups=context.graphic_groups,
     )
-    expected = {31: np.full((2, 2), 10, np.uint32), 265297118: np.full((2, 2), 30, np.uint32)}
+    expected = {
+        31: np.full((2, 2), 10, np.uint32),
+        265297118: np.full((2, 2), 30, np.uint32),
+    }
     mtimes = {}
     for group, plane in expected.items():
         store.write_group_plane(group, 1, plane, overwrite=False)
@@ -457,8 +496,16 @@ def test_process_pair_preserves_nissl_inputs_reuses_partial_outputs_and_skips(
         cuda = Cuda()
 
     def fake_fit(left, right, wleft, wright, axes, config, **kwargs):
-        captured["arrays"] = tuple(value.copy() for value in (left, right, wleft, wright))
-        return left_flow, right_flow, {"wsi_commit": "wsi-test"}, _IdentityInterpolation(), Torch()
+        captured["arrays"] = tuple(
+            value.copy() for value in (left, right, wleft, wright)
+        )
+        return (
+            left_flow,
+            right_flow,
+            {"wsi_commit": "wsi-test"},
+            _IdentityInterpolation(),
+            Torch(),
+        )
 
     monkeypatch.setattr(dense, "fit_pair_trajectories", fake_fit)
     report = dense.process_pair(
@@ -476,7 +523,9 @@ def test_process_pair_preserves_nissl_inputs_reuses_partial_outputs_and_skips(
         overwrite=False,
     )
 
-    for actual, wanted in zip(captured["arrays"], (nissl[0], nissl[1], weights[0], weights[1])):
+    for actual, wanted in zip(
+        captured["arrays"], (nissl[0], nissl[1], weights[0], weights[1])
+    ):
         np.testing.assert_array_equal(actual, wanted)
     assert left_flow.calls == [0.25]
     assert right_flow.calls == [0.75]
@@ -484,12 +533,17 @@ def test_process_pair_preserves_nissl_inputs_reuses_partial_outputs_and_skips(
         path = tmp_path / f"dense_tiff/groups/{group}/000001.tif"
         assert path.stat().st_mtime_ns == mtimes[group]
         np.testing.assert_array_equal(store.read_group_plane(group, 1), plane)
-        assert report["group_reports"][str(group)]["compatible_existing_planes_reused"] == 1
+        assert (
+            report["group_reports"][str(group)]["compatible_existing_planes_reused"]
+            == 1
+        )
 
     monkeypatch.setattr(
         dense,
         "fit_pair_trajectories",
-        lambda *args, **kwargs: pytest.fail("compatible checkpoint should skip fitting"),
+        lambda *args, **kwargs: pytest.fail(
+            "compatible checkpoint should skip fitting"
+        ),
     )
     repeated = dense.process_pair(
         context,
@@ -709,3 +763,187 @@ def test_annotation_default_uses_dedicated_output(monkeypatch):
     assert dense.main(["--driver", "annotation"]) == 0
     assert received["output"] == dense.DEFAULT_ANNOTATION_OUTPUT.resolve()
     assert received["graphic_groups"] == [31, 265297118]
+
+
+def test_corrected_production_profile_is_exact_calibrated_one_scale():
+    config = dense.effective_pair_config(
+        dense.DEFAULT_PAIR_CONFIG, "section-to-section-diffeo"
+    )
+
+    assert config["n_iter"] == [100]
+    assert config["a"] == [1000.0]
+    assert config["dv"] == [[50.0, 2000.0, 2000.0]]
+    assert config["sigmaR"] == [100000.0]
+    assert (
+        dense._stable_json_sha256(config)
+        == dense.CORRECTED_PRODUCTION_CONFIGURATION_SHA256
+    )
+
+
+def test_authoritative_corrected_schedule_is_disjoint_and_reconciled():
+    root = dense.PROJECT / "results/diagnostics/allen_cpu_gpu_scheduling"
+    schedule = dense.validate_corrected_production_schedule(
+        root / "corrected_production_gpu_worklist.tsv",
+        root / "corrected_production_cpu_worklist.tsv",
+        root / "final_cpu_gpu_eligibility_105_pairs.tsv",
+    )
+
+    gpu = set(schedule["gpu_pair_ids"])
+    cpu = set(schedule["cpu_pair_ids"])
+    unresolved = set(schedule["known_unresolved_pair_ids"])
+    assert len(gpu) == 80
+    assert len(cpu) == 24
+    assert unresolved == {"1716-1787"}
+    assert gpu.isdisjoint(cpu | unresolved)
+    assert cpu.isdisjoint(unresolved)
+    assert gpu | cpu | unresolved == set(schedule["inventory_pair_ids"])
+    assert schedule["historically_completed_pair_count"] == 59
+
+
+def test_worker_failure_policy_isolates_pairs_but_stops_global_failures():
+    assert not dense._is_global_worker_failure(ValueError("one numerical pair"))
+    assert dense._is_global_worker_failure(
+        dense.GlobalRunError("incompatible checkpoint identity")
+    )
+    assert dense._is_global_worker_failure(OSError("shared output unavailable"))
+    assert dense._is_global_worker_failure(RuntimeError("CUDA is unavailable"))
+
+
+def test_failure_record_has_recovery_identity_and_no_complete_checkpoint(tmp_path):
+    context = _minimal_context(tmp_path)
+    report = {"registration_support": "test support"}
+    identity = dense._checkpoint_identity(
+        context,
+        driver="annotation",
+        pair_groups=(31,),
+        driver_keys=((31, 1),),
+        driver_report=report,
+        config={"nt": 10, "n_iter": [100]},
+        wsi_commit="wsi-test",
+    )
+    log = tmp_path / "logs/pair.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("pair output\n")
+    try:
+        raise ValueError("synthetic independent failure")
+    except ValueError as exc:
+        path = dense._record_pair_failure(
+            tmp_path,
+            (0, 2),
+            "cpu",
+            "test-worker",
+            exc,
+            1.25,
+            log,
+            identity,
+            ["31:1"],
+        )
+    failure = json.loads(path.read_text())
+
+    assert failure["pair_id"] == "0000-0002"
+    assert failure["assigned_device"] == "cpu"
+    assert failure["exception_type"] == "ValueError"
+    assert failure["exception_message"] == "synthetic independent failure"
+    assert "ValueError: synthetic independent failure" in failure["traceback"]
+    assert failure["effective_solver_configuration"] == identity["solver_configuration"]
+    assert failure["wsi_source_identity"]["repository_commit"] == "wsi-test"
+    assert failure["elapsed_seconds"] == 1.25
+    assert failure["incomplete_planes_written"] is True
+    assert dense._existing_pair_status_path(tmp_path, (0, 2), "tiff") is None
+
+
+def test_corrected_run_identity_rejects_stale_shared_output_state(tmp_path):
+    identity = {"schema": dense.RUN_IDENTITY_SCHEMA, "identity_sha256": "one"}
+    dense._validate_or_write_run_identity(tmp_path, identity, write=True)
+    dense._validate_or_write_run_identity(tmp_path, identity, write=False)
+
+    with pytest.raises(dense.GlobalRunError, match="incompatible run identity"):
+        dense._validate_or_write_run_identity(
+            tmp_path,
+            {"schema": dense.RUN_IDENTITY_SCHEMA, "identity_sha256": "two"},
+            write=False,
+        )
+
+
+def test_pair_log_supports_fresh_pinned_backend_import(tmp_path):
+    log_path = tmp_path / "fresh-backend-import.log"
+    code = f"""
+import sys
+from pathlib import Path
+from preprocess import densify_allen_annotations as dense
+assert "IPython" not in sys.modules
+assert "emlddmm" not in sys.modules
+with dense._pair_attempt_log(Path({str(log_path)!r})):
+    loaded = dense._load_wsi(dense.DEFAULT_WSI_REPOSITORY)
+assert loaded[-1] == dense.WSI_PIN
+print("fresh backend import passed")
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(dense.PROJECT / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=dense.PROJECT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "fresh backend import passed" in result.stdout
+    assert "AttributeError" not in log_path.read_text()
+
+
+def test_launcher_reuses_inherited_conda_environment_under_nounset():
+    environment = os.environ.copy()
+    environment["CONDA_DEFAULT_ENV"] = "wsi-pipeline"
+    launcher = dense.PROJECT / "scripts/run_allen_full_densification.sh"
+
+    result = subprocess.run(
+        ["bash", str(launcher), "worker", "deliberately-invalid"],
+        cwd=dense.PROJECT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 2
+    assert "Unknown worker: deliberately-invalid" in result.stderr
+    assert "CONDA_CLASSPATH_BACKUP" not in result.stdout + result.stderr
+    assert "pyjnius_deactivate.sh" not in result.stdout + result.stderr
+
+
+def test_failure_attempt_classification_distinguishes_originating_stage():
+    logging = dense._classify_failure_attempt(
+        {
+            "exception_type": "AttributeError",
+            "exception_message": "'_TeeText' object has no attribute 'isatty'",
+            "traceback": "IPython/core/kitty.py",
+        }
+    )
+    numerical = dense._classify_failure_attempt(
+        {
+            "exception_type": "_LinAlgError",
+            "exception_message": "input matrix is singular",
+            "traceback": "torch.inverse(A)",
+        }
+    )
+    other = dense._classify_failure_attempt(
+        {
+            "exception_type": "ValueError",
+            "exception_message": "different failure",
+            "traceback": "elsewhere",
+        }
+    )
+
+    assert logging == (
+        "logging/import failure",
+        "first EM-LDDMM/IPython backend import",
+    )
+    assert numerical == (
+        "numerical singular-affine failure",
+        "first WSI forward EM-LDDMM call at affine inversion",
+    )
+    assert other == ("other failure", "unclassified attempt stage")

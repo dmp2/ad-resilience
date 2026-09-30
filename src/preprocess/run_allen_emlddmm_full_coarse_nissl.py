@@ -129,11 +129,30 @@ PROFILE_OVERRIDES = {
                 "local_contrast": [[1, 8, 8], [1, 8, 8], [1, 8, 8]],
                 "muA": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], # estimate of the intensitiy of artifacts (black)
                 "muB": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], # estimate of the intensity of the background (white)
-            }, 
+            },
     "section-to-section-diffeo": {
         "a": 1000.0,
         "dv": [50.0, 2000.0, 2000.0], # keep [50.0, 2000.0, 2000.0], until we fix wsi-tissue-pipeline
         "n_iter": [100, 50, 40],
+        "eA": 0,
+        "Amode": 0,
+        "eA2d": 0,
+        "slice_matching": False,
+        "sigmaR": 1e5,
+        },
+    # TODO: to finish mask-to-mask diffeo, I think the matching weights and/or the objective function must be updated
+    "section-annotation-to-section-annotation-diffeo": {
+        "a": 1000.0,
+        "dv": [50.0, 2000.0, 2000.0], # keep [50.0, 2000.0, 2000.0], until we fix wsi-tissue-pipeline
+        "n_iter": [100, 50, 40],
+
+        # Classical multichannel LDDMM attachment for categorical annotations.
+        "order": 0,
+        "update_matching_weights": False,
+        # "priors": [1.0, 0.0, 0.0], # keep tissue weight, no artifacts in annotations, no background discrepancy needed
+        # "update_priors": False, # only tissue mask present, no artifacts
+        # "n_e_step": 1000000, # don't update the priors
+
         "eA": 0,
         "Amode": 0,
         "eA2d": 0,
@@ -166,7 +185,7 @@ PROFILE_OVERRIDES["pv-to-aligned-nissl-rigid-local-contrast"] = {
 LOCAL_CONTRAST_TARGET_SHAPES = ((32, 45), (65, 91), (130, 182))
 
 _THREE_LEVEL_SCALARS = (
-    "a", "dv", 
+    "a", "dv",
     "eA", "eA2d", "Amode", "rigid_procrustes",
     "slice_deformation", "auto_stepsize_v", "priors", "update_priors",
     "update_muA", "update_muB", "sigmaM", "sigmaA", "sigmaB",

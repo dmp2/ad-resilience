@@ -11,6 +11,7 @@ this module does not estimate section placement or transfer data to MRI space.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import gc
 import hashlib
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -59,11 +61,15 @@ DEFAULT_PAIR_CONFIG = PROJECT / "configs/allen_dense_pairwise.json"
 DEFAULT_WSI_REPOSITORY = PROJECT.parent / "wsi-tissue-pipeline"
 DEFAULT_EMLDDMM_REPOSITORY = PROJECT.parent / "emlddmm"
 WSI_PIN = "d4d118a47d08700c8c30cf852b855e14e411bbdf"
+CORRECTED_PRODUCTION_CONFIGURATION_SHA256 = (
+    "c77abf66122961056da1d42ec8e544731582a0fb7be84b828b0f69806ae49457"
+)
 
 SCHEMA = "allen-dense-registered-histology-v4"
 ANCHOR_SCHEMA = "allen-final-registered-annotation-anchors-v1"
 PAIR_SCHEMA = "allen-dense-pair-v4"
 TIFF_STORE_SCHEMA = "allen-dense-tiff-store-v1"
+RUN_IDENTITY_SCHEMA = "allen-dense-corrected-run-identity-v1"
 
 UNSUPPORTED = 0
 OBSERVED_LABELS = 1
@@ -78,6 +84,10 @@ STATE_NAME = {
 SEMANTIC_LABELED = "LABELED"
 SEMANTIC_VALID_EMPTY = "VALID_EMPTY"
 SEMANTIC_UNAVAILABLE = "UNAVAILABLE"
+
+
+class GlobalRunError(RuntimeError):
+    """A failure that invalidates all remaining work in a shared run."""
 
 
 @dataclass(frozen=True)
@@ -801,6 +811,8 @@ def _describe_annotation_pair_driver(
     left_maps: dict[int, np.ndarray] = {}
     right_maps: dict[int, np.ndarray] = {}
     driver_keys: list[tuple[int, int]] = []
+    left_anatomical_ids: set[int] = set()
+    right_anatomical_ids: set[int] = set()
     left_support: np.ndarray | None = None
     right_support: np.ndarray | None = None
     for group in ordered_groups:
@@ -815,13 +827,11 @@ def _describe_annotation_pair_driver(
             )
         left_maps[group] = left
         right_maps[group] = right
-        ids = sorted(
-            (
-                set(map(int, np.unique(left)))
-                | set(map(int, np.unique(right)))
-            )
-            - {0}
-        )
+        left_ids = set(map(int, np.unique(left))) - {0}
+        right_ids = set(map(int, np.unique(right))) - {0}
+        left_anatomical_ids.update(left_ids)
+        right_anatomical_ids.update(right_ids)
+        ids = sorted(left_ids | right_ids)
         driver_keys.extend((group, allen_id) for allen_id in ids)
         group_left_support = left != 0
         group_right_support = right != 0
@@ -843,6 +853,11 @@ def _describe_annotation_pair_driver(
         "pair_driver_groups": list(ordered_groups),
         "ordered_roi_channel_keys": [list(key) for key in keys],
         "driver_channel_count": len(keys),
+        "left_endpoint_label_count": len(left_anatomical_ids),
+        "right_endpoint_label_count": len(right_anatomical_ids),
+        "pair_local_union_anatomical_id_count": len(
+            left_anatomical_ids | right_anatomical_ids
+        ),
         "registration_support": (
             "endpoint foreground union across selected ROI channels"
         ),
@@ -914,6 +929,81 @@ def _load_pair_config(path: Path) -> dict[str, Any]:
     return config
 
 
+def effective_pair_config(
+    pair_config: Path, profile_name: str | None
+) -> dict[str, Any]:
+    """Merge a named registration profile into the one-scale pair template."""
+    config = _load_pair_config(pair_config.expanduser().resolve())
+    if profile_name is None:
+        return config
+    profile = coarse.PROFILE_OVERRIDES[profile_name]
+    required = ("a", "dv", "eA", "eA2d", "sigmaR", "n_iter")
+    missing = [key for key in required if key not in profile]
+    if missing:
+        raise RuntimeError(
+            f"Pair profile {profile_name!r} lacks required values: {missing}"
+        )
+    config["a"] = [float(profile["a"])]
+    dv = profile["dv"]
+    if isinstance(dv, Sequence) and not isinstance(dv, (str, bytes)):
+        config["dv"] = [[float(value) for value in dv]]
+    else:
+        config["dv"] = [float(dv)]
+    config["eA"] = [float(profile["eA"])]
+    config["eA2d"] = [float(profile["eA2d"])]
+    config["sigmaR"] = [float(profile["sigmaR"])]
+    iterations = profile["n_iter"]
+    if isinstance(iterations, Sequence) and not isinstance(iterations, (str, bytes)):
+        if not iterations:
+            raise RuntimeError(f"Pair profile {profile_name!r} has no iterations")
+        config["n_iter"] = [int(iterations[0])]
+    else:
+        config["n_iter"] = [int(iterations)]
+    config["Amode"] = int(profile["Amode"])
+    config["slice_matching"] = [bool(profile["slice_matching"])]
+
+    # Optional profile-level controls that are not part of the generic
+    # one-scale pair template. Preserve them in the effective solver
+    # configuration so they are passed to WSI/EM-LDDMM and included in
+    # the configuration identity/hash.
+    if "order" in profile:
+        order = profile["order"]
+        if isinstance(order, Sequence) and not isinstance(order, (str, bytes)):
+            if not order:
+                raise RuntimeError(f"Pair profile {profile_name!r} has no order")
+            config["order"] = [int(order[0])]
+        else:
+            config["order"] = [int(order)]
+
+    if "update_matching_weights" in profile:
+        config["update_matching_weights"] = bool(
+            profile["update_matching_weights"]
+        )
+
+    return _load_pair_config_from_mapping(config)
+
+
+def _load_pair_config_from_mapping(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply the same invariants as ``_load_pair_config`` after profile merging."""
+    result = dict(config)
+    required = {
+        "slice_matching": [False],
+        "eA": [0.0],
+        "eA2d": [0.0],
+        "Amode": 0,
+        "downI": [[1, 1]],
+        "downJ": [[1, 1]],
+    }
+    for key, value in required.items():
+        if result.get(key) != value:
+            raise RuntimeError(f"Pair configuration must keep {key}={value!r}")
+    if int(result.get("nt", 0)) < 1:
+        raise RuntimeError("Pair configuration nt must be positive")
+    if not result.get("n_iter") or any(int(value) < 1 for value in result["n_iter"]):
+        raise RuntimeError("Pair configuration iterations must be positive")
+    return result
+
+
 def pair_solver_config(
     config: Mapping[str, Any], nt_override: int | None = None
 ) -> dict[str, Any]:
@@ -924,6 +1014,204 @@ def pair_solver_config(
             raise ValueError("An nt override must be positive")
         solver["nt"] = int(nt_override)
     return solver
+
+
+def _effective_velocity_spacing(
+    config: Mapping[str, Any],
+) -> tuple[float, float, float]:
+    """Resolve the final synthetic-3D velocity spacing without running EM-LDDMM."""
+    value = config.get("dv")
+    while (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes))
+        and len(value) == 1
+    ):
+        value = value[0]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        if value and isinstance(value[-1], Sequence):
+            value = value[-1]
+        values = tuple(float(item) for item in value)
+        if len(values) != 3:
+            raise RuntimeError(f"Cannot estimate velocity grid from dv={value!r}")
+        spacing = values
+    else:
+        scalar = float(value)
+        spacing = (scalar, scalar, scalar)
+    if any(item <= 0 or not np.isfinite(item) for item in spacing):
+        raise RuntimeError(f"Cannot estimate velocity grid from dv={value!r}")
+    return spacing
+
+
+def estimate_pair_registration_memory(
+    channel_count: int,
+    image_shape: Sequence[int],
+    registered_axes: Sequence[np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    inferred_group_planes: int = 0,
+) -> dict[str, Any]:
+    """Return a structural memory score for triage, not a peak-VRAM claim."""
+    if channel_count < 0:
+        raise ValueError("channel_count must be nonnegative")
+    height, width = map(int, image_shape)
+    if (height, width) != tuple(len(axis) for axis in registered_axes):
+        raise ValueError("Registered axes and image shape differ")
+    nt = int(config["nt"])
+    scalar_bytes = 4 if str(config.get("dtype", "float32")) == "float32" else 8
+    image_pixels = height * width
+    image_values = channel_count * image_pixels
+    synthetic_z = 2
+    synthetic_values = synthetic_z * image_values
+
+    axis_steps = [
+        float(np.mean(np.abs(np.diff(np.asarray(axis, dtype=np.float64)))))
+        for axis in registered_axes
+    ]
+    synthetic_spacing = float(np.mean(axis_steps))
+    backend_extents = (
+        synthetic_spacing,
+        float(np.ptp(registered_axes[0])),
+        float(np.ptp(registered_axes[1])),
+    )
+    velocity_spacing = _effective_velocity_spacing(config)
+    velocity_shape = tuple(
+        max(1, int(np.ceil(1.4 * extent / spacing)))
+        for extent, spacing in zip(backend_extents, velocity_spacing, strict=True)
+    )
+    velocity_values = nt * 3 * int(np.prod(velocity_shape))
+    map_values = (nt + 1) * 2 * image_pixels
+
+    # These terms mirror the arrays held by the current WSI wrapper. The
+    # autograd allowance is deliberately explicit and is calibrated against
+    # pilots before it is used as a GPU admission estimate.
+    components = {
+        "endpoint_driver_bytes": 2 * image_values * scalar_bytes,
+        "synthetic_3d_endpoint_bytes": 2 * synthetic_values * scalar_bytes,
+        "flowed_image_trajectory_bytes": 2 * (nt + 1) * image_values * scalar_bytes,
+        "image_autograd_allowance_bytes": 12 * synthetic_values * scalar_bytes,
+        "flow_map_and_gradient_bytes": 6 * map_values * scalar_bytes,
+        "velocity_fft_and_gradient_bytes": 6 * velocity_values * scalar_bytes,
+        "fixed_workspace_bytes": 64 * 1024**2,
+    }
+    structural_bytes = int(sum(components.values()))
+    iterations = config.get("n_iter", [1])
+    if not isinstance(iterations, Sequence) or isinstance(iterations, (str, bytes)):
+        iterations = [iterations]
+    iteration_count = sum(int(item) for item in iterations)
+    registration_work = 4 * iteration_count * image_values
+    output_work = 2 * inferred_group_planes * image_values
+    return {
+        "model": "allen-emlddmm-structural-v1",
+        "scalar_bytes": scalar_bytes,
+        "image_shape_yx": [height, width],
+        "synthetic_backend_z_planes": synthetic_z,
+        "velocity_grid_shape_zyx": list(velocity_shape),
+        "components": components,
+        "structural_estimated_bytes": structural_bytes,
+        "relative_runtime_work_units": int(registration_work + output_work),
+        "calibration_required_for_gpu_eligibility": True,
+    }
+
+
+def fit_gpu_memory_calibration(
+    pilot_reports: Sequence[Mapping[str, Any]],
+    *,
+    safety_factor: float = 1.15,
+    free_memory_reserve_fraction: float = 0.15,
+    minimum_free_memory_reserve_bytes: int = 1024**3,
+) -> dict[str, Any]:
+    """Fit a device-specific reserved-VRAM admission model from valid pilots."""
+    valid = [
+        report
+        for report in pilot_reports
+        if report.get("numerically_valid")
+        and report.get("configuration_kind") == "corrected-production"
+    ]
+    if len(valid) < 3:
+        raise RuntimeError("At least three valid production CUDA pilots are required")
+    configuration_hashes = {
+        str(report["effective_solver_configuration_sha256"]) for report in valid
+    }
+    image_shapes = {tuple(report["image_shape_yx"]) for report in valid}
+    device_totals = {int(report["cuda_total_bytes"]) for report in valid}
+    if len(configuration_hashes) != 1 or len(image_shapes) != 1:
+        raise RuntimeError(
+            "Calibration pilots must share configuration and image shape"
+        )
+    if len(device_totals) != 1:
+        raise RuntimeError("Calibration pilots must use one CUDA device capacity")
+    if safety_factor < 1.0:
+        raise ValueError("safety_factor must be at least one")
+    if not 0.0 <= free_memory_reserve_fraction < 1.0:
+        raise ValueError("free_memory_reserve_fraction must be in [0, 1)")
+
+    x = [
+        float(report["memory_estimate"]["structural_estimated_bytes"])
+        for report in valid
+    ]
+    y = [float(report["peak_cuda_reserved_bytes"]) for report in valid]
+    x_mean = sum(x) / len(x)
+    y_mean = sum(y) / len(y)
+    denominator = sum((value - x_mean) ** 2 for value in x)
+    if denominator == 0:
+        raise RuntimeError("Calibration pilots do not span different memory scores")
+    slope = (
+        sum(
+            (x_value - x_mean) * (y_value - y_mean)
+            for x_value, y_value in zip(x, y, strict=True)
+        )
+        / denominator
+    )
+    intercept = y_mean - slope * x_mean
+    if slope <= 0 or intercept < 0:
+        raise RuntimeError("Pilot memory fit is not physically usable")
+    residual_margin = max(
+        0.0,
+        max(
+            measured - (intercept + slope * structural)
+            for structural, measured in zip(x, y, strict=True)
+        ),
+    )
+    total_bytes = next(iter(device_totals))
+    availability_reserve = max(
+        int(minimum_free_memory_reserve_bytes),
+        int(np.ceil(total_bytes * free_memory_reserve_fraction)),
+    )
+    minimum_observed_free = min(
+        int(report["cuda_free_before_bytes"]) for report in valid
+    )
+    admission_budget = minimum_observed_free - availability_reserve
+    if admission_budget <= 0:
+        raise RuntimeError(
+            "CUDA availability reserve consumes the observed free memory"
+        )
+    return {
+        "model": "linear-reserved-vram-v1",
+        "structural_score_coefficient": slope,
+        "intercept_bytes": intercept,
+        "positive_residual_margin_bytes": residual_margin,
+        "prediction_safety_factor": float(safety_factor),
+        "minimum_observed_free_bytes": minimum_observed_free,
+        "cuda_total_bytes": total_bytes,
+        "availability_reserve_bytes": availability_reserve,
+        "gpu_admission_budget_bytes": admission_budget,
+        "effective_solver_configuration_sha256": next(iter(configuration_hashes)),
+        "image_shape_yx": list(next(iter(image_shapes))),
+        "calibration_pair_ids": [str(report["pair_id"]) for report in valid],
+    }
+
+
+def calibrated_gpu_memory_bytes(
+    structural_estimated_bytes: int, calibration: Mapping[str, Any]
+) -> int:
+    """Apply the measured fit, residual allowance, and safety factor."""
+    base = (
+        float(calibration["intercept_bytes"])
+        + float(calibration["structural_score_coefficient"])
+        * int(structural_estimated_bytes)
+        + float(calibration["positive_residual_margin_bytes"])
+    )
+    return int(np.ceil(base * float(calibration["prediction_safety_factor"])))
 
 
 def _verify_wsi_repository(repository: Path) -> str:
@@ -954,7 +1242,7 @@ def _load_wsi(
         .resolve()
     )
     expected_emlddmm = (
-        (PROJECT / "configs/emlddmm-upstream-commit.txt").read_text().strip()
+        (PROJECT / "configs/emlddmm-annotation-commit.txt").read_text().strip()
     )
     actual_emlddmm = subprocess.run(
         ["git", "-C", str(emlddmm_repository), "rev-parse", "HEAD"],
@@ -1532,12 +1820,12 @@ class TiffDenseAnnotationStore(DenseAnnotationStore):
         }
         if descriptor_path.is_file():
             if json.loads(descriptor_path.read_text()) != descriptor:
-                raise RuntimeError(
+                raise GlobalRunError(
                     f"Existing TIFF product conflicts with this run: {descriptor_path}"
                 )
         else:
             if self.root.exists() and any(self.root.rglob("*.tif")):
-                raise RuntimeError(
+                raise GlobalRunError(
                     "Existing TIFF planes lack compatible store metadata; move the "
                     f"incomplete product aside: {self.root}"
                 )
@@ -1832,6 +2120,81 @@ def _restore_tiff_checkpoint_states(
                 store.set_state(group, canonical_index, INFERRED)
 
 
+def _worklist_pairs(path: Path) -> tuple[tuple[int, int], ...]:
+    rows = _read_tsv(path.expanduser().resolve())
+    if not rows or "pair_id" not in rows[0]:
+        raise GlobalRunError(f"Pair worklist is empty or lacks pair_id: {path}")
+    pairs = tuple(_parse_pair(row["pair_id"]) for row in rows)
+    if len(pairs) != len(set(pairs)):
+        raise GlobalRunError(f"Pair worklist contains duplicates: {path}")
+    return pairs
+
+
+def validate_corrected_production_schedule(
+    gpu_worklist: Path, cpu_worklist: Path, inventory: Path
+) -> dict[str, Any]:
+    """Validate the frozen 80/24/1 corrected-production assignment."""
+    gpu_path = gpu_worklist.expanduser().resolve()
+    cpu_path = cpu_worklist.expanduser().resolve()
+    inventory_path = inventory.expanduser().resolve()
+    gpu_rows = _read_tsv(gpu_path)
+    cpu_rows = _read_tsv(cpu_path)
+    inventory_rows = _read_tsv(inventory_path)
+    gpu = tuple(_parse_pair(row["pair_id"]) for row in gpu_rows)
+    cpu = tuple(_parse_pair(row["pair_id"]) for row in cpu_rows)
+    inventory_pairs = tuple(_parse_pair(row["pair_id"]) for row in inventory_rows)
+    for label, values in (("GPU", gpu), ("CPU", cpu), ("inventory", inventory_pairs)):
+        if len(values) != len(set(values)):
+            raise GlobalRunError(f"{label} scheduling input contains duplicate pairs")
+    if set(gpu) & set(cpu):
+        overlap = sorted(_pair_id(pair) for pair in set(gpu) & set(cpu))
+        raise GlobalRunError(f"CPU and GPU worklists overlap: {overlap}")
+    assignment = {
+        _parse_pair(row["pair_id"]): row.get("final_assigned_device", "")
+        for row in inventory_rows
+    }
+    unresolved = tuple(
+        pair for pair in inventory_pairs if assignment[pair] == "unresolved"
+    )
+    if any(assignment.get(pair) != "gpu" for pair in gpu):
+        raise GlobalRunError("GPU worklist disagrees with inventory device assignments")
+    if any(assignment.get(pair) != "cpu" for pair in cpu):
+        raise GlobalRunError("CPU worklist disagrees with inventory device assignments")
+    if set(gpu) | set(cpu) | set(unresolved) != set(inventory_pairs):
+        raise GlobalRunError(
+            "Worklists and unresolved pairs do not reconcile to inventory"
+        )
+    if len(gpu) != 80 or len(cpu) != 24 or len(inventory_pairs) != 105:
+        raise GlobalRunError(
+            "Corrected schedule must contain 80 GPU, 24 CPU, and 105 total pairs"
+        )
+    if unresolved != ((1716, 1787),):
+        raise GlobalRunError(
+            "Corrected schedule must contain only known-unresolved pair 1716-1787"
+        )
+    historical = sum(
+        row.get("historically_completed", "").strip().lower() == "true"
+        for row in inventory_rows
+    )
+    if historical != 59 or any(
+        row.get("corrected_run_requires_regeneration", "").strip().lower() != "true"
+        for row in inventory_rows
+    ):
+        raise GlobalRunError(
+            "Inventory must retain 59 historical completions while regenerating all 105 pairs"
+        )
+    return {
+        "gpu_pair_ids": [_pair_id(pair) for pair in gpu],
+        "cpu_pair_ids": [_pair_id(pair) for pair in cpu],
+        "known_unresolved_pair_ids": [_pair_id(pair) for pair in unresolved],
+        "inventory_pair_ids": [_pair_id(pair) for pair in inventory_pairs],
+        "historically_completed_pair_count": historical,
+        "gpu_worklist_sha256": _sha256(gpu_path),
+        "cpu_worklist_sha256": _sha256(cpu_path),
+        "inventory_sha256": _sha256(inventory_path),
+    }
+
+
 def _parse_pair(value: str) -> tuple[int, int]:
     try:
         left, right = value.split("-", 1)
@@ -1997,12 +2360,8 @@ def process_pair(
     z0_um = float(context.axes[0][left_index])
     z1_um = float(context.axes[0][right_index])
     if driver == "nissl":
-        left_image = np.asarray(
-            anchor_root["nissl"][left_ordinal], dtype=np.float32
-        )
-        right_image = np.asarray(
-            anchor_root["nissl"][right_ordinal], dtype=np.float32
-        )
+        left_image = np.asarray(anchor_root["nissl"][left_ordinal], dtype=np.float32)
+        right_image = np.asarray(anchor_root["nissl"][right_ordinal], dtype=np.float32)
         left_weight = np.asarray(
             anchor_root["nissl_weight"][left_ordinal], dtype=np.float32
         )
@@ -2033,7 +2392,7 @@ def process_pair(
         wsi_commit=str(checkpoint_identity["wsi_commit"]),
     )
     if actual_identity != checkpoint_identity:
-        raise RuntimeError(
+        raise GlobalRunError(
             f"Pair {_pair_id(pair)} driver identity changed after preflight"
         )
     existing_status_path = _existing_pair_status_path(output, pair, store.output_format)
@@ -2041,7 +2400,7 @@ def process_pair(
     if existing_status_path is not None and not overwrite:
         status = json.loads(existing_status_path.read_text())
         if status.get("status") != "complete":
-            raise RuntimeError(
+            raise GlobalRunError(
                 f"Existing pair status is incomplete: {existing_status_path}"
             )
         recorded_format = status.get("output_format")
@@ -2057,7 +2416,7 @@ def process_pair(
         exact_match = _checkpoint_matches(status, checkpoint_identity)
         legacy_match = _legacy_nissl_checkpoint_matches(status, checkpoint_identity)
         if not exact_match and not legacy_match:
-            raise RuntimeError(
+            raise GlobalRunError(
                 "Existing pair checkpoint is incompatible with the requested "
                 f"{driver} driver, channel semantics, groups, sources, or solver: "
                 f"{existing_status_path}"
@@ -2069,7 +2428,7 @@ def process_pair(
         for group in groups:
             for physical in range(left_index + 1, right_index):
                 if not store.verify_plane(physical, group=group):
-                    raise RuntimeError(
+                    raise GlobalRunError(
                         "Pair checkpoint exists without its completed "
                         f"{store.output_format} output: {existing_status_path}"
                     )
@@ -2171,6 +2530,7 @@ def process_pair(
         "output_format": store.output_format,
         "pair": list(pair),
         "pair_id": _pair_id(pair),
+        "assigned_device": device,
         "endpoint_z_um": [z0_um, z1_um],
         "delta_z_um": z1_um - z0_um,
         "nt": nt,
@@ -2322,9 +2682,7 @@ def finalize_dense(
         method = "two-sided annotation-driven diffeomorphic interpolation"
         registration_representation = "pair-local joint binary ROI memberships"
         channel_semantics = "(graphic_group, original Allen ID)"
-        registration_support = (
-            "endpoint foreground union across selected ROI channels"
-        )
+        registration_support = "endpoint foreground union across selected ROI channels"
     else:
         method = (
             "two-sided Nissl-driven diffeomorphic interpolation of categorical "
@@ -2457,6 +2815,7 @@ def build_preflight_report(
     sequences: Mapping[int, Sequence[int]],
     pair_groups: Mapping[tuple[int, int], Sequence[int]],
     checkpoint_identities: Mapping[tuple[int, int], Mapping[str, Any]],
+    driver_reports: Mapping[tuple[int, int], Mapping[str, Any]],
     *,
     driver: str,
     output_format: str,
@@ -2467,16 +2826,40 @@ def build_preflight_report(
     inferred_group_planes = 0
     for pair, groups in pair_groups.items():
         identity = checkpoint_identities[pair]
+        driver_report = driver_reports[pair]
         left, right = pair
+        estimated_planes = (right - left - 1) * len(groups)
+        memory = estimate_pair_registration_memory(
+            int(identity["driver_channel_count"]),
+            context.shape,
+            context.registered_axes,
+            identity["solver_configuration"],
+            inferred_group_planes=estimated_planes,
+        )
         entry = {
             "pair_id": _pair_id(pair),
             "left_physical_index": left,
             "right_physical_index": right,
             "endpoint_physical_index_gap": right - left,
-            "endpoint_delta_z_um": float(context.axes[0][right] - context.axes[0][left]),
+            "endpoint_delta_z_um": float(
+                context.axes[0][right] - context.axes[0][left]
+            ),
             "pair_driver_groups": list(map(int, groups)),
             "driver_channel_count": identity["driver_channel_count"],
-            "estimated_inferred_planes": (right - left - 1) * len(groups),
+            "left_endpoint_label_count": driver_report.get("left_endpoint_label_count"),
+            "right_endpoint_label_count": driver_report.get(
+                "right_endpoint_label_count"
+            ),
+            "pair_local_union_anatomical_id_count": driver_report.get(
+                "pair_local_union_anatomical_id_count"
+            ),
+            "left_support_pixels": driver_report.get("left_support_pixels"),
+            "right_support_pixels": driver_report.get("right_support_pixels"),
+            "estimated_inferred_planes": estimated_planes,
+            "effective_solver_configuration_sha256": identity[
+                "solver_configuration_sha256"
+            ],
+            "memory_estimate": memory,
         }
         pairs.append(entry)
         inferred_group_planes += entry["estimated_inferred_planes"]
@@ -2487,8 +2870,12 @@ def build_preflight_report(
         for section in (1042, 1117)
     }
     report = {
-        "schema": "allen-dense-preflight-v1",
+        "schema": "allen-dense-preflight-v2",
         "driver": driver,
+        "registered_image_shape_yx": list(context.shape),
+        "memory_estimate_policy": (
+            "structural triage only; CUDA pilot calibration is required for eligibility"
+        ),
         "selected_graphic_groups": list(context.graphic_groups),
         "observed_annotation_anchors_by_group": {
             str(group): len(sequences[group]) for group in context.graphic_groups
@@ -2509,6 +2896,390 @@ def build_preflight_report(
     return report
 
 
+class _TeeText:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, value: str) -> int:
+        for stream in self.streams:
+            stream.write(value)
+            stream.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return bool(self.streams[0].isatty())
+
+    def fileno(self) -> int:
+        return int(self.streams[0].fileno())
+
+    def writable(self) -> bool:
+        return all(stream.writable() for stream in self.streams)
+
+    @property
+    def encoding(self) -> str | None:
+        return getattr(self.streams[0], "encoding", None)
+
+    @property
+    def errors(self) -> str | None:
+        return getattr(self.streams[0], "errors", None)
+
+
+@contextlib.contextmanager
+def _pair_attempt_log(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"PAIR ATTEMPT START: {datetime.now(timezone.utc).isoformat()}\n")
+        stream.flush()
+        with contextlib.redirect_stdout(
+            _TeeText(sys.stdout, stream)
+        ), contextlib.redirect_stderr(_TeeText(sys.stderr, stream)):
+            yield
+
+
+def _run_identity(
+    context: SourceContext,
+    output: Path,
+    config: Mapping[str, Any],
+    *,
+    driver: str,
+    wsi_commit: str,
+    output_format: str,
+    schedule: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    identity = {
+        "schema": RUN_IDENTITY_SCHEMA,
+        "output": str(output.resolve()),
+        "driver": driver,
+        "selected_graphic_groups": list(context.graphic_groups),
+        "output_format": output_format,
+        "solver_configuration": dict(config),
+        "solver_configuration_sha256": _stable_json_sha256(config),
+        "wsi_commit": wsi_commit,
+        "authoritative_source_identity": _authoritative_source_identity(context),
+        "schedule": dict(schedule) if schedule is not None else None,
+    }
+    return {**identity, "identity_sha256": _stable_json_sha256(identity)}
+
+
+def _validate_or_write_run_identity(
+    output: Path, identity: Mapping[str, Any], *, write: bool
+) -> Path:
+    path = output / "metadata/corrected_run_identity.json"
+    if path.is_file():
+        existing = json.loads(path.read_text())
+        if existing != identity:
+            raise GlobalRunError(
+                f"Existing corrected output has an incompatible run identity: {path}"
+            )
+    elif write:
+        _json(path, identity)
+    else:
+        raise GlobalRunError(
+            f"Corrected output was not initialized by the launcher: {path}"
+        )
+    return path
+
+
+def _incomplete_pair_planes(
+    store: DenseAnnotationStore,
+    pair: tuple[int, int],
+    groups: Sequence[int],
+) -> list[str]:
+    left, right = pair
+    return [
+        f"{group}:{physical}"
+        for group in groups
+        for physical in range(left + 1, right)
+        if store.state(group, physical) == INFERRED
+        and store.verify_plane(physical, group=group)
+    ]
+
+
+def _is_global_worker_failure(exc: BaseException) -> bool:
+    message = str(exc)
+    return isinstance(exc, (GlobalRunError, OSError)) or (
+        "CUDA is unavailable" in message or "shared output" in message.lower()
+    )
+
+
+def _record_pair_failure(
+    output: Path,
+    pair: tuple[int, int],
+    device: str,
+    worker_id: str,
+    exc: BaseException,
+    elapsed: float,
+    log_path: Path,
+    checkpoint_identity: Mapping[str, Any],
+    incomplete_planes: Sequence[str],
+) -> Path:
+    token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    path = (
+        output
+        / "metadata/failures/attempts"
+        / _pair_id(pair)
+        / f"{token}.{os.getpid()}.json"
+    )
+    traceback_text = traceback.format_exc()
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            f"\nPAIR ATTEMPT FAILED: {type(exc).__name__}: {exc}\n" f"{traceback_text}"
+        )
+    payload = {
+        "schema": "allen-dense-pair-failure-v1",
+        "status": "failed",
+        "pair": list(pair),
+        "pair_id": _pair_id(pair),
+        "assigned_device": device,
+        "worker_id": worker_id,
+        "exception_type": type(exc).__name__,
+        "exception_message": str(exc),
+        "traceback": traceback_text,
+        "pair_log": str(log_path),
+        "checkpoint_identity": dict(checkpoint_identity),
+        "effective_solver_configuration": checkpoint_identity["solver_configuration"],
+        "effective_solver_configuration_sha256": checkpoint_identity[
+            "solver_configuration_sha256"
+        ],
+        "wsi_source_identity": {
+            "repository_commit": checkpoint_identity["wsi_commit"],
+            "authoritative_source_identity": checkpoint_identity[
+                "authoritative_source_identity"
+            ],
+        },
+        "elapsed_seconds": elapsed,
+        "incomplete_planes_written": bool(incomplete_planes),
+        "incomplete_plane_group_indices": list(incomplete_planes),
+        "failed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "global_failure": isinstance(exc, (GlobalRunError, OSError)),
+    }
+    _json(path, payload)
+    return path
+
+
+def _valid_pair_checkpoint(
+    output: Path,
+    store: DenseAnnotationStore,
+    pair: tuple[int, int],
+    groups: Sequence[int],
+    identity: Mapping[str, Any],
+) -> tuple[bool, Mapping[str, Any] | None, str]:
+    path = _existing_pair_status_path(output, pair, store.output_format)
+    if path is None:
+        return False, None, "missing complete checkpoint"
+    try:
+        status = json.loads(path.read_text())
+        if status.get("status") != "complete":
+            return False, status, "checkpoint is not complete"
+        if not _checkpoint_matches(status, identity):
+            return False, status, "checkpoint identity is incompatible"
+        for group in groups:
+            for physical in range(pair[0] + 1, pair[1]):
+                if not store.verify_plane(physical, group=group):
+                    return (
+                        False,
+                        status,
+                        "checkpoint has a missing or invalid TIFF plane",
+                    )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        return (
+            False,
+            None,
+            f"checkpoint verification failed: {type(exc).__name__}: {exc}",
+        )
+    return True, status, "complete"
+
+
+def _classify_failure_attempt(
+    failure: Mapping[str, Any],
+) -> tuple[str, str]:
+    exception_type = str(failure.get("exception_type", ""))
+    message = str(failure.get("exception_message", ""))
+    traceback_text = str(failure.get("traceback", ""))
+    if (
+        exception_type == "AttributeError"
+        and "_TeeText" in message
+        and "isatty" in message
+        and "IPython" in traceback_text
+    ):
+        return "logging/import failure", "first EM-LDDMM/IPython backend import"
+    if (
+        exception_type == "_LinAlgError"
+        and "input matrix is singular" in message
+        and "torch.inverse(A)" in traceback_text
+    ):
+        return (
+            "numerical singular-affine failure",
+            "first WSI forward EM-LDDMM call at affine inversion",
+        )
+    return "other failure", "unclassified attempt stage"
+
+
+def consolidate_corrected_run(
+    context: SourceContext,
+    output: Path,
+    store: DenseAnnotationStore,
+    pair_groups: Mapping[tuple[int, int], Sequence[int]],
+    checkpoint_identities: Mapping[tuple[int, int], Mapping[str, Any]],
+    schedule: Mapping[str, Any],
+    anchor_report: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    driver: str,
+) -> dict[str, Any]:
+    assigned = {
+        **{pair_id: "cuda:0" for pair_id in schedule["gpu_pair_ids"]},
+        **{pair_id: "cpu" for pair_id in schedule["cpu_pair_ids"]},
+    }
+    completed: list[Mapping[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+    scheduled_ids = set(assigned)
+    for pair, groups in pair_groups.items():
+        pair_id = _pair_id(pair)
+        valid, status, reason = _valid_pair_checkpoint(
+            output, store, pair, groups, checkpoint_identities[pair]
+        )
+        if valid:
+            assert status is not None
+            completed.append(status)
+            continue
+        if pair_id not in scheduled_ids:
+            continue
+        attempts = sorted(
+            (output / "metadata/failures/attempts" / pair_id).glob("*.json")
+        )
+        failure = json.loads(attempts[-1].read_text()) if attempts else {}
+        failure_category, failure_stage = (
+            _classify_failure_attempt(failure)
+            if failure
+            else ("other failure", "checkpoint verification")
+        )
+        failed_rows.append(
+            {
+                "pair_id": pair_id,
+                "assigned_device": assigned[pair_id],
+                "status": "failed" if failure else "not_completed",
+                "failure_category": failure_category,
+                "failure_stage": failure_stage,
+                "exception_type": failure.get("exception_type", ""),
+                "exception_message": failure.get("exception_message", reason),
+                "elapsed_seconds": failure.get("elapsed_seconds", ""),
+                "incomplete_planes_written": failure.get(
+                    "incomplete_planes_written", False
+                ),
+                "failure_record": str(attempts[-1]) if attempts else "",
+                "pair_log": failure.get("pair_log", ""),
+            }
+        )
+    failure_fields = (
+        list(failed_rows[0])
+        if failed_rows
+        else [
+            "pair_id",
+            "assigned_device",
+            "status",
+            "failure_category",
+            "failure_stage",
+            "exception_type",
+            "exception_message",
+            "elapsed_seconds",
+            "incomplete_planes_written",
+            "failure_record",
+            "pair_log",
+        ]
+    )
+    _write_tsv(
+        output / "metadata/failures/failed_pairs.tsv", failed_rows, failure_fields
+    )
+    retry_rows = [
+        {
+            "pair_id": row["pair_id"],
+            "assigned_device": row["assigned_device"],
+            "failure_category": row["failure_category"],
+            "failure_stage": row["failure_stage"],
+            "retry_reason": row["exception_message"],
+        }
+        for row in failed_rows
+    ]
+    _write_tsv(
+        output / "metadata/failures/retry_worklist.tsv",
+        retry_rows,
+        [
+            "pair_id",
+            "assigned_device",
+            "failure_category",
+            "failure_stage",
+            "retry_reason",
+        ],
+    )
+    unresolved_rows = [
+        {
+            "pair_id": pair_id,
+            "status": "known_numerically_unresolved",
+            "initial_schedule": "excluded",
+        }
+        for pair_id in schedule["known_unresolved_pair_ids"]
+    ]
+    _write_tsv(
+        output / "metadata/failures/known_unresolved.tsv",
+        unresolved_rows,
+        ["pair_id", "status", "initial_schedule"],
+    )
+    all_complete = len(completed) == len(pair_groups)
+    category_counts = {
+        category: sum(row["failure_category"] == category for row in failed_rows)
+        for category in (
+            "logging/import failure",
+            "numerical singular-affine failure",
+            "other failure",
+        )
+    }
+    accounted = (
+        len(completed) + len(failed_rows) + len(schedule["known_unresolved_pair_ids"])
+    )
+    if accounted != len(pair_groups):
+        raise GlobalRunError(
+            f"Consolidated accounting covers {accounted} of {len(pair_groups)} pairs"
+        )
+    report: dict[str, Any] = {
+        "schema": "allen-dense-corrected-run-status-v1",
+        "status": "complete" if all_complete else "incomplete",
+        "inventory_pair_count": len(pair_groups),
+        "scheduled_pair_count": len(scheduled_ids),
+        "completed_pair_count": len(completed),
+        "failed_or_missing_scheduled_pair_count": len(failed_rows),
+        "failure_category_counts": category_counts,
+        "known_unresolved_pair_ids": schedule["known_unresolved_pair_ids"],
+        "known_unresolved_pair_count": len(schedule["known_unresolved_pair_ids"]),
+        "accounted_pair_count": accounted,
+        "failed_pair_report": str(output / "metadata/failures/failed_pairs.tsv"),
+        "retry_worklist": str(output / "metadata/failures/retry_worklist.tsv"),
+        "known_unresolved_report": str(
+            output / "metadata/failures/known_unresolved.tsv"
+        ),
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _json(output / "metadata/corrected_run_status.json", report)
+    if all_complete:
+        final = finalize_dense(
+            context,
+            output,
+            store,
+            pair_groups,
+            anchor_report,
+            config,
+            completed,
+            driver=driver,
+        )
+        report = {**report, "status": "complete", "dataset": final}
+        _json(output / "metadata/corrected_run_status.json", report)
+    return report
+
+
 def run(
     *,
     dataset: Path,
@@ -2518,10 +3289,20 @@ def run(
     driver: str = "nissl",
     graphic_groups: Sequence[int] | None = None,
     pair: tuple[int, int] | None,
+    pair_worklist: Path | None = None,
     pair_config: Path,
+    pair_profile: str | None = None,
+    expected_configuration_sha256: str | None = None,
     wsi_repository: Path,
     device: str,
     overwrite: bool,
+    worker_id: str | None = None,
+    assigned_device: str | None = None,
+    initialize_only: bool = False,
+    consolidate_only: bool = False,
+    gpu_worklist: Path | None = None,
+    cpu_worklist: Path | None = None,
+    schedule_inventory: Path | None = None,
     nt_override: int | None = None,
     anchors_only: bool = False,
     output_format: str = "tiff",
@@ -2529,15 +3310,22 @@ def run(
 ) -> dict[str, Any]:
     if driver not in {"nissl", "annotation"}:
         raise ValueError(f"Unsupported registration driver: {driver}")
+    if pair is not None and pair_worklist is not None:
+        raise ValueError("Use either one --pair or one --pair-worklist, not both")
+    if initialize_only and consolidate_only:
+        raise ValueError("Initialization and consolidation are separate operations")
+    output = output.expanduser().resolve()
     context = select_graphic_groups(
         discover_inputs(dataset, registration, annotations), graphic_groups
     )
     print(f"Selected graphic groups: {context.graphic_groups}")
-    _copy_file_transactionally(
-        context.dataset / "metadata/physical_sections.tsv",
-        output / "metadata/physical_sections.tsv",
-    )
-    _write_output_readme(output)
+    worker_mode = worker_id is not None or consolidate_only
+    if not worker_mode:
+        _copy_file_transactionally(
+            context.dataset / "metadata/physical_sections.tsv",
+            output / "metadata/physical_sections.tsv",
+        )
+        _write_output_readme(output)
     anchor_report = materialize_anchors(context, output)
     anchor_rows = _read_tsv(output / "metadata/anchors.tsv")
     sequences, pair_groups = build_endpoint_sequences(
@@ -2554,31 +3342,17 @@ def run(
             )
     if nt_override is not None and pair is None:
         raise RuntimeError("An nt override requires one explicitly selected pair")
-    base_config = _load_pair_config(pair_config.resolve())
-
-    if driver == "annotation":
-        profile = coarse.PROFILE_OVERRIDES[
-            "section-to-section-diffeo"
-        ]
-
-        for key in (
-            "a",
-            "dv",
-            "eA",
-            "eA2d",
-            "sigmaR",
-        ):
-            base_config[key] = [float(profile[key])]
-
-        base_config["Amode"] = int(profile["Amode"])
-        base_config["slice_matching"] = [
-            bool(profile["slice_matching"])
-        ]
-
-        assert base_config["Amode"] == 0
-        assert base_config["eA"] == [0.0]
-        assert base_config["eA2d"] == [0.0]
-        assert base_config["slice_matching"] == [False]
+    effective_profile = pair_profile if driver == "annotation" else None
+    base_config = effective_pair_config(pair_config, effective_profile)
+    configuration_sha256 = _stable_json_sha256(base_config)
+    if (
+        expected_configuration_sha256 is not None
+        and configuration_sha256 != expected_configuration_sha256
+    ):
+        raise GlobalRunError(
+            "Effective solver configuration differs from the required corrected "
+            f"production identity: {configuration_sha256}"
+        )
 
     wsi_commit = _verify_wsi_repository(wsi_repository)
     anchor_root = zarr.open_group(str(output / "anchors.zarr"), mode="r")
@@ -2587,10 +3361,11 @@ def run(
         for ordinal, section in enumerate(context.annotation_sections)
     }
     checkpoint_identities: dict[tuple[int, int], dict[str, Any]] = {}
+    driver_reports: dict[tuple[int, int], dict[str, Any]] = {}
     for endpoint_pair, groups in pair_groups.items():
         selected_override = nt_override if endpoint_pair == pair else None
         solver_config = pair_solver_config(base_config, selected_override)
-        identity, _ = _pair_checkpoint_identity(
+        identity, driver_report = _pair_checkpoint_identity(
             context,
             anchor_root,
             ordinal_by_physical,
@@ -2601,6 +3376,46 @@ def run(
             wsi_commit=wsi_commit,
         )
         checkpoint_identities[endpoint_pair] = identity
+        driver_reports[endpoint_pair] = driver_report
+
+    schedule: Mapping[str, Any] | None = None
+    schedule_inputs = (gpu_worklist, cpu_worklist, schedule_inventory)
+    if any(path is not None for path in schedule_inputs):
+        if not all(path is not None for path in schedule_inputs):
+            raise ValueError(
+                "GPU worklist, CPU worklist, and schedule inventory are required together"
+            )
+        assert gpu_worklist is not None and cpu_worklist is not None
+        assert schedule_inventory is not None
+        schedule = validate_corrected_production_schedule(
+            gpu_worklist, cpu_worklist, schedule_inventory
+        )
+        if set(schedule["inventory_pair_ids"]) != {
+            _pair_id(value) for value in pair_groups
+        }:
+            raise GlobalRunError(
+                "Scheduling inventory does not match the annotation endpoint inventory"
+            )
+    marker_path = output / "metadata/corrected_run_identity.json"
+    if worker_mode and schedule is None:
+        if not marker_path.is_file():
+            raise GlobalRunError(
+                f"Corrected output was not initialized by the launcher: {marker_path}"
+            )
+        schedule = json.loads(marker_path.read_text()).get("schedule")
+        if not isinstance(schedule, dict):
+            raise GlobalRunError("Corrected run identity lacks a validated schedule")
+    identity = _run_identity(
+        context,
+        output,
+        base_config,
+        driver=driver,
+        wsi_commit=wsi_commit,
+        output_format=output_format,
+        schedule=schedule,
+    )
+    if worker_mode:
+        _validate_or_write_run_identity(output, identity, write=False)
 
     pair_table = []
     for endpoint_pair, groups in pair_groups.items():
@@ -2639,39 +3454,45 @@ def run(
             }
         )
     pair_table_path = output / "metadata/endpoint_pairs.tsv"
-    _write_tsv(pair_table_path, pair_table, list(pair_table[0]))
-    _json(
-        output / "metadata/endpoint_sequences.json",
-        {
-            "semantic_anchor_physical_indices": {
-                str(group): values for group, values in sequences.items()
+    preflight: Mapping[str, Any]
+    if not worker_mode:
+        _write_tsv(pair_table_path, pair_table, list(pair_table[0]))
+        _json(
+            output / "metadata/endpoint_sequences.json",
+            {
+                "semantic_anchor_physical_indices": {
+                    str(group): values for group, values in sequences.items()
+                },
+                "unique_endpoint_pair_count": len(pair_groups),
+                "canonical_output_positions": context.canonical_count,
+                "canonical_z_coordinate_source": str(
+                    output / "metadata/physical_sections.tsv"
+                ),
+                "configured_lddmm_nt": int(base_config["nt"]),
+                "driver": driver,
+                "selected_graphic_groups": list(context.graphic_groups),
+                "output_time_rule": "t=(z-z0)/(z1-z0) at each canonical physical z",
+                "output_format": output_format,
             },
-            "unique_endpoint_pair_count": len(pair_groups),
-            "canonical_output_positions": context.canonical_count,
-            "canonical_z_coordinate_source": str(
-                output / "metadata/physical_sections.tsv"
-            ),
-            "configured_lddmm_nt": int(base_config["nt"]),
-            "driver": driver,
-            "selected_graphic_groups": list(context.graphic_groups),
-            "output_time_rule": "t=(z-z0)/(z1-z0) at each canonical physical z",
-            "output_format": output_format,
-        },
-    )
-    preflight = build_preflight_report(
-        context,
-        output,
-        sequences,
-        pair_groups,
-        checkpoint_identities,
-        driver=driver,
-        output_format=output_format,
-    )
+        )
+        preflight = build_preflight_report(
+            context,
+            output,
+            sequences,
+            pair_groups,
+            checkpoint_identities,
+            driver_reports,
+            driver=driver,
+            output_format=output_format,
+        )
+    else:
+        preflight = json.loads((output / "metadata/preflight.json").read_text())
     planning = {
         "unique_endpoint_pairs": len(pair_groups),
         "canonical_output_positions": context.canonical_count,
         "endpoint_pair_table": str(pair_table_path),
         "configured_lddmm_nt": int(base_config["nt"]),
+        "effective_solver_configuration_sha256": configuration_sha256,
         "driver": driver,
         "selected_graphic_groups": list(context.graphic_groups),
         "output_time_rule": "t=(z-z0)/(z1-z0)",
@@ -2691,11 +3512,10 @@ def run(
             "preflight": preflight,
         }
 
-    selected = list(pair_groups) if pair is None else [pair]
-    recoverable_planes = {
+    all_recoverable_planes = {
         (group, physical)
-        for endpoint_pair in selected
-        for group in pair_groups[endpoint_pair]
+        for endpoint_pair, groups in pair_groups.items()
+        for group in groups
         for physical in range(endpoint_pair[0] + 1, endpoint_pair[1])
     }
     store = create_dense_store(
@@ -2710,34 +3530,153 @@ def run(
         context,
         output,
         store,
-        recoverable_planes,
+        all_recoverable_planes,
         checkpoint_identities,
     )
-    reports = []
+    if initialize_only:
+        if schedule is None:
+            raise ValueError("Corrected initialization requires scheduling inputs")
+        _validate_or_write_run_identity(output, identity, write=True)
+        unresolved_rows = [
+            {
+                "pair_id": pair_id,
+                "status": "known_numerically_unresolved",
+                "initial_schedule": "excluded",
+            }
+            for pair_id in schedule["known_unresolved_pair_ids"]
+        ]
+        _write_tsv(
+            output / "metadata/failures/known_unresolved.tsv",
+            unresolved_rows,
+            ["pair_id", "status", "initial_schedule"],
+        )
+        return {
+            "status": "corrected_run_initialized",
+            "run_identity": str(marker_path),
+            "planning": planning,
+            "schedule": schedule,
+            "output": str(output),
+        }
+    if consolidate_only:
+        if schedule is None:
+            raise GlobalRunError("Consolidation requires the initialized schedule")
+        return consolidate_corrected_run(
+            context,
+            output,
+            store,
+            pair_groups,
+            checkpoint_identities,
+            schedule,
+            anchor_report,
+            base_config,
+            driver=driver,
+        )
+
+    if pair_worklist is not None:
+        selected = list(_worklist_pairs(pair_worklist))
+        missing = [value for value in selected if value not in pair_groups]
+        if missing:
+            raise GlobalRunError(
+                "Worklist contains pairs outside the endpoint inventory: "
+                + ", ".join(_pair_id(value) for value in missing)
+            )
+        if schedule is None:
+            raise GlobalRunError("Worklist workers require an initialized schedule")
+        expected_ids = set(
+            schedule["gpu_pair_ids" if assigned_device == "cuda:0" else "cpu_pair_ids"]
+        )
+        if {_pair_id(value) for value in selected} != expected_ids:
+            raise GlobalRunError(
+                "Worker worklist does not match its corrected device assignment"
+            )
+    else:
+        selected = list(pair_groups) if pair is None else [pair]
+
+    reports: list[Mapping[str, Any]] = []
+    failures: list[str] = []
+    worker_label = worker_id or "serial"
     for endpoint_pair in selected:
         selected_override = nt_override if endpoint_pair == pair else None
         solver_config = pair_solver_config(base_config, selected_override)
-        reports.append(
-            process_pair(
-                context,
-                output,
-                store,
-                endpoint_pair,
-                pair_groups[endpoint_pair],
-                solver_config,
-                driver=driver,
-                checkpoint_identity=checkpoint_identities[endpoint_pair],
-                nt_source=(
-                    "command_line_override"
-                    if selected_override is not None
-                    else "configured_temporal_discretization"
-                ),
-                wsi_repository=wsi_repository,
-                device=device,
-                overwrite=overwrite,
-            )
+        token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        log_path = (
+            output
+            / "logs/pairs"
+            / worker_label
+            / f"{_pair_id(endpoint_pair)}.{token}.{os.getpid()}.log"
         )
+        started = time.monotonic()
+        try:
+            with _pair_attempt_log(log_path):
+                reports.append(
+                    process_pair(
+                        context,
+                        output,
+                        store,
+                        endpoint_pair,
+                        pair_groups[endpoint_pair],
+                        solver_config,
+                        driver=driver,
+                        checkpoint_identity=checkpoint_identities[endpoint_pair],
+                        nt_source=(
+                            "command_line_override"
+                            if selected_override is not None
+                            else "configured_temporal_discretization"
+                        ),
+                        wsi_repository=wsi_repository,
+                        device=device,
+                        overwrite=overwrite,
+                    )
+                )
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            incomplete = _incomplete_pair_planes(
+                store, endpoint_pair, pair_groups[endpoint_pair]
+            )
+            failure_path = _record_pair_failure(
+                output,
+                endpoint_pair,
+                device,
+                worker_label,
+                exc,
+                elapsed,
+                log_path,
+                checkpoint_identities[endpoint_pair],
+                incomplete,
+            )
+            failures.append(str(failure_path))
+            print(
+                f"PAIR FAILED {_pair_id(endpoint_pair)} on {device}: "
+                f"{type(exc).__name__}: {exc}; record={failure_path}",
+                file=sys.stderr,
+            )
+            if _is_global_worker_failure(exc):
+                print("Stopping worker after global run failure", file=sys.stderr)
+                break
+            continue
     immutability = assert_observed_immutable(context, output, store)
+    if worker_mode:
+        return {
+            "status": "worker_complete" if not failures else "worker_failed",
+            "worker_id": worker_label,
+            "assigned_device": device,
+            "assigned_pair_count": len(selected),
+            "completed_or_checkpointed_pair_count": len(reports),
+            "failed_attempt_count": len(failures),
+            "failure_records": failures,
+            "observed_evidence_immutability": immutability,
+            "output": str(output),
+            "exit_code": 0 if not failures else 1,
+        }
+    if failures:
+        return {
+            "status": "incomplete",
+            "reports": reports,
+            "failure_records": failures,
+            "planning": planning,
+            "output": str(output),
+            "exit_code": 1,
+        }
     if pair is not None:
         state_path = _write_state_table(context, output, store.states)
         manifest_path = store.finalize(include_combined=False)
@@ -2824,25 +3763,38 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="one required endpoint pair as LEFT_PHYSICAL_INDEX-RIGHT_PHYSICAL_INDEX",
     )
     parser.add_argument(
+        "--pair-worklist",
+        type=Path,
+        default=None,
+        help="TSV containing an assigned pair_id column for one isolated worker",
+    )
+    parser.add_argument(
         "--nt",
         type=int,
         default=None,
         help="expert nt override for one explicit --pair (use a dedicated output)",
     )
-    # parser.add_argument("--pair-config", type=Path, default=DEFAULT_PAIR_CONFIG)
+    parser.add_argument("--pair-config", type=Path, default=DEFAULT_PAIR_CONFIG)
     parser.add_argument(
-        "--pair-config",
-        type=str,
-        default="section-to-section-diffeo",
+        "--pair-profile",
+        default="section-annotation-to-section-annotation-diffeo",
         choices=tuple(coarse.PROFILE_OVERRIDES),
-        help="EM-LDDMM registration profile for pairwise densification",
+        help="profile merged into the one-scale pair JSON for annotation registration",
     )
+    parser.add_argument("--expected-configuration-sha256", default=None)
     parser.add_argument("--wsi-repository", type=Path, default=DEFAULT_WSI_REPOSITORY)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--worker-id", default=None)
+    parser.add_argument("--assigned-device", choices=("cpu", "cuda:0"), default=None)
+    parser.add_argument("--initialize-only", action="store_true")
+    parser.add_argument("--consolidate-only", action="store_true")
+    parser.add_argument("--gpu-worklist", type=Path, default=None)
+    parser.add_argument("--cpu-worklist", type=Path, default=None)
+    parser.add_argument("--schedule-inventory", type=Path, default=None)
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="recompute a selected completed pair; observed anchors remain immutable",
+        help="recompute selected pairs; observed anchors remain immutable",
     )
     parser.add_argument(
         "--anchors-only",
@@ -2877,10 +3829,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = args.output or (
         DEFAULT_ANNOTATION_OUTPUT if args.driver == "annotation" else DEFAULT_OUTPUT
     )
-    if args.overwrite and args.pair is None:
-        parser.error("--overwrite is limited to an explicitly selected --pair")
+    if args.pair is not None and args.pair_worklist is not None:
+        parser.error("--pair and --pair-worklist are mutually exclusive")
+    if args.overwrite and args.pair is None and args.pair_worklist is None:
+        parser.error("--overwrite requires --pair or --pair-worklist")
     if args.nt is not None and args.pair is None:
         parser.error("--nt requires an explicitly selected --pair")
+    if args.pair_worklist is not None and (
+        args.worker_id is None or args.assigned_device is None
+    ):
+        parser.error("--pair-worklist requires --worker-id and --assigned-device")
+    if args.assigned_device is not None and args.device != args.assigned_device:
+        parser.error("--device must equal --assigned-device for a scheduled worker")
+    if args.worker_id is not None and args.pair is None and args.pair_worklist is None:
+        parser.error("--worker-id requires --pair or --pair-worklist")
     report = run(
         dataset=dataset,
         registration=registration,
@@ -2889,17 +3851,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         driver=args.driver,
         graphic_groups=graphic_groups,
         pair=args.pair,
+        pair_worklist=args.pair_worklist,
         pair_config=args.pair_config,
+        pair_profile=args.pair_profile,
+        expected_configuration_sha256=args.expected_configuration_sha256,
         wsi_repository=args.wsi_repository,
         device=args.device,
         overwrite=args.overwrite,
+        worker_id=args.worker_id,
+        assigned_device=args.assigned_device,
+        initialize_only=args.initialize_only,
+        consolidate_only=args.consolidate_only,
+        gpu_worklist=args.gpu_worklist,
+        cpu_worklist=args.cpu_worklist,
+        schedule_inventory=args.schedule_inventory,
         nt_override=args.nt,
         anchors_only=args.anchors_only,
         output_format=args.output_format,
         tiff_compression=args.tiff_compression,
     )
+    exit_code = int(report.pop("exit_code", 0))
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
