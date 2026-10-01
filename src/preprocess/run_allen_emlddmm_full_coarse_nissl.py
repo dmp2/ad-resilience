@@ -142,13 +142,13 @@ PROFILE_OVERRIDES = {
         },
     # TODO: to finish mask-to-mask diffeo, I think the matching weights and/or the objective function must be updated
     "section-annotation-to-section-annotation-diffeo": {
-        "a": 1000.0,
-        "dv": [50.0, 2000.0, 2000.0], # keep [50.0, 2000.0, 2000.0], until we fix wsi-tissue-pipeline
+        "a": 250.0,
+        "dv": [50.0, 500.0, 500.0], # keep [50.0, 2000.0, 2000.0], until we fix wsi-tissue-pipeline
         "n_iter": [100, 50, 40],
 
         # Classical multichannel LDDMM attachment for categorical annotations.
         "order": 0,
-        "update_matching_weights": False,
+        "update_matching_weights": False, # new local emlddmm update
         # "priors": [1.0, 0.0, 0.0], # keep tissue weight, no artifacts in annotations, no background discrepancy needed
         # "update_priors": False, # only tissue mask present, no artifacts
         # "n_e_step": 1000000, # don't update the priors
@@ -157,7 +157,7 @@ PROFILE_OVERRIDES = {
         "Amode": 0,
         "eA2d": 0,
         "slice_matching": False,
-        "sigmaR": 1e5,
+        "sigmaR": 1e8, # 1e5,
         },
     }
 
