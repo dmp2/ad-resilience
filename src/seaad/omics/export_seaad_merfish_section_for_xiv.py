@@ -200,7 +200,7 @@ def _string_equal(values: np.ndarray, target: str) -> np.ndarray:
 def _select_rows(
     obs: h5py.Group,
     *,
-    section_field: str,
+    section_field: str | None,
     section_value: str,
     donor_field: str,
     donor_value: str | None,
@@ -209,6 +209,12 @@ def _select_rows(
     chunk_rows: int,
 ) -> tuple[np.ndarray, dict[str, int]]:
     n_obs = _index_length(obs)
+    if section_field is None:
+        if donor_value is not None or selection != "all":
+            raise ValueError("Whole-file export requires donor=None and selection='all'")
+        rows = np.arange(n_obs, dtype=np.int64)
+        return rows, {"n_cells_matching_section": n_obs,
+                      "n_cells_after_selection": n_obs}
     section_parts: list[np.ndarray] = []
     selected_parts: list[np.ndarray] = []
 
@@ -541,7 +547,7 @@ def export_section_for_xiv(
     section: str,
     output: str | os.PathLike[str] | None,
     donor: str | None,
-    section_field: str,
+    section_field: str | None,
     donor_field: str,
     coordinate_key: str,
     selection: str,
@@ -598,9 +604,8 @@ def export_section_for_xiv(
         obsm = f["obsm"]
         obs_cols = _table_columns(obs)
 
-        for required in [section_field]:
-            if required not in obs_cols:
-                raise KeyError(f"Required obs field not found: {required}")
+        if section_field is not None and section_field not in obs_cols:
+            raise KeyError(f"Required obs field not found: {section_field}")
         if donor is not None and donor_field not in obs_cols:
             raise KeyError(f"Donor field not found: {donor_field}")
         if selection != "all" and selection_field not in obs_cols:
