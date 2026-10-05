@@ -358,6 +358,20 @@ def build_h5ad_obs_tables(h5ad_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, 
         )
         .reset_index()
     )
+    if "Cell ID" in cell_df.columns:
+        cell_ids = (
+            cell_df.groupby(["Donor ID", "Specimen Barcode"], dropna=False)["Cell ID"]
+            .agg(n_cell_ids="count", n_unique_cell_ids="nunique")
+            .reset_index()
+        )
+        cell_ids["n_repeated_cell_id_rows"] = (
+            cell_ids["n_cell_ids"] - cell_ids["n_unique_cell_ids"]
+        )
+        section_df = section_df.merge(
+            cell_ids.drop(columns="n_cell_ids"),
+            on=["Donor ID", "Specimen Barcode"],
+            how="left",
+        )
     if "example_section_name" in section_df.columns and pd.api.types.is_numeric_dtype(section_df["example_section_name"]):
         section_df = section_df.drop(columns=["example_section_name"])
 
@@ -376,67 +390,55 @@ def build_unmatched_audit(
     spatial_lookup: pd.DataFrame,
     h5ad_section_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    spatial_lookup = spatial_lookup.copy()
-    h5ad_section_df = h5ad_section_df.copy()
+    """Audit donor/barcode pairs, including barcodes filed under another donor."""
+    spatial = spatial_lookup.copy()
+    h5ad = h5ad_section_df.copy()
+    spatial["Donor ID"] = spatial["Donor ID"].map(normalize_string)
+    spatial["matched_spatial_section_id"] = spatial["matched_spatial_section_id"].map(normalize_string)
+    h5ad["Donor ID"] = h5ad["Donor ID"].map(normalize_string)
+    h5ad["Specimen Barcode"] = h5ad["Specimen Barcode"].map(normalize_string)
 
-    spatial_lookup["matched_spatial_section_id"] = spatial_lookup["matched_spatial_section_id"].map(normalize_string)
-    h5ad_section_df["Specimen Barcode"] = h5ad_section_df["Specimen Barcode"].map(normalize_string)
-
-    h5ad_keys = set(h5ad_section_df.loc[h5ad_section_df["Specimen Barcode"] != "", "Specimen Barcode"])
-    spatial_keys = set(spatial_lookup.loc[spatial_lookup["matched_spatial_section_id"] != "", "matched_spatial_section_id"])
-
-    unmatched_h5ad = sorted(h5ad_keys - spatial_keys)
-    unmatched_spatial = sorted(spatial_keys - h5ad_keys)
-
-    spatial_simple = {simplify_string(x): x for x in spatial_keys if simplify_string(x)}
-    h5ad_simple = {simplify_string(x): x for x in h5ad_keys if simplify_string(x)}
+    h5ad_pairs = set(zip(h5ad["Donor ID"], h5ad["Specimen Barcode"]))
+    spatial_pairs = set(zip(spatial["Donor ID"], spatial["matched_spatial_section_id"]))
+    h5ad_pairs = {(donor, barcode) for donor, barcode in h5ad_pairs if donor and barcode}
+    spatial_pairs = {(donor, barcode) for donor, barcode in spatial_pairs if donor and barcode}
+    h5ad_barcodes = {barcode for _, barcode in h5ad_pairs}
+    spatial_barcodes = {barcode for _, barcode in spatial_pairs}
+    h5ad_simple = {simplify_string(barcode): barcode for barcode in h5ad_barcodes}
+    spatial_simple = {simplify_string(barcode): barcode for barcode in spatial_barcodes}
 
     rows: List[Dict[str, object]] = []
-    h5ad_donor_map = (
-        h5ad_section_df[["Donor ID", "Specimen Barcode", "n_cells_or_obs"]]
-        .drop_duplicates()
-        .rename(columns={"Specimen Barcode": "section_key"})
-    )
-    spatial_donor_map = (
-        spatial_lookup[["Donor ID", "matched_spatial_section_id", "spatial_section_path"]]
-        .drop_duplicates()
-        .rename(columns={"matched_spatial_section_id": "section_key"})
-    )
-
-    for key in unmatched_h5ad:
-        simple = simplify_string(key)
-        rows.append({
-            "unmatched_type": "h5ad_only",
-            "section_key": key,
-            "Donor ID": next((v for v in h5ad_donor_map.loc[h5ad_donor_map["section_key"] == key, "Donor ID"].tolist() if normalize_string(v)), ""),
-            "n_cells_or_obs": int(h5ad_donor_map.loc[h5ad_donor_map["section_key"] == key, "n_cells_or_obs"].sum()),
-            "exists_in_h5ad": True,
-            "exists_in_spatial_manifest": False,
-            "possible_formatting_issue": simple in spatial_simple,
-            "possible_matching_key_after_simplify": spatial_simple.get(simple, ""),
-            "spatial_section_path": "",
-            "note": "Present in merged h5ad but absent from spatial section manifest",
-        })
-
-    for key in unmatched_spatial:
-        simple = simplify_string(key)
-        rows.append({
-            "unmatched_type": "spatial_manifest_only",
-            "section_key": key,
-            "Donor ID": next((v for v in spatial_donor_map.loc[spatial_donor_map["section_key"] == key, "Donor ID"].tolist() if normalize_string(v)), ""),
-            "n_cells_or_obs": pd.NA,
-            "exists_in_h5ad": False,
-            "exists_in_spatial_manifest": True,
-            "possible_formatting_issue": simple in h5ad_simple,
-            "possible_matching_key_after_simplify": h5ad_simple.get(simple, ""),
-            "spatial_section_path": next((v for v in spatial_donor_map.loc[spatial_donor_map["section_key"] == key, "spatial_section_path"].tolist() if normalize_string(v)), ""),
-            "note": "Present in spatial section manifest but absent from merged h5ad",
-        })
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values(["unmatched_type", "Donor ID", "section_key"]).reset_index(drop=True)
-    return out
+    for kind, missing, other, other_barcodes, other_simple in [
+        ("h5ad_only", h5ad_pairs - spatial_pairs, spatial_pairs, spatial_barcodes, spatial_simple),
+        ("spatial_manifest_only", spatial_pairs - h5ad_pairs, h5ad_pairs, h5ad_barcodes, h5ad_simple),
+    ]:
+        for donor, barcode in sorted(missing):
+            counterpart = sorted({d for d, s in other if s == barcode and d != donor})
+            simplified = simplify_string(barcode)
+            formatting_issue = barcode not in other_barcodes and simplified in other_simple
+            if counterpart:
+                note = "Barcode listed under a different donor"
+            elif kind == "h5ad_only":
+                note = "Present in merged h5ad but absent from spatial section manifest"
+            else:
+                note = "Present in spatial section manifest but absent from merged h5ad"
+            match = h5ad[(h5ad["Donor ID"] == donor) & (h5ad["Specimen Barcode"] == barcode)]
+            raw = spatial[(spatial["Donor ID"] == donor) &
+                          (spatial["matched_spatial_section_id"] == barcode)]
+            rows.append({
+                "unmatched_type": kind,
+                "section_key": barcode,
+                "Donor ID": donor,
+                "counterpart_donor_id": " | ".join(counterpart),
+                "n_cells_or_obs": int(match["n_cells_or_obs"].sum()) if kind == "h5ad_only" else pd.NA,
+                "exists_in_h5ad": kind == "h5ad_only",
+                "exists_in_spatial_manifest": kind == "spatial_manifest_only",
+                "possible_formatting_issue": formatting_issue,
+                "possible_matching_key_after_simplify": other_simple.get(simplified, "") if formatting_issue else "",
+                "spatial_section_path": " | ".join(sorted(set(raw["spatial_section_path"].dropna().astype(str)))) if kind == "spatial_manifest_only" else "",
+                "note": note,
+            })
+    return pd.DataFrame(rows).sort_values(["unmatched_type", "Donor ID", "section_key"]).reset_index(drop=True) if rows else pd.DataFrame()
 
 
 
@@ -494,6 +496,8 @@ def build_canonical_crosswalk(
         "Specimen Barcode",
         "matched_spatial_section_id",
         "n_cells_or_obs",
+        "n_unique_cell_ids",
+        "n_repeated_cell_id_rows",
         "spatial_section_path",
         "has_spatial_raw_images",
         "has_detected_transcripts_csv",
@@ -548,6 +552,8 @@ def build_canonical_crosswalk(
         "n_matched_sections": int((section_canonical["section_match_status"] == "matched").sum()),
         "n_unmatched_sections": int((section_canonical["section_match_status"] == "unmatched").sum()),
         "n_unmatched_audit_rows": int(len(unmatched_audit)),
+        "n_sections_with_repeated_cell_ids": int((section_canonical["n_repeated_cell_id_rows"] > 0).sum()) if "n_repeated_cell_id_rows" in section_canonical else None,
+        "n_repeated_cell_id_rows": int(section_canonical["n_repeated_cell_id_rows"].sum()) if "n_repeated_cell_id_rows" in section_canonical else None,
         "celllevel_output": str(cell_parquet),
         "celllevel_output_status": parquet_status,
         "h5ad_meta": h5ad_meta,

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Render SEA-AD MERFISH sections and a donor montage from xIV particles."""
+"""Render SEA-AD spatial sections and donor montages from xIV particles."""
 
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import hashlib
 import json
 import os
@@ -24,7 +25,9 @@ from omics.visualize_seaad_merfish_section import _obs_column_length, _read_obs_
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 OUTPUT_ROOT = REPO_ROOT / "data/derivatives/sea-ad/merfish"
+XENIUM_OUTPUT_ROOT = REPO_ROOT / "data/derivatives/sea-ad/xenium"
 RAW_ROOT = REPO_ROOT / "data/raw/sea-ad/merfish"
+XENIUM_RAW_ROOT = REPO_ROOT / "data/raw/sea-ad/xenium"
 STEM = "full_section_particles"
 
 
@@ -41,6 +44,7 @@ class SourceSpec(NamedTuple):
     section_field: str | None
     coordinate_key: str
     feature_field: str
+    assay: str = "MERFISH"
 
 
 SINGLE_SPECIMENS = {
@@ -53,6 +57,8 @@ DONOR_MAPPING_URL = "https://community.brain-map.org/t/donor-mapping-for-merfish
 
 
 def _source_spec(path: Path) -> SourceSpec:
+    if path.name == "CaH_Xenium.2026-01-07.h5ad":
+        return SourceSpec("CaH", None, None, "barcode", "spatial", "Subclass", "Xenium")
     if path.name in SINGLE_SPECIMENS:
         return SINGLE_SPECIMENS[path.name]
     match = re.fullmatch(r"SEAAD_([A-Za-z0-9]+)_MERFISH\..+\.h5ad", path.name)
@@ -62,24 +68,23 @@ def _source_spec(path: Path) -> SourceSpec:
                       "X_spatial_raw", "Subclass")
 
 
-def _sections_for_donor(h5ad: Path, donor: str, chunk_rows: int) -> list[str]:
-    """Find all barcodes without loading the expression matrix."""
+def _donor_sections(h5ad: Path, chunk_rows: int) -> dict[str, list[str]]:
+    """Index source donor/barcode pairs without loading the expression matrix."""
     spec = _source_spec(h5ad)
     if spec.section is not None:
-        return [spec.section] if donor == spec.donor else []
-    barcodes: set[str] = set()
+        return {spec.donor: [spec.section]}
+    pairs: dict[str, set[str]] = defaultdict(set)
     with h5py.File(h5ad, "r") as handle:
         obs = handle["obs"]
         n = _obs_column_length(obs, "Donor ID")
         for start in range(0, n, chunk_rows):
             stop = min(n, start + chunk_rows)
             donors = _read_obs_chunk(obs, "Donor ID", start, stop)
-            matches = donors == donor
-            if np.any(matches):
-                sections = _read_obs_chunk(obs, "Specimen Barcode", start, stop)
-                barcodes.update(str(value) for value in sections[matches]
-                                if value is not None and str(value) not in {"", "nan"})
-    return sorted(barcodes)
+            sections = _read_obs_chunk(obs, spec.section_field, start, stop)
+            for donor, section in zip(donors, sections):
+                if donor is not None and section is not None:
+                    pairs[str(donor)].add(str(section))
+    return {donor: sorted(sections) for donor, sections in pairs.items()}
 
 
 def _subclass_colors(h5ad: Path, labels: list[str], field: str) -> tuple[list[str], str]:
@@ -152,7 +157,7 @@ def _render(Z: np.ndarray, nu: np.ndarray, labels: list[str], colors: list[str],
         legend.text(0.99, y_pos, f"{counts[i]:,}", va="center", ha="right",
                     fontsize=8.1, color="#59636e", transform=legend.transAxes)
 
-    fig.text(0.035, 0.955, f"SEA-AD {spec.region} MERFISH", fontsize=18, fontweight="bold")
+    fig.text(0.035, 0.955, f"SEA-AD {spec.region} {spec.assay}", fontsize=18, fontweight="bold")
     fig.text(0.035, 0.916, f"Donor {donor}  ·  Specimen {section}  ·  {len(Z):,} cells",
              fontsize=11, color="#4b5563")
     fig.text(0.035, 0.045,
@@ -199,6 +204,8 @@ def _update_catalog(path: Path, donor: str, spec: SourceSpec, h5ad: Path, labels
     }
     if spec.donor is not None:
         shared["donor_id_source"] = DONOR_MAPPING_URL
+    if spec.assay != "MERFISH":
+        shared["assay"] = spec.assay
     catalog = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
         **shared, "sections": {}
     }
@@ -230,7 +237,7 @@ def make_figure(h5ad: Path, donor: str, section: str, output_root: Path,
         raise FileExistsError(f"Derivative exists in {directory}; use --overwrite")
     directory.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="seaad_merfish_") as staging:
+    with tempfile.TemporaryDirectory(prefix="seaad_spatial_") as staging:
         npz, _, meta = export_section_for_xiv(
             h5ad_path=h5ad, section=section,
             donor=donor if spec.section_field is not None else None,
@@ -292,7 +299,7 @@ def make_figure(h5ad: Path, donor: str, section: str, output_root: Path,
     return directory
 
 
-def _make_montage(donor_dir: Path, donor: str) -> Path:
+def _make_montage(donor_dir: Path, donor: str, assay: str = "MERFISH") -> Path:
     """Tile the existing full-section PNGs; their legends and labels stay intact."""
     from PIL import Image, ImageDraw, ImageFont
 
@@ -323,7 +330,7 @@ def _make_montage(donor_dir: Path, donor: str) -> Path:
         font = ImageFont.truetype("DejaVuSans.ttf", 42)
     except OSError:
         font = ImageFont.load_default()
-    draw.text((gap, 22), f"SEA-AD MERFISH · Donor {donor} · {len(panels)} sections",
+    draw.text((gap, 22), f"SEA-AD {assay} · Donor {donor} · {len(panels)} sections",
               fill="#263238", font=font)
     for index, panel in enumerate(panels):
         with Image.open(panel) as source:
@@ -333,80 +340,100 @@ def _make_montage(donor_dir: Path, donor: str) -> Path:
         if row == rows - 1 and len(panels) % columns == 1:
             x += (width + gap) // 2
         canvas.paste(image, (x, header + gap + row * (height + gap)))
-    output = donor_dir / "merfish_montage.png"
+    output = donor_dir / f"{assay.lower()}_montage.png"
     canvas.save(output, optimize=True)
     return output
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--assay", choices=("merfish", "xenium"), default="merfish")
     parser.add_argument("--h5ad", type=Path, action="append",
-                        help="MERFISH H5AD; repeat for more ROIs. Batch default: all local MERFISH H5ADs")
-    parser.add_argument("--donor", required=True, help="Exact Donor ID")
+                        help="H5AD source; repeat for multiple ROIs. Default: local files for assay")
+    donors = parser.add_mutually_exclusive_group(required=True)
+    donors.add_argument("--donor", help="Exact Donor ID")
+    donors.add_argument("--all-donors", action="store_true",
+                        help="Process every donor found in the selected H5AD files")
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--section", help="Exact Specimen Barcode")
     selection.add_argument("--all-sections", action="store_true",
-                           help="Make every section for this donor, then a subject montage")
-    parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
+                           help="Make every section and donor montage")
+    parser.add_argument("--output-root", type=Path)
     parser.add_argument("--chunk-rows", type=int, default=250_000)
     parser.add_argument("--pdf", action="store_true", help="Also save PDF section figures")
     parser.add_argument("--no-npz", action="store_true",
-                        help="Omit registration-ready xIV NPZ files from the derivatives")
+                        help="Omit registration-ready xIV NPZ files from derivatives")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     if args.chunk_rows < 1:
         parser.error("--chunk-rows must be positive")
-    sources = args.h5ad or sorted([*RAW_ROOT.glob("SEAAD_*_MERFISH*.h5ad"),
-                                   *RAW_ROOT.glob("*/*_mapped.h5ad")])
+    if args.all_donors and args.section:
+        parser.error("--all-donors requires --all-sections")
+    output_root = args.output_root or (OUTPUT_ROOT if args.assay == "merfish"
+                                       else XENIUM_OUTPUT_ROOT)
+    if args.h5ad:
+        sources = args.h5ad
+    elif args.assay == "merfish":
+        sources = sorted([*RAW_ROOT.glob("SEAAD_*_MERFISH*.h5ad"),
+                          *RAW_ROOT.glob("*/*_mapped.h5ad")])
+    else:
+        sources = sorted(XENIUM_RAW_ROOT.glob("*/*_Xenium*.h5ad"))
     if not sources:
-        parser.error("No MERFISH H5AD found; pass --h5ad")
+        parser.error(f"No local {args.assay} H5AD found; pass --h5ad")
     if args.section and len(sources) != 1:
         parser.error("--section requires exactly one --h5ad")
-    regions = []
+    specs = []
     for source in sources:
         if not source.is_file():
             parser.error(f"H5AD not found: {source}")
         try:
-            regions.append(_source_spec(source).region)
+            spec = _source_spec(source)
         except ValueError as exc:
             parser.error(str(exc))
-    if len(regions) != len(set(regions)):
-        parser.error("Pass only one MERFISH H5AD per ROI")
+        if spec.assay.lower() != args.assay:
+            parser.error(f"{source.name} is {spec.assay}, not {args.assay}")
+        specs.append(spec)
+    if len({spec.region for spec in specs}) != len(specs):
+        parser.error("Pass only one H5AD per ROI")
 
     if args.section:
-        path = make_figure(sources[0], args.donor, args.section, args.output_root,
+        path = make_figure(sources[0], args.donor, args.section, output_root,
                            args.chunk_rows, args.overwrite, args.pdf, not args.no_npz)
-        print(f"Wrote MERFISH section derivatives: {path}")
+        print(f"Wrote spatial section derivatives: {path}")
         return 0
 
-    for source in sources:
-        spec = _source_spec(source)
-        sections = _sections_for_donor(source, args.donor, args.chunk_rows)
-        if not sections:
-            continue
-        region = spec.region
-        print(f"{region}: {len(sections)} sections for donor {args.donor}", flush=True)
-        for section in sections:
-            directory = args.output_root / args.donor / region / section
-            catalog_path = directory.parent / "sections.json"
-            entry = (json.loads(catalog_path.read_text(encoding="utf-8"))
-                     .get("sections", {}).get(section) if catalog_path.exists() else None)
-            needed = {"png", "vtk"}
-            if not args.no_npz:
-                needed.add("npz")
-            if args.pdf:
-                needed.add("pdf")
-            if (not args.overwrite and entry and
-                    needed.issubset(entry.get("files", {})) and
-                    all((catalog_path.parent / entry["files"][ext]).is_file()
-                        for ext in needed)):
-                print(f"  Reusing {section}", flush=True)
+    processed_donors: set[str] = set()
+    for source, spec in zip(sources, specs):
+        available = _donor_sections(source, args.chunk_rows)
+        donor_ids = sorted(available) if args.all_donors else [args.donor]
+        for donor in donor_ids:
+            sections = available.get(donor, [])
+            if not sections:
                 continue
-            make_figure(source, args.donor, section, args.output_root,
-                        args.chunk_rows, args.overwrite, args.pdf, not args.no_npz)
-            print(f"  Wrote {section}", flush=True)
-    montage = _make_montage(args.output_root / args.donor, args.donor)
-    print(f"Wrote subject montage: {montage}")
+            processed_donors.add(donor)
+            print(f"{spec.assay} {spec.region} {donor}: {len(sections)} sections", flush=True)
+            for section in sections:
+                directory = output_root / donor / spec.region / section
+                catalog_path = directory.parent / "sections.json"
+                entry = (json.loads(catalog_path.read_text(encoding="utf-8"))
+                         .get("sections", {}).get(section) if catalog_path.exists() else None)
+                needed = {"png", "vtk"}
+                if not args.no_npz:
+                    needed.add("npz")
+                if args.pdf:
+                    needed.add("pdf")
+                if (not args.overwrite and entry and
+                        needed.issubset(entry.get("files", {})) and
+                        all((catalog_path.parent / entry["files"][ext]).is_file()
+                            for ext in needed)):
+                    print(f"  Reusing {section}", flush=True)
+                    continue
+                make_figure(source, donor, section, output_root,
+                            args.chunk_rows, args.overwrite, args.pdf, not args.no_npz)
+                print(f"  Wrote {section}", flush=True)
+    for donor in sorted(processed_donors):
+        montage = _make_montage(output_root / donor, donor, specs[0].assay)
+        print(f"Wrote donor montage: {montage}", flush=True)
     return 0
 
 

@@ -214,28 +214,38 @@ PYTHONPATH=src/seaad python -m cli.omics_extract_genes \
 
 Matching is case-sensitive and exact against both the AnnData `var/index` gene symbol/name and `var/gene_ids` Ensembl ID. Missing requests are printed in the command summary and written beside the output as `<output>.missing_genes.txt`.
 
-## SEA-AD MERFISH particle figures and donor montages
+## SEA-AD spatial particle figures and donor montages
 
-Keep the public merged MTG H5AD at `data/raw/sea-ad/merfish/SEAAD_MTG_MERFISH.2024-12-11.h5ad` ([source](https://sea-ad-spatial-transcriptomics.s3.amazonaws.com/middle-temporal-gyrus/all_donors-h5ad/SEAAD_MTG_MERFISH.2024-12-11.h5ad)). The two single-specimen releases go under the same raw tree:
+The processed H5ADs provide the cell coordinates and subclass labels needed for full-section particle figures. Keep them under `data/raw/sea-ad/`:
+
+| Assay and ROI | Source H5AD | Local path |
+| --- | --- | --- |
+| MERFISH MTG | [merged MTG release](https://sea-ad-spatial-transcriptomics.s3.amazonaws.com/middle-temporal-gyrus/all_donors-h5ad/SEAAD_MTG_MERFISH.2024-12-11.h5ad) | `merfish/SEAAD_MTG_MERFISH.2024-12-11.h5ad` |
+| MERFISH MEC | [single specimen](https://sea-ad-spatial-transcriptomics.s3.amazonaws.com/medial-entorhinal-cortex/combined_anndata_object/1444201261_MEC_mapped.h5ad) | `merfish/MEC/1444201261_MEC_mapped.h5ad` |
+| MERFISH HPF | [single specimen](https://sea-ad-spatial-transcriptomics.s3.amazonaws.com/hippocampus/combined_anndata_object/1444211893_HPF_mapped.h5ad) | `merfish/HPF/1444211893_HPF_mapped.h5ad` |
+| Xenium CaH | [combined caudate release](https://sea-ad-spatial-transcriptomics.s3.amazonaws.com/caudate_nucleus/combined_anndata_object/CaH_Xenium.2026-01-07.h5ad) | `xenium/CaH/CaH_Xenium.2026-01-07.h5ad` |
+
+The [Allen Brain Map team](https://community.brain-map.org/t/donor-mapping-for-merfish-mec-hpf-specimens/5020) identified the MEC and HPF files as one specimen each from `H24.30.005`; their donor and specimen IDs are absent from `obs`. MTG and CaH carry donor/barcode columns in their H5ADs. The merged MTG H5AD is sufficient for these figures; raw microscopy TIFFs and transcript files are not needed.
+
+Run the assay-neutral entry point with the project xIV-LDDMM Python environment and `h5py` available:
 
 ```bash
-mkdir -p data/raw/sea-ad/merfish/{MEC,HPF}
-curl -L https://sea-ad-spatial-transcriptomics.s3.amazonaws.com/medial-entorhinal-cortex/combined_anndata_object/1444201261_MEC_mapped.h5ad \
-  -o data/raw/sea-ad/merfish/MEC/1444201261_MEC_mapped.h5ad
-curl -L https://sea-ad-spatial-transcriptomics.s3.amazonaws.com/hippocampus/combined_anndata_object/1444211893_HPF_mapped.h5ad \
-  -o data/raw/sea-ad/merfish/HPF/1444211893_HPF_mapped.h5ad
+# All 69 MTG MERFISH sections across 27 donors, with a montage per donor.
+PYTHONPATH=.cache/merfish-deps:src/seaad python -m omics.figure_seaad_spatial_particles \
+  --assay merfish --h5ad data/raw/sea-ad/merfish/SEAAD_MTG_MERFISH.2024-12-11.h5ad \
+  --all-donors --all-sections
+
+# Four CaH Xenium sections for H20.33.012 and one Xenium montage.
+PYTHONPATH=.cache/merfish-deps:src/seaad python -m omics.figure_seaad_spatial_particles \
+  --assay xenium --donor H20.33.012 --all-sections
+
+# MEC and HPF MERFISH sections for H24.30.005 and one MERFISH montage.
+PYTHONPATH=.cache/merfish-deps:src/seaad python -m omics.figure_seaad_spatial_particles \
+  --assay merfish --donor H24.30.005 --all-sections
 ```
 
-Each of those files is one section from donor `H24.30.005`, as confirmed by the [Allen Brain Map team](https://community.brain-map.org/t/donor-mapping-for-merfish-mec-hpf-specimens/5020). Their donor and specimen IDs are absent from `obs`, so the figure command records that external mapping explicitly. The merged MTG file has three sections for donor `H20.33.012`. Run the same command for either donor:
+The commands reuse complete section outputs unless `--overwrite` is given. Add `--pdf` for PDF figures or `--no-npz` to omit the registration-ready xIV input. Each section produces a PNG, VTK point cloud, and NPZ under `data/derivatives/sea-ad/<assay>/<Donor ID>/<ROI>/<Specimen Barcode>/`. Each ROI has one compact `sections.json`; donor montages are `merfish_montage.png` or `xenium_montage.png` at the donor level. xIV reads `Z` and `nu_Z` from NPZ; PyVista and ParaView can open VTK. The H5ADs remain the detailed cell metadata source.
 
-```bash
-# Run with the project xIV-LDDMM Python environment and h5py available.
-PYTHONPATH=.cache/merfish-deps:src/seaad python -m omics.figure_seaad_merfish_particles \
-  --donor H20.33.012 --all-sections
-PYTHONPATH=.cache/merfish-deps:src/seaad python -m omics.figure_seaad_merfish_particles \
-  --donor H24.30.005 --all-sections
-```
+The source coordinate/feature pairs are `X_spatial_raw`/`Subclass` for MTG, `spatial`/`Subclass_scANVI` for MEC and HPF, and `spatial`/`Subclass` for CaH. The figures include all cells with finite 2D coordinates, with missing subclass values assigned to a labeled channel. The xIV z coordinate is zero padding, not anatomical depth; these montages do not align sections in 3D. The MTG source does not label a left or right hemisphere, so the figures leave laterality unspecified.
 
-The command discovers the local MTG and mapped MEC/HPF H5ADs, reuses completed sections, and writes a donor montage to `data/derivatives/sea-ad/merfish/<Donor ID>/merfish_montage.png`. Pass `--h5ad` for an explicit source, with `--section` for one MTG barcode or one mapped specimen. For every section, `data/derivatives/sea-ad/merfish/<Donor ID>/<ROI>/<Specimen Barcode>/` contains a PNG, VTK point cloud, and xIV NPZ. `--pdf` adds a PDF; `--no-npz` omits the registration-ready NPZ. One compact `<Donor ID>/<ROI>/sections.json` catalogs each ROI. xIV reads `Z` and `nu_Z` from NPZ; VTK is for PyVista or ParaView. The H5ADs remain the detailed cell metadata source.
-
-MTG uses `X_spatial_raw` and `Subclass`; MEC/HPF use `spatial` and `Subclass_scANVI`. All figures include every cell with finite coordinates and retain missing subclass values as a labeled channel. The source coordinates are 2D; the exported xIV z coordinate is zero padding, not registered anatomical depth. The merged MTG H5AD does not identify left/right hemisphere, and the MEC/HPF files do not provide between-region alignment. Do not interpret the two-region montage as a spatial registration.
+MTG source audit: the merged H5AD has 1,887,729 observation rows across 69 sections, but seven sections contain two rows for every `Cell ID` at the same coordinates (234,737 repeated rows). Spot counts differ for every pair, sampled pairs also differ in expression, and 24,362 pairs have different `Subclass` labels. These sections are `H20.33.015`/`1296199271`, `1296199276`, `1296199281`; `H21.33.040`/`1296199298`, `1296199308`; and `H21.33.031`/`1296510469`, `1296510477`. Their existing all-row figures are useful for geometry review, but their particle weights and subclass colors are ambiguous for quantitative registration until the two source representations are resolved. The canonical MTG crosswalk now reports repeated cell IDs by section.
