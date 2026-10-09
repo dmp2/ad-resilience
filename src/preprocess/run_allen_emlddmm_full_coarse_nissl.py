@@ -138,26 +138,32 @@ PROFILE_OVERRIDES = {
         "Amode": 0,
         "eA2d": 0,
         "slice_matching": False,
+        "update_A": False, # don't update global 3D affine 
         "sigmaR": 1e5,
+        "out_of_plane": False, # only in-plane diffeo for slices
+        "combine_velocities": "forward", # wsi-pipeline specfic argument
         },
     # TODO: to finish mask-to-mask diffeo, I think the matching weights and/or the objective function must be updated
     "section-annotation-to-section-annotation-diffeo": {
-        "a": 250.0,
-        "dv": [50.0, 500.0, 500.0], # keep [50.0, 2000.0, 2000.0], until we fix wsi-tissue-pipeline
+        "a": 500.0,
+        "dv": [1000.0, 1000.0],
         "n_iter": [100, 50, 40],
 
         # Classical multichannel LDDMM attachment for categorical annotations.
         "order": 0,
         "update_matching_weights": False, # new local emlddmm update
+        "update_A": False, # don't update global 3D affine 
         # "priors": [1.0, 0.0, 0.0], # keep tissue weight, no artifacts in annotations, no background discrepancy needed
         # "update_priors": False, # only tissue mask present, no artifacts
         # "n_e_step": 1000000, # don't update the priors
 
-        "eA": 0,
-        "Amode": 0,
-        "eA2d": 0,
+        "eA": 0.,
+        "Amode": 0.,
+        "eA2d": 0.,
         "slice_matching": False,
-        "sigmaR": 1e8, # 1e5,
+        "sigmaR": 1e5, # 1e5,
+        "out_of_plane": False, # only in-plane diffeo for slices
+        "combine_velocities": "forward", # wsi-pipeline specfic argument
         },
     }
 

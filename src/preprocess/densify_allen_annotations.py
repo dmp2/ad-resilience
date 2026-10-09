@@ -60,7 +60,7 @@ DEFAULT_ANNOTATION_GROUPS = (31, 265297118)
 DEFAULT_PAIR_CONFIG = PROJECT / "configs/allen_dense_pairwise.json"
 DEFAULT_WSI_REPOSITORY = PROJECT.parent / "wsi-tissue-pipeline"
 DEFAULT_EMLDDMM_REPOSITORY = PROJECT.parent / "emlddmm"
-WSI_PIN = "d4d118a47d08700c8c30cf852b855e14e411bbdf"
+WSI_PIN = "e14cb6c59ed9b787ad4889b6aafc982a9d99f58a"
 CORRECTED_PRODUCTION_CONFIGURATION_SHA256 = (
     "c77abf66122961056da1d42ec8e544731582a0fb7be84b828b0f69806ae49457"
 )
@@ -980,6 +980,16 @@ def effective_pair_config(
             profile["update_matching_weights"]
         )
 
+    # This is a wsi-specific argument for a wrapper function around the em-lddmm function.
+    if "combine_velocities" in profile:
+        combine_velocities = str(profile["combine_velocities"])
+        if combine_velocities not in {"average", "forward", "backward"}:
+            raise RuntimeError(
+                f"Pair profile {profile_name!r} has invalid "
+                f"combine_velocities={combine_velocities!r}"
+            )
+        config["combine_velocities"] = combine_velocities
+
     return _load_pair_config_from_mapping(config)
 
 
@@ -1018,8 +1028,8 @@ def pair_solver_config(
 
 def _effective_velocity_spacing(
     config: Mapping[str, Any],
-) -> tuple[float, float, float]:
-    """Resolve the final synthetic-3D velocity spacing without running EM-LDDMM."""
+) -> tuple[float, ...]:
+    """Resolve the configured WSI velocity spacing without running EM-LDDMM."""
     value = config.get("dv")
     while (
         isinstance(value, Sequence)
@@ -1027,18 +1037,21 @@ def _effective_velocity_spacing(
         and len(value) == 1
     ):
         value = value[0]
+
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         if value and isinstance(value[-1], Sequence):
             value = value[-1]
-        values = tuple(float(item) for item in value)
-        if len(values) != 3:
+        spacing = tuple(float(item) for item in value)
+        if len(spacing) not in (2, 3):
             raise RuntimeError(f"Cannot estimate velocity grid from dv={value!r}")
-        spacing = values
     else:
         scalar = float(value)
+        # Preserve the legacy scalar interpretation.
         spacing = (scalar, scalar, scalar)
+
     if any(item <= 0 or not np.isfinite(item) for item in spacing):
         raise RuntimeError(f"Cannot estimate velocity grid from dv={value!r}")
+
     return spacing
 
 
@@ -1068,17 +1081,37 @@ def estimate_pair_registration_memory(
         for axis in registered_axes
     ]
     synthetic_spacing = float(np.mean(axis_steps))
-    backend_extents = (
-        synthetic_spacing,
-        float(np.ptp(registered_axes[0])),
-        float(np.ptp(registered_axes[1])),
-    )
     velocity_spacing = _effective_velocity_spacing(config)
+
+    if len(velocity_spacing) == 2:
+        # Current WSI annotation backend: native 2-D velocity field.
+        backend_extents = (
+            float(np.ptp(registered_axes[0])),
+            float(np.ptp(registered_axes[1])),
+        )
+        velocity_components = 2
+    elif len(velocity_spacing) == 3:
+        # Legacy synthetic-3-D WSI path.
+        backend_extents = (
+            synthetic_spacing,
+            float(np.ptp(registered_axes[0])),
+            float(np.ptp(registered_axes[1])),
+        )
+        velocity_components = 3
+    else:
+        raise RuntimeError(
+            f"Unsupported velocity spacing dimensionality: {velocity_spacing!r}"
+        )
+
     velocity_shape = tuple(
         max(1, int(np.ceil(1.4 * extent / spacing)))
-        for extent, spacing in zip(backend_extents, velocity_spacing, strict=True)
+        for extent, spacing in zip(
+            backend_extents, velocity_spacing, strict=True
+        )
     )
-    velocity_values = nt * 3 * int(np.prod(velocity_shape))
+    velocity_values = (
+        nt * velocity_components * int(np.prod(velocity_shape))
+    )
     map_values = (nt + 1) * 2 * image_pixels
 
     # These terms mirror the arrays held by the current WSI wrapper. The
