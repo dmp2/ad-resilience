@@ -12,12 +12,11 @@ DATASET="data/derivatives/allen/specimen_708424/histology_symmetric_nissl_native
 ANNOTATIONS="data/derivatives/allen/specimen_708424/annotations_symmetric_nissl_native_200um_section_aligned"
 REGISTRATION="results/allen/specimen_708424/emlddmm/native-200um-clean/HIST_NISSL_SYMMETRIC_SECTION_ALIGNED_to_MRI_7T_WHOLE"
 HISTORICAL_OUTPUT="data/derivatives/allen/specimen_708424/annotations_dense_annotation_driven_200um_groups_31_265297118"
-OUTPUT="data/derivatives/allen/specimen_708424/annotations_dense_annotation_driven_corrected_200um_groups_31_265297118"
-PAIR_CONFIG="configs/allen_dense_pairwise.json"
-PAIR_PROFILE="section-to-section-diffeo"
-EXPECTED_CONFIG_SHA256="c77abf66122961056da1d42ec8e544731582a0fb7be84b828b0f69806ae49457"
+OUTPUT="data/derivatives/allen/specimen_708424/annotations_dense_annotation_driven_wsi_seg_200um_groups_31_265297118"
+PAIR_CONFIG="configs/allen_dense_pairwise_wsi_seg.json"
+EXPECTED_CONFIG_SHA256="6442fa60eb8db8f8b9056c377359ca2725e2d0418a9a477f0feeebae8cdb6ae1"
 WSI_REPOSITORY="/cis/home/dpadova/Documents/git/wsi-tissue-pipeline"
-SCHEDULE_ROOT="results/diagnostics/allen_cpu_gpu_scheduling"
+SCHEDULE_ROOT="results/diagnostics/allen_wsi_gpu_calibration"
 GPU_WORKLIST="$SCHEDULE_ROOT/corrected_production_gpu_worklist.tsv"
 CPU_WORKLIST="$SCHEDULE_ROOT/corrected_production_cpu_worklist.tsv"
 INVENTORY="$SCHEDULE_ROOT/final_cpu_gpu_eligibility_105_pairs.tsv"
@@ -33,7 +32,6 @@ COMMON_ARGS=(
     --output-format tiff
     --tiff-compression deflate
     --pair-config "$PAIR_CONFIG"
-    --pair-profile "$PAIR_PROFILE"
     --expected-configuration-sha256 "$EXPECTED_CONFIG_SHA256"
     --wsi-repository "$WSI_REPOSITORY"
 )
@@ -148,6 +146,7 @@ run_worker() {
             return 2
             ;;
     esac
+    check_inputs
     : "${ALLEN_LAUNCH_STATE:?ALLEN_LAUNCH_STATE is required for worker mode}"
     local state_dir="$ALLEN_LAUNCH_STATE"
     mkdir -p "$state_dir" "$LOG_ROOT"
@@ -269,9 +268,9 @@ launch_tmux() {
     tmux send-keys -t "$SESSION:cpu" "$cpu_command" C-m
 
     echo "Created tmux session: $SESSION"
-    echo "GPU worker: cuda:0, 80 pairs"
-    echo "CPU worker: cpu, 24 pairs"
-    echo "Known unresolved pair excluded: 1716-1787"
+    echo "GPU worker: cuda:0, $(($(wc -l < "$GPU_WORKLIST") - 1)) pairs"
+    echo "CPU worker: cpu, $(($(wc -l < "$CPU_WORKLIST") - 1)) pairs"
+    echo "Unresolved pairs are excluded according to the calibrated inventory"
     echo "Attach with: tmux attach -t $SESSION"
 }
 
@@ -295,7 +294,6 @@ case "$mode" in
         ;;
     worker)
         activate_environment
-        check_inputs
         run_worker "${2:-}"
         ;;
     serial)

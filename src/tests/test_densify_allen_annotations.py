@@ -306,6 +306,9 @@ def test_pair_config_uses_modest_configurable_temporal_nt():
 
 
 def test_gpu_memory_calibration_uses_measured_fit_and_device_reserve():
+    identity = {key: "same" for key in dense.gpu_memory.IDENTITY_FIELDS}
+    identity.update(mapping_backend=dense.gpu_memory.BACKEND, structural_model=dense.gpu_memory.MODEL,
+        upsample_mode="seg", image_shape_yx=[10, 20], cuda_total_bytes=1000)
     pilots = []
     for pair_id, structural, reserved, free in (
         ("low", 100, 150, 900),
@@ -315,6 +318,10 @@ def test_gpu_memory_calibration_uses_measured_fit_and_device_reserve():
         pilots.append(
             {
                 "pair_id": pair_id,
+                "device": "cuda:0", "outcome": "success",
+                "driver_channel_count": structural,
+                "calibration_identity": identity,
+                "calibration_identity_sha256": dense.gpu_memory.identity_hash(identity),
                 "numerically_valid": True,
                 "configuration_kind": "corrected-production",
                 "effective_solver_configuration_sha256": "same",
@@ -322,7 +329,7 @@ def test_gpu_memory_calibration_uses_measured_fit_and_device_reserve():
                 "cuda_total_bytes": 1000,
                 "cuda_free_before_bytes": free,
                 "peak_cuda_reserved_bytes": reserved,
-                "memory_estimate": {"structural_estimated_bytes": structural},
+                "memory_estimate": {"structural_estimated_bytes": structural, "model": dense.gpu_memory.MODEL},
             }
         )
 
@@ -972,12 +979,12 @@ def test_annotation_default_uses_dedicated_output(monkeypatch):
 
 def test_corrected_production_profile_is_exact_calibrated_one_scale():
     config = dense.effective_pair_config(
-        dense.DEFAULT_PAIR_CONFIG, "section-to-section-diffeo"
+        dense.PROJECT / "configs/allen_dense_pairwise_wsi_seg.json", None
     )
 
     assert config["n_iter"] == [100]
-    assert config["a"] == [1000.0]
-    assert config["dv"] == [[50.0, 2000.0, 2000.0]]
+    assert config["a"] == [500.0]
+    assert config["dv"] == [[1000.0, 1000.0]]
     assert config["sigmaR"] == [100000.0]
     assert (
         dense._stable_json_sha256(config)
@@ -985,24 +992,14 @@ def test_corrected_production_profile_is_exact_calibrated_one_scale():
     )
 
 
-def test_authoritative_corrected_schedule_is_disjoint_and_reconciled():
+def test_legacy_corrected_schedule_is_rejected():
     root = dense.PROJECT / "results/diagnostics/allen_cpu_gpu_scheduling"
-    schedule = dense.validate_corrected_production_schedule(
-        root / "corrected_production_gpu_worklist.tsv",
-        root / "corrected_production_cpu_worklist.tsv",
-        root / "final_cpu_gpu_eligibility_105_pairs.tsv",
-    )
-
-    gpu = set(schedule["gpu_pair_ids"])
-    cpu = set(schedule["cpu_pair_ids"])
-    unresolved = set(schedule["known_unresolved_pair_ids"])
-    assert len(gpu) == 80
-    assert len(cpu) == 24
-    assert unresolved == {"1716-1787"}
-    assert gpu.isdisjoint(cpu | unresolved)
-    assert cpu.isdisjoint(unresolved)
-    assert gpu | cpu | unresolved == set(schedule["inventory_pair_ids"])
-    assert schedule["historically_completed_pair_count"] == 59
+    with pytest.raises(dense.GlobalRunError, match="Run GPU calibration pilots"):
+        dense.validate_corrected_production_schedule(
+            root / "corrected_production_gpu_worklist.tsv",
+            root / "corrected_production_cpu_worklist.tsv",
+            root / "final_cpu_gpu_eligibility_105_pairs.tsv",
+        )
 
 
 def test_worker_failure_policy_isolates_pairs_but_stops_global_failures():

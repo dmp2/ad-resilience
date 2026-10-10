@@ -6,15 +6,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 from pathlib import Path
 from typing import Any, Sequence
 
 from preprocess import densify_allen_annotations as dense
 
-
 DIAGNOSTIC_ROOT = (dense.PROJECT / "results/diagnostics").resolve()
-DEFAULT_DIRECTORY = DIAGNOSTIC_ROOT / "allen_cpu_gpu_scheduling"
+DEFAULT_DIRECTORY = DIAGNOSTIC_ROOT / "allen_wsi_gpu_calibration"
 
 
 def _diagnostic_path(value: str) -> Path:
@@ -31,126 +29,105 @@ def build_assignments(
     gpu_pilot_reports: Sequence[dict[str, Any]],
     cpu_pilot_reports: Sequence[dict[str, Any]] = (),
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    identity = dense.gpu_memory.require_identity(resources)
+    if not gpu_pilot_reports:
+        raise RuntimeError(
+            "No CUDA memory calibration exists for "
+            + json.dumps(identity, sort_keys=True)
+            + ". Run GPU calibration pilots before generating the production worklist."
+        )
+    for report in [*gpu_pilot_reports, *cpu_pilot_reports]:
+        dense.gpu_memory.require_identity(report, identity)
     calibration = dense.fit_gpu_memory_calibration(gpu_pilot_reports)
-    expected_configuration = resources[
-        "intended_corrected_profile_configuration_sha256"
-    ]
-    if calibration["effective_solver_configuration_sha256"] != expected_configuration:
-        raise RuntimeError("Pilot calibration and resource table configurations differ")
-    gpu_reports = {
-        str(report["pair_id"]): report
-        for report in gpu_pilot_reports
-        if report.get("configuration_kind") == "corrected-production"
-    }
-    cpu_reports = {
-        str(report["pair_id"]): report
-        for report in cpu_pilot_reports
-        if report.get("configuration_kind") == "corrected-production"
-    }
-    budget = int(calibration["gpu_admission_budget_bytes"])
-    safety_factor = float(calibration["prediction_safety_factor"])
-    calibration_reports = [
-        report
-        for report in gpu_pilot_reports
-        if report.get("configuration_kind") == "corrected-production"
-        and report.get("numerically_valid")
-    ]
-    calibration_scores = [
-        int(report["memory_estimate"]["structural_estimated_bytes"])
-        for report in calibration_reports
-    ]
-    measured_min = min(calibration_scores)
-    measured_max = max(calibration_scores)
-
-    def as_gib(value: int | None) -> float | None:
-        return None if value is None else value / 1024**3
-
+    dense.gpu_memory.require_identity(calibration, identity)
+    gpu_reports = {str(report["pair_id"]): report for report in gpu_pilot_reports}
+    cpu_reports = {str(report["pair_id"]): report for report in cpu_pilot_reports}
     rows = []
+    seen = set()
     for resource in resources["pairs"]:
-        structural = int(resource["structural_memory_estimate_bytes"])
-        predicted = int(
-            math.ceil(
-                float(calibration["intercept_bytes"])
-                + float(calibration["structural_score_coefficient"])
-                * structural
-                + float(calibration["positive_residual_margin_bytes"])
+        dense.gpu_memory.require_identity(resource, identity)
+        pair_id = str(resource["pair_id"])
+        if pair_id in seen:
+            raise RuntimeError("Duplicate resource pair")
+        seen.add(pair_id)
+        estimate = resource["memory_estimate"]
+        if estimate["model"] != dense.gpu_memory.MODEL:
+            raise RuntimeError("Resource structural model is stale")
+        structural = int(estimate["structural_estimated_bytes"])
+        reason = dense.gpu_memory.exclusion_reason(structural, calibration)
+        gpu_report, cpu_report = gpu_reports.get(pair_id), cpu_reports.get(pair_id)
+        if gpu_report and gpu_report.get("outcome") == "other-failure":
+            if (
+                cpu_report
+                and cpu_report.get("outcome") == "success"
+                and cpu_report.get("numerically_valid")
+            ):
+                device, category = "cpu", "CPU assigned — demonstrated GPU failure"
+                reason = "GPU numerical failure; matching CPU pilot succeeded"
+            else:
+                device, category = "unresolved", "Unresolved"
+                reason = "GPU non-OOM failure; no matching successful CPU evidence"
+        elif gpu_report and gpu_report.get("outcome") == "oom":
+            device, category = "cpu", "CPU assigned — memory"
+            reason = "matching production CUDA pilot OOM"
+        elif reason:
+            device, category = "cpu", "CPU assigned — memory"
+        elif int(resource["driver_channel_count"]) == 0:
+            device, category, reason = (
+                "cpu",
+                "CPU assigned — no channels",
+                "zero usable driver channels",
             )
+        else:
+            device, category, reason = (
+                "gpu",
+                "GPU eligible",
+                "within budget, measured coverage, and matching OOM bound",
+            )
+        predicted = dense.gpu_memory.predicted_bytes(
+            structural, calibration, safety_adjusted=False
         )
         admission = dense.calibrated_gpu_memory_bytes(structural, calibration)
-        pair_id = str(resource["pair_id"])
-        exceeds_budget = admission > budget
-        if structural < measured_min:
-            calibration_range = "below measured range"
-        elif structural > measured_max:
-            calibration_range = "above measured range"
-        else:
-            calibration_range = "within measured range"
-        historical_status = str(resource["checkpoint_state"])
-        gpu_report = gpu_reports.get(pair_id)
-        cpu_report = cpu_reports.get(pair_id)
-        observed_gpu_peak = (
-            int(gpu_report["peak_cuda_reserved_bytes"])
-            if gpu_report is not None
-            and gpu_report.get("peak_cuda_reserved_bytes") is not None
-            else None
+        low, high = (
+            calibration["smallest_successful_calibration_score"],
+            calibration["largest_successful_calibration_score"],
         )
-        if gpu_report is not None and not gpu_report.get("numerically_valid"):
-            if cpu_report is not None and cpu_report.get("numerically_valid"):
-                category = "CPU assigned — demonstrated GPU failure"
-                device = "cpu"
-                reason = (
-                    "corrected-production GPU pilot failed numerically and the "
-                    "equivalent CPU pilot succeeded"
-                )
-            else:
-                category = "Unresolved"
-                device = "unresolved"
-                cpu_detail = (
-                    str(cpu_report.get("error_type", "unknown CPU failure"))
-                    if cpu_report is not None
-                    else "no equivalent CPU pilot"
-                )
-                reason = (
-                    "corrected-production GPU pilot failed numerically; CPU path "
-                    f"not demonstrated suitable ({cpu_detail})"
-                )
-        elif not exceeds_budget:
-            category = "GPU eligible"
-            device = "gpu"
-            reason = (
-                "safety-adjusted admission estimate is within budget and no GPU "
-                "numerical failure was observed"
+        status = (
+            "below measured range"
+            if structural < low
+            else (
+                "above measured range" if structural > high else "within measured range"
             )
-        else:
-            category = "CPU assigned — memory"
-            device = "cpu"
-            reason = (
-                "GPU registration succeeded in isolation"
-                if gpu_report is not None and gpu_report.get("numerically_valid")
-                else "no GPU numerical failure was observed"
-            )
-            reason += "; safety-adjusted admission estimate exceeds budget"
+        )
+        historical = resource.get("checkpoint_state", "unknown")
         rows.append(
             {
                 "pair_id": pair_id,
-                "historical_checkpoint_status": historical_status,
-                "historically_completed": historical_status == "complete",
+                "historical_checkpoint_status": historical,
+                "historically_completed": historical == "complete",
                 "corrected_run_requires_regeneration": True,
                 "driver_channel_count": int(resource["driver_channel_count"]),
-                "left_support_pixels": int(resource["left_support_pixels"]),
-                "right_support_pixels": int(resource["right_support_pixels"]),
+                "left_support_pixels": resource.get("left_support_pixels"),
+                "right_support_pixels": resource.get("right_support_pixels"),
                 "structural_memory_estimate_bytes": structural,
+                "structural_score": structural,
                 "predicted_reserved_vram_bytes": predicted,
-                "predicted_reserved_vram_gib": as_gib(predicted),
-                "admission_safety_factor": safety_factor,
+                "predicted_reserved_vram_gib": predicted / 1024**3,
+                "admission_safety_factor": calibration["prediction_safety_factor"],
                 "safety_adjusted_admission_bytes": admission,
-                "safety_adjusted_admission_gib": as_gib(admission),
-                "gpu_admission_budget_bytes": budget,
-                "gpu_admission_budget_gib": as_gib(budget),
-                "exceeds_gpu_admission_budget": exceeds_budget,
-                "calibration_range_status": calibration_range,
-                "observed_peak_gpu_reserved_bytes": observed_gpu_peak,
-                "observed_peak_gpu_reserved_gib": as_gib(observed_gpu_peak),
+                "safety_adjusted_admission_gib": admission / 1024**3,
+                "gpu_admission_budget_bytes": calibration["gpu_admission_budget_bytes"],
+                "gpu_admission_budget_gib": calibration["gpu_admission_budget_bytes"]
+                / 1024**3,
+                "exceeds_gpu_admission_budget": admission
+                > calibration["gpu_admission_budget_bytes"],
+                "calibration_range_status": status,
+                "measured_coverage": structural <= high,
+                "largest_successful_calibration_score": high,
+                "lowest_observed_oom_score": calibration["lowest_observed_oom_score"],
+                "observed_peak_gpu_reserved_bytes": (
+                    gpu_report.get("peak_cuda_reserved_bytes") if gpu_report else None
+                ),
                 "observed_gpu_numerically_valid": (
                     gpu_report.get("numerically_valid") if gpu_report else None
                 ),
@@ -160,24 +137,19 @@ def build_assignments(
                 "observed_cpu_numerically_valid": (
                     cpu_report.get("numerically_valid") if cpu_report else None
                 ),
-                "observed_cpu_error_type": (
-                    cpu_report.get("error_type") if cpu_report else None
-                ),
                 "eligibility_category": category,
                 "final_assigned_device": device,
                 "assignment_reason": reason,
+                "calibration_identity": identity,
+                "calibration_identity_sha256": dense.gpu_memory.identity_hash(identity),
             }
         )
     calibration.update(
         {
-            "schema": "allen-gpu-memory-calibration-v3",
             "inventory_pair_count": len(rows),
             "total_corrected_run_regeneration_pair_count": len(rows),
             "historically_complete_pair_count": sum(
                 row["historically_completed"] for row in rows
-            ),
-            "historically_unfinished_pair_count": sum(
-                not row["historically_completed"] for row in rows
             ),
             "gpu_assigned_pair_count": sum(
                 row["final_assigned_device"] == "gpu" for row in rows
@@ -188,37 +160,20 @@ def build_assignments(
             "unresolved_pair_count": sum(
                 row["final_assigned_device"] == "unresolved" for row in rows
             ),
-            "gpu_budget_exceeding_pair_count": sum(
-                row["exceeds_gpu_admission_budget"] for row in rows
-            ),
-            "gpu_budget_exceeding_pair_ids": [
-                row["pair_id"]
-                for row in rows
-                if row["exceeds_gpu_admission_budget"]
-            ],
-            "calibration_extrapolated_pair_count": sum(
-                row["calibration_range_status"] != "within measured range"
-                for row in rows
-            ),
             "calibration_extrapolated_pair_ids": [
                 row["pair_id"]
                 for row in rows
                 if row["calibration_range_status"] != "within measured range"
             ],
-            "measured_calibration_structural_min_bytes": measured_min,
-            "measured_calibration_structural_max_bytes": measured_max,
             "known_invalid_cuda_pairs": {
-                pair_id: str(report.get("error_type", "invalid pilot"))
-                for pair_id, report in gpu_reports.items()
-                if not report.get("numerically_valid")
-            },
-            "known_invalid_cpu_pairs": {
-                pair_id: str(report.get("error_type", "invalid pilot"))
-                for pair_id, report in cpu_reports.items()
-                if not report.get("numerically_valid")
+                key: report.get("error_type")
+                for key, report in gpu_reports.items()
+                if report.get("outcome") == "other-failure"
             },
         }
     )
+    for row in rows:
+        row["calibration_sha256"] = dense._stable_json_sha256(calibration)
     return calibration, rows
 
 
@@ -250,12 +205,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--remaining-tsv",
         type=_diagnostic_path,
-        default=DEFAULT_DIRECTORY / "remaining_46_cpu_gpu_assignments.tsv",
+        default=DEFAULT_DIRECTORY / "historically_unfinished_cpu_gpu_assignments.tsv",
     )
     parser.add_argument(
         "--remaining-json",
         type=_diagnostic_path,
-        default=DEFAULT_DIRECTORY / "remaining_46_cpu_gpu_assignments.json",
+        default=DEFAULT_DIRECTORY / "historically_unfinished_cpu_gpu_assignments.json",
     )
     parser.add_argument(
         "--gpu-worklist-tsv",
@@ -292,10 +247,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.inventory_tsv.parent.mkdir(parents=True, exist_ok=True)
 
     def write_tsv(path: Path, values: Sequence[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(values[0]), delimiter="\t")
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]), delimiter="\t")
             writer.writeheader()
-            writer.writerows(values)
+            writer.writerows(
+                {
+                    key: (
+                        json.dumps(value, sort_keys=True, separators=(",", ":"))
+                        if isinstance(value, (dict, list))
+                        else value
+                    )
+                    for key, value in row.items()
+                }
+                for row in values
+            )
 
     remaining = [row for row in rows if not row["historically_completed"]]
     gpu_worklist = [row for row in rows if row["final_assigned_device"] == "gpu"]
@@ -323,7 +289,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     dense._json(
         args.gpu_worklist_json,
         {
-            "schema": "allen-corrected-production-gpu-worklist-v1",
+            "schema": "allen-wsi-production-gpu-worklist-v2",
+            "calibration_identity": calibration["calibration_identity"],
+            "calibration_identity_sha256": calibration["calibration_identity_sha256"],
             "pair_count": len(gpu_worklist),
             "pairs": gpu_worklist,
         },
@@ -331,12 +299,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     dense._json(
         args.cpu_worklist_json,
         {
-            "schema": "allen-corrected-production-cpu-worklist-v1",
+            "schema": "allen-wsi-production-cpu-worklist-v2",
+            "calibration_identity": calibration["calibration_identity"],
+            "calibration_identity_sha256": calibration["calibration_identity_sha256"],
             "pair_count": len(cpu_worklist),
             "pairs": cpu_worklist,
         },
     )
-    print(json.dumps(calibration, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                key: value
+                for key, value in calibration.items()
+                if key != "calibration_identity"
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

@@ -17,7 +17,6 @@ import zarr
 
 from preprocess import densify_allen_annotations as dense
 
-
 DEFAULT_SOURCE_OUTPUT = dense.PROJECT / (
     "data/derivatives/allen/specimen_708424/"
     "annotations_dense_annotation_driven_200um_groups_31_265297118"
@@ -28,8 +27,7 @@ DEFAULT_ANNOTATIONS = dense.PROJECT / (
 )
 DIAGNOSTIC_ROOT = (dense.PROJECT / "results/diagnostics").resolve()
 RESOURCE_PREFLIGHT = (
-    DIAGNOSTIC_ROOT
-    / "allen_cpu_gpu_scheduling/preflight_resources_105_pairs.json"
+    DIAGNOSTIC_ROOT / "allen_wsi_gpu_calibration/preflight_resources_105_pairs.json"
 )
 
 
@@ -52,11 +50,11 @@ def _checkpoint_configuration(source_output: Path) -> dict[str, Any]:
 
 
 def _pilot_configuration(
-    source_output: Path, configuration_kind: str
+    source_output: Path, configuration_kind: str, resources: Path = RESOURCE_PREFLIGHT
 ) -> dict[str, Any]:
     if configuration_kind == "checkpoint":
         return _checkpoint_configuration(source_output)
-    preflight = json.loads(RESOURCE_PREFLIGHT.read_text())
+    preflight = json.loads(resources.read_text())
     key = {
         "corrected-short": "corrected_short_validation_configuration",
         "corrected-production": "intended_corrected_profile_configuration",
@@ -94,6 +92,7 @@ def run_pilot(
     registration: Path,
     wsi_repository: Path,
     configuration_kind: str,
+    resources: Path = RESOURCE_PREFLIGHT,
 ) -> dict[str, Any]:
     source_output = source_output.expanduser().resolve()
     context = dense.select_graphic_groups(
@@ -101,7 +100,7 @@ def run_pilot(
         dense.DEFAULT_ANNOTATION_GROUPS,
     )
     groups = _pair_groups(source_output, pair)
-    config = _pilot_configuration(source_output, configuration_kind)
+    config = _pilot_configuration(source_output, configuration_kind, resources)
     anchor_root = zarr.open_group(str(source_output / "anchors.zarr"), mode="r")
     ordinal_by_physical = {
         context.physical_by_section[section]: ordinal
@@ -126,8 +125,23 @@ def run_pilot(
         config,
         inferred_group_planes=(pair[1] - pair[0] - 1) * len(groups),
     )
+    identity = dense.gpu_calibration_identity(
+        context.shape,
+        context.registered_axes,
+        config,
+        wsi_repository=wsi_repository,
+        device=device,
+        require_cuda=device.startswith("cuda"),
+    )
+    cached = json.loads(resources.read_text())
+    dense.gpu_memory.require_identity(cached, identity)
+    expected_pair = next(
+        row for row in cached["pairs"] if row["pair_id"] == dense._pair_id(pair)
+    )
+    if len(driver_keys) != int(expected_pair["driver_channel_count"]):
+        raise RuntimeError("Pilot channels disagree with cached preflight")
     pilot: dict[str, Any] = {
-        "schema": "allen-registration-pilot-v1",
+        "schema": "allen-registration-pilot-v2",
         "pair": list(pair),
         "pair_id": dense._pair_id(pair),
         "device": device,
@@ -142,42 +156,56 @@ def run_pilot(
         "memory_estimate": estimate,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "numerically_valid": False,
+        "outcome": "other-failure",
+        "calibration_identity": identity,
+        "calibration_identity_sha256": dense.gpu_memory.identity_hash(identity),
+        "mapping_backend": identity["mapping_backend"],
+        "upsample_mode": "seg",
     }
     started = time.monotonic()
     start_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     torch = None
     try:
         if device.startswith("cuda"):
-            _, _, torch, _, _, _ = dense._load_wsi(wsi_repository)
+            _, torch, _, _ = dense._load_wsi_upsampler(wsi_repository)
             torch.cuda.set_device(device)
+            torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
             free_bytes, total_bytes = torch.cuda.mem_get_info(device)
             pilot["cuda_total_bytes"] = int(total_bytes)
             pilot["cuda_free_before_bytes"] = int(free_bytes)
-        left_flow, right_flow, map_report, _, torch = dense.fit_pair_trajectories(
+        channels, map_report, torch = dense._upsample_annotation_pair_with_wsi(
+            context,
+            pair,
             left_image,
             right_image,
             left_weight,
             right_weight,
-            context.registered_axes,
             config,
             wsi_repository=wsi_repository,
             device=device,
         )
-        midpoint_left = left_flow.evaluate(0.5)
-        midpoint_right = right_flow.evaluate(0.5)
-        if not (
-            np.all(np.isfinite(midpoint_left))
-            and np.all(np.isfinite(midpoint_right))
-        ):
-            raise RuntimeError("Pilot midpoint maps contain non-finite values")
+        if not np.all(np.isfinite(channels)):
+            raise RuntimeError("Pilot WSI channels contain non-finite values")
+        for group in groups:
+            for local in range(channels.shape[1]):
+                dense._decode_annotation_channels(
+                    channels[:, local],
+                    driver_keys,
+                    group,
+                    physical_plane=pair[0] + local,
+                )
+        if device.startswith("cuda"):
+            torch.cuda.synchronize(device)
         pilot["map_convention"] = map_report
         pilot["numerically_valid"] = True
+        pilot["outcome"] = "success"
     except Exception as exc:
         pilot["error_type"] = type(exc).__name__
         pilot["error"] = str(exc)
-        raise
+        if torch is not None and isinstance(exc, torch.cuda.OutOfMemoryError):
+            pilot["outcome"] = "oom"
     finally:
         pilot["registration_wall_time_seconds"] = time.monotonic() - started
         pilot["peak_host_rss_kib"] = max(
@@ -203,17 +231,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pair", required=True, type=dense._parse_pair)
     parser.add_argument("--device", required=True)
+    parser.add_argument("--resources", type=Path, default=RESOURCE_PREFLIGHT)
     parser.add_argument("--source-output", type=Path, default=DEFAULT_SOURCE_OUTPUT)
     parser.add_argument("--report", required=True, type=_diagnostic_path)
     parser.add_argument(
         "--configuration",
         choices=("corrected-short", "corrected-production", "checkpoint"),
-        default="corrected-short",
+        default="corrected-production",
     )
     parser.add_argument("--dataset", type=Path, default=dense.DEFAULT_DATASET)
     parser.add_argument("--annotations", type=Path, default=DEFAULT_ANNOTATIONS)
-    parser.add_argument("--registration-run", type=Path, default=dense.DEFAULT_REGISTRATION)
-    parser.add_argument("--wsi-repository", type=Path, default=dense.DEFAULT_WSI_REPOSITORY)
+    parser.add_argument(
+        "--registration-run", type=Path, default=dense.DEFAULT_REGISTRATION
+    )
+    parser.add_argument(
+        "--wsi-repository", type=Path, default=dense.DEFAULT_WSI_REPOSITORY
+    )
     return parser
 
 
@@ -229,9 +262,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         registration=args.registration_run,
         wsi_repository=args.wsi_repository,
         configuration_kind=args.configuration,
+        resources=args.resources,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 0
+    return (
+        0
+        if report["outcome"] == "success"
+        else (2 if report["outcome"] == "oom" else 1)
+    )
 
 
 if __name__ == "__main__":

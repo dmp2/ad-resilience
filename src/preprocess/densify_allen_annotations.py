@@ -34,6 +34,7 @@ import numpy as np
 import tifffile
 import zarr
 
+from preprocess import allen_gpu_memory as gpu_memory
 from preprocess import run_allen_emlddmm_full_coarse_nissl as coarse
 from preprocess.run_allen_emlddmm_full_resolution_nissl import (
     warp_categorical_section,
@@ -63,7 +64,7 @@ DEFAULT_WSI_REPOSITORY = PROJECT.parent / "wsi-tissue-pipeline"
 DEFAULT_EMLDDMM_REPOSITORY = PROJECT.parent / "emlddmm"
 WSI_PIN = "1ff82fc8b5bdb673394b14df5639939affcd56a1"
 CORRECTED_PRODUCTION_CONFIGURATION_SHA256 = (
-    "c77abf66122961056da1d42ec8e544731582a0fb7be84b828b0f69806ae49457"
+    "6442fa60eb8db8f8b9056c377359ca2725e2d0418a9a477f0feeebae8cdb6ae1"
 )
 
 SCHEMA = "allen-dense-registered-histology-v4"
@@ -1056,196 +1057,74 @@ def _effective_velocity_spacing(
     return spacing
 
 
-def estimate_pair_registration_memory(
-    channel_count: int,
+def estimate_pair_registration_memory(*args, **kwargs) -> dict[str, Any]:
+    """Return a byte-scaled WSI structural score, not predicted peak VRAM."""
+    return gpu_memory.estimate(*args, **kwargs)
+
+
+def fit_gpu_memory_calibration(*args, **kwargs) -> dict[str, Any]:
+    return gpu_memory.fit(*args, **kwargs)
+
+
+def calibrated_gpu_memory_bytes(score: int, calibration: Mapping[str, Any]) -> int:
+    return gpu_memory.predicted_bytes(score, calibration)
+
+
+def gpu_calibration_identity(
     image_shape: Sequence[int],
     registered_axes: Sequence[np.ndarray],
     config: Mapping[str, Any],
     *,
-    inferred_group_planes: int = 0,
+    wsi_repository: Path,
+    device: str = "cuda:0",
+    require_cuda: bool = True,
 ) -> dict[str, Any]:
-    """Return a structural memory score for triage, not a peak-VRAM claim."""
-    if channel_count < 0:
-        raise ValueError("channel_count must be nonnegative")
-    height, width = map(int, image_shape)
-    if (height, width) != tuple(len(axis) for axis in registered_axes):
-        raise ValueError("Registered axes and image shape differ")
-    nt = int(config["nt"])
-    scalar_bytes = 4 if str(config.get("dtype", "float32")) == "float32" else 8
-    image_pixels = height * width
-    image_values = channel_count * image_pixels
-    synthetic_z = 2
-    synthetic_values = synthetic_z * image_values
-
-    axis_steps = [
-        float(np.mean(np.abs(np.diff(np.asarray(axis, dtype=np.float64)))))
-        for axis in registered_axes
-    ]
-    synthetic_spacing = float(np.mean(axis_steps))
-    velocity_spacing = _effective_velocity_spacing(config)
-
-    if len(velocity_spacing) == 2:
-        # Current WSI annotation backend: native 2-D velocity field.
-        backend_extents = (
-            float(np.ptp(registered_axes[0])),
-            float(np.ptp(registered_axes[1])),
-        )
-        velocity_components = 2
-    elif len(velocity_spacing) == 3:
-        # Legacy synthetic-3-D WSI path.
-        backend_extents = (
-            synthetic_spacing,
-            float(np.ptp(registered_axes[0])),
-            float(np.ptp(registered_axes[1])),
-        )
-        velocity_components = 3
-    else:
-        raise RuntimeError(
-            f"Unsupported velocity spacing dimensionality: {velocity_spacing!r}"
-        )
-
-    velocity_shape = tuple(
-        max(1, int(np.ceil(1.4 * extent / spacing)))
-        for extent, spacing in zip(
-            backend_extents, velocity_spacing, strict=True
-        )
+    """Fingerprint actual pinned source and geometry without reading images."""
+    commit = _prepare_wsi_dependencies(wsi_repository)
+    em_repository = (
+        Path(os.environ.get("EMLDDMM_REPO", str(DEFAULT_EMLDDMM_REPOSITORY)))
+        .expanduser()
+        .resolve()
     )
-    velocity_values = (
-        nt * velocity_components * int(np.prod(velocity_shape))
-    )
-    map_values = (nt + 1) * 2 * image_pixels
-
-    # These terms mirror the arrays held by the current WSI wrapper. The
-    # autograd allowance is deliberately explicit and is calibrated against
-    # pilots before it is used as a GPU admission estimate.
-    components = {
-        "endpoint_driver_bytes": 2 * image_values * scalar_bytes,
-        "synthetic_3d_endpoint_bytes": 2 * synthetic_values * scalar_bytes,
-        "flowed_image_trajectory_bytes": 2 * (nt + 1) * image_values * scalar_bytes,
-        "image_autograd_allowance_bytes": 12 * synthetic_values * scalar_bytes,
-        "flow_map_and_gradient_bytes": 6 * map_values * scalar_bytes,
-        "velocity_fft_and_gradient_bytes": 6 * velocity_values * scalar_bytes,
-        "fixed_workspace_bytes": 64 * 1024**2,
+    source_paths = {
+        "wsi_upsample": wsi_repository / "src/wsi_pipeline/registration/upsample.py",
+        "wsi_symmetric": wsi_repository / "src/wsi_pipeline/registration/symmetric.py",
+        "emlddmm": em_repository / "emlddmm.py",
     }
-    structural_bytes = int(sum(components.values()))
-    iterations = config.get("n_iter", [1])
-    if not isinstance(iterations, Sequence) or isinstance(iterations, (str, bytes)):
-        iterations = [iterations]
-    iteration_count = sum(int(item) for item in iterations)
-    registration_work = 4 * iteration_count * image_values
-    output_work = 2 * inferred_group_planes * image_values
-    return {
-        "model": "allen-emlddmm-structural-v1",
-        "scalar_bytes": scalar_bytes,
-        "image_shape_yx": [height, width],
-        "synthetic_backend_z_planes": synthetic_z,
-        "velocity_grid_shape_zyx": list(velocity_shape),
-        "components": components,
-        "structural_estimated_bytes": structural_bytes,
-        "relative_runtime_work_units": int(registration_work + output_work),
-        "calibration_required_for_gpu_eligibility": True,
-    }
+    gpu_model, total = None, None
+    try:
+        import torch
 
-
-def fit_gpu_memory_calibration(
-    pilot_reports: Sequence[Mapping[str, Any]],
-    *,
-    safety_factor: float = 1.15,
-    free_memory_reserve_fraction: float = 0.15,
-    minimum_free_memory_reserve_bytes: int = 1024**3,
-) -> dict[str, Any]:
-    """Fit a device-specific reserved-VRAM admission model from valid pilots."""
-    valid = [
-        report
-        for report in pilot_reports
-        if report.get("numerically_valid")
-        and report.get("configuration_kind") == "corrected-production"
-    ]
-    if len(valid) < 3:
-        raise RuntimeError("At least three valid production CUDA pilots are required")
-    configuration_hashes = {
-        str(report["effective_solver_configuration_sha256"]) for report in valid
-    }
-    image_shapes = {tuple(report["image_shape_yx"]) for report in valid}
-    device_totals = {int(report["cuda_total_bytes"]) for report in valid}
-    if len(configuration_hashes) != 1 or len(image_shapes) != 1:
-        raise RuntimeError(
-            "Calibration pilots must share configuration and image shape"
-        )
-    if len(device_totals) != 1:
-        raise RuntimeError("Calibration pilots must use one CUDA device capacity")
-    if safety_factor < 1.0:
-        raise ValueError("safety_factor must be at least one")
-    if not 0.0 <= free_memory_reserve_fraction < 1.0:
-        raise ValueError("free_memory_reserve_fraction must be in [0, 1)")
-
-    x = [
-        float(report["memory_estimate"]["structural_estimated_bytes"])
-        for report in valid
-    ]
-    y = [float(report["peak_cuda_reserved_bytes"]) for report in valid]
-    x_mean = sum(x) / len(x)
-    y_mean = sum(y) / len(y)
-    denominator = sum((value - x_mean) ** 2 for value in x)
-    if denominator == 0:
-        raise RuntimeError("Calibration pilots do not span different memory scores")
-    slope = (
-        sum(
-            (x_value - x_mean) * (y_value - y_mean)
-            for x_value, y_value in zip(x, y, strict=True)
-        )
-        / denominator
-    )
-    intercept = y_mean - slope * x_mean
-    if slope <= 0 or intercept < 0:
-        raise RuntimeError("Pilot memory fit is not physically usable")
-    residual_margin = max(
-        0.0,
-        max(
-            measured - (intercept + slope * structural)
-            for structural, measured in zip(x, y, strict=True)
-        ),
-    )
-    total_bytes = next(iter(device_totals))
-    availability_reserve = max(
-        int(minimum_free_memory_reserve_bytes),
-        int(np.ceil(total_bytes * free_memory_reserve_fraction)),
-    )
-    minimum_observed_free = min(
-        int(report["cuda_free_before_bytes"]) for report in valid
-    )
-    admission_budget = minimum_observed_free - availability_reserve
-    if admission_budget <= 0:
-        raise RuntimeError(
-            "CUDA availability reserve consumes the observed free memory"
+        if torch.cuda.is_available():
+            cuda_device = device if device.startswith("cuda") else "cuda:0"
+            gpu_model = torch.cuda.get_device_name(cuda_device)
+            _, total = torch.cuda.mem_get_info(cuda_device)
+    except ImportError:
+        pass
+    if require_cuda and total is None:
+        raise GlobalRunError(
+            "CUDA unavailable: run instrumented GPU calibration pilots before generating the production worklist"
         )
     return {
-        "model": "linear-reserved-vram-v1",
-        "structural_score_coefficient": slope,
-        "intercept_bytes": intercept,
-        "positive_residual_margin_bytes": residual_margin,
-        "prediction_safety_factor": float(safety_factor),
-        "minimum_observed_free_bytes": minimum_observed_free,
-        "cuda_total_bytes": total_bytes,
-        "availability_reserve_bytes": availability_reserve,
-        "gpu_admission_budget_bytes": admission_budget,
-        "effective_solver_configuration_sha256": next(iter(configuration_hashes)),
-        "image_shape_yx": list(next(iter(image_shapes))),
-        "calibration_pair_ids": [str(report["pair_id"]) for report in valid],
+        "wsi_commit": commit,
+        "emlddmm_commit": (PROJECT / "configs/emlddmm-annotation-commit.txt")
+        .read_text()
+        .strip(),
+        "backend_source_sha256": {
+            name: _sha256(path) for name, path in source_paths.items()
+        },
+        "mapping_backend": gpu_memory.BACKEND,
+        "upsample_mode": "seg",
+        "effective_solver_configuration_sha256": _stable_json_sha256(config),
+        "image_shape_yx": list(map(int, image_shape)),
+        "registered_geometry": [
+            np.asarray(axis, dtype=np.float64).tolist() for axis in registered_axes
+        ],
+        "dtype": str(config.get("dtype", "float32")),
+        "structural_model": gpu_memory.MODEL,
+        "gpu_model": gpu_model,
+        "cuda_total_bytes": int(total) if total is not None else None,
     }
-
-
-def calibrated_gpu_memory_bytes(
-    structural_estimated_bytes: int, calibration: Mapping[str, Any]
-) -> int:
-    """Apply the measured fit, residual allowance, and safety factor."""
-    base = (
-        float(calibration["intercept_bytes"])
-        + float(calibration["structural_score_coefficient"])
-        * int(structural_estimated_bytes)
-        + float(calibration["positive_residual_margin_bytes"])
-    )
-    return int(np.ceil(base * float(calibration["prediction_safety_factor"])))
 
 
 def _verify_wsi_repository(repository: Path) -> str:
@@ -2294,76 +2173,130 @@ def _restore_tiff_checkpoint_states(
 
 def _worklist_pairs(path: Path) -> tuple[tuple[int, int], ...]:
     rows = _read_tsv(path.expanduser().resolve())
-    if not rows or "pair_id" not in rows[0]:
-        raise GlobalRunError(f"Pair worklist is empty or lacks pair_id: {path}")
+    with path.open(encoding="utf-8", newline="") as stream:
+        fields = csv.DictReader(stream, delimiter="\t").fieldnames or []
+    if "pair_id" not in fields:
+        raise GlobalRunError(f"Pair worklist lacks pair_id: {path}")
     pairs = tuple(_parse_pair(row["pair_id"]) for row in rows)
     if len(pairs) != len(set(pairs)):
         raise GlobalRunError(f"Pair worklist contains duplicates: {path}")
     return pairs
 
 
+def validate_initialized_schedule(
+    schedule: Mapping[str, Any], expected_identity: Mapping[str, Any]
+) -> None:
+    """Workers must reject stale backend identities stored in a run marker."""
+    try:
+        gpu_memory.require_identity(schedule, expected_identity)
+        gpu_memory.require_identity(schedule["calibration"], expected_identity)
+        if schedule.get("calibration_sha256") != _stable_json_sha256(
+            schedule["calibration"]
+        ):
+            raise RuntimeError("Initialized schedule calibration is stale")
+    except (KeyError, RuntimeError) as exc:
+        raise GlobalRunError(
+            f"Stale initialized schedule: {exc}. Run GPU calibration pilots."
+        ) from exc
+
+
 def validate_corrected_production_schedule(
-    gpu_worklist: Path, cpu_worklist: Path, inventory: Path
+    gpu_worklist: Path,
+    cpu_worklist: Path,
+    inventory: Path,
+    *,
+    expected_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate the frozen 80/24/1 corrected-production assignment."""
-    gpu_path = gpu_worklist.expanduser().resolve()
-    cpu_path = cpu_worklist.expanduser().resolve()
-    inventory_path = inventory.expanduser().resolve()
-    gpu_rows = _read_tsv(gpu_path)
-    cpu_rows = _read_tsv(cpu_path)
-    inventory_rows = _read_tsv(inventory_path)
-    gpu = tuple(_parse_pair(row["pair_id"]) for row in gpu_rows)
-    cpu = tuple(_parse_pair(row["pair_id"]) for row in cpu_rows)
-    inventory_pairs = tuple(_parse_pair(row["pair_id"]) for row in inventory_rows)
-    for label, values in (("GPU", gpu), ("CPU", cpu), ("inventory", inventory_pairs)):
-        if len(values) != len(set(values)):
-            raise GlobalRunError(f"{label} scheduling input contains duplicate pairs")
-    if set(gpu) & set(cpu):
-        overlap = sorted(_pair_id(pair) for pair in set(gpu) & set(cpu))
-        raise GlobalRunError(f"CPU and GPU worklists overlap: {overlap}")
-    assignment = {
-        _parse_pair(row["pair_id"]): row.get("final_assigned_device", "")
-        for row in inventory_rows
-    }
-    unresolved = tuple(
-        pair for pair in inventory_pairs if assignment[pair] == "unresolved"
-    )
-    if any(assignment.get(pair) != "gpu" for pair in gpu):
-        raise GlobalRunError("GPU worklist disagrees with inventory device assignments")
-    if any(assignment.get(pair) != "cpu" for pair in cpu):
-        raise GlobalRunError("CPU worklist disagrees with inventory device assignments")
-    if set(gpu) | set(cpu) | set(unresolved) != set(inventory_pairs):
-        raise GlobalRunError(
-            "Worklists and unresolved pairs do not reconcile to inventory"
+    """Require current backend calibration and reconcile dynamic assignments."""
+    paths = [
+        path.expanduser().resolve() for path in (gpu_worklist, cpu_worklist, inventory)
+    ]
+    gpu_rows, cpu_rows, inventory_rows = [_read_tsv(path) for path in paths]
+    if not inventory_rows:
+        raise GlobalRunError("Scheduling inventory is empty")
+    try:
+
+        def decode(row):
+            return {
+                "calibration_identity": json.loads(row["calibration_identity"]),
+                "calibration_identity_sha256": row["calibration_identity_sha256"],
+            }
+
+        current = gpu_memory.require_identity(
+            decode(inventory_rows[0]), expected_identity
         )
-    if len(gpu) != 80 or len(cpu) != 24 or len(inventory_pairs) != 105:
+        calibration_path = paths[2].parent / "gpu_memory_calibration.json"
+        calibration = json.loads(calibration_path.read_text())
+        gpu_memory.require_identity(calibration, current)
+        calibration_sha = _stable_json_sha256(calibration)
+        assignment = {}
+        for row in inventory_rows:
+            gpu_memory.require_identity(decode(row), current)
+            if row.get("calibration_sha256") != calibration_sha:
+                raise RuntimeError("Inventory calibration fingerprint is stale")
+            pair = _parse_pair(row["pair_id"])
+            if pair in assignment or row["final_assigned_device"] not in {
+                "gpu",
+                "cpu",
+                "unresolved",
+            }:
+                raise RuntimeError("Duplicate pair or invalid inventory assignment")
+            score = int(row["structural_memory_estimate_bytes"])
+            if (
+                int(row["predicted_reserved_vram_bytes"])
+                != gpu_memory.predicted_bytes(score, calibration, safety_adjusted=False)
+                or int(row["safety_adjusted_admission_bytes"])
+                != gpu_memory.predicted_bytes(score, calibration)
+                or int(row["gpu_admission_budget_bytes"])
+                != int(calibration["gpu_admission_budget_bytes"])
+            ):
+                raise RuntimeError(
+                    "Inventory prediction or budget disagrees with calibration"
+                )
+            if row["final_assigned_device"] == "gpu" and gpu_memory.exclusion_reason(
+                score, calibration
+            ):
+                raise RuntimeError("GPU assignment violates measured CUDA admission")
+            assignment[pair] = row
+        groups = []
+        for label, rows in (("gpu", gpu_rows), ("cpu", cpu_rows)):
+            pairs = tuple(_parse_pair(row["pair_id"]) for row in rows)
+            if len(pairs) != len(set(pairs)):
+                raise RuntimeError("Duplicate worklist pairs")
+            for row, pair in zip(rows, pairs, strict=True):
+                if assignment.get(pair) != row or row["final_assigned_device"] != label:
+                    raise RuntimeError("Worklist disagrees with inventory")
+            if set(pairs) != {
+                pair
+                for pair, row in assignment.items()
+                if row["final_assigned_device"] == label
+            }:
+                raise RuntimeError("Worklists do not reconcile to inventory")
+            groups.append(pairs)
+    except (KeyError, ValueError, OSError, RuntimeError) as exc:
         raise GlobalRunError(
-            "Corrected schedule must contain 80 GPU, 24 CPU, and 105 total pairs"
-        )
-    if unresolved != ((1716, 1787),):
-        raise GlobalRunError(
-            "Corrected schedule must contain only known-unresolved pair 1716-1787"
-        )
-    historical = sum(
-        row.get("historically_completed", "").strip().lower() == "true"
-        for row in inventory_rows
-    )
-    if historical != 59 or any(
-        row.get("corrected_run_requires_regeneration", "").strip().lower() != "true"
-        for row in inventory_rows
-    ):
-        raise GlobalRunError(
-            "Inventory must retain 59 historical completions while regenerating all 105 pairs"
-        )
+            f"No valid current CUDA schedule: {exc}. Run GPU calibration pilots before generating the production worklist."
+        ) from exc
     return {
-        "gpu_pair_ids": [_pair_id(pair) for pair in gpu],
-        "cpu_pair_ids": [_pair_id(pair) for pair in cpu],
-        "known_unresolved_pair_ids": [_pair_id(pair) for pair in unresolved],
-        "inventory_pair_ids": [_pair_id(pair) for pair in inventory_pairs],
-        "historically_completed_pair_count": historical,
-        "gpu_worklist_sha256": _sha256(gpu_path),
-        "cpu_worklist_sha256": _sha256(cpu_path),
-        "inventory_sha256": _sha256(inventory_path),
+        "gpu_pair_ids": [_pair_id(pair) for pair in groups[0]],
+        "cpu_pair_ids": [_pair_id(pair) for pair in groups[1]],
+        "known_unresolved_pair_ids": [
+            _pair_id(pair)
+            for pair, row in assignment.items()
+            if row["final_assigned_device"] == "unresolved"
+        ],
+        "inventory_pair_ids": [_pair_id(pair) for pair in assignment],
+        "historically_completed_pair_count": sum(
+            row.get("historically_completed", "").lower() == "true"
+            for row in inventory_rows
+        ),
+        "gpu_worklist_sha256": _sha256(paths[0]),
+        "cpu_worklist_sha256": _sha256(paths[1]),
+        "inventory_sha256": _sha256(paths[2]),
+        "calibration_identity": current,
+        "calibration_identity_sha256": gpu_memory.identity_hash(current),
+        "calibration": calibration,
+        "calibration_sha256": calibration_sha,
     }
 
 
@@ -2430,7 +2363,8 @@ def _checkpoint_identity(
                 "upsample_mode": "seg",
                 "channel_decoding": "active nonzero channels; reject within-group multi-active pixels",
             }
-            if driver == "annotation" else {}
+            if driver == "annotation"
+            else {}
         ),
         "authoritative_source_identity": _authoritative_source_identity(context),
     }
@@ -3050,6 +2984,7 @@ def build_preflight_report(
     *,
     driver: str,
     output_format: str,
+    wsi_repository: Path = DEFAULT_WSI_REPOSITORY,
 ) -> dict[str, Any]:
     """Summarize actual anchor topology and pair-local driver capacity."""
     pairs = []
@@ -3096,12 +3031,43 @@ def build_preflight_report(
         inferred_group_planes += entry["estimated_inferred_planes"]
         if identity["driver_channel_count"] == 0:
             zero_channel_pairs.append(entry)
+    configs = {
+        value["solver_configuration_sha256"]: value["solver_configuration"]
+        for value in checkpoint_identities.values()
+    }
+    calibration_identities = (
+        {
+            digest: gpu_calibration_identity(
+                context.shape,
+                context.registered_axes,
+                config,
+                wsi_repository=wsi_repository,
+                require_cuda=False,
+            )
+            for digest, config in configs.items()
+        }
+        if driver == "annotation"
+        else {}
+    )
+    for entry in pairs:
+        calibration_identity = calibration_identities.get(
+            entry["effective_solver_configuration_sha256"]
+        )
+        if calibration_identity is not None:
+            entry["calibration_identity"] = calibration_identity
+            entry["calibration_identity_sha256"] = gpu_memory.identity_hash(
+                calibration_identity
+            )
     known_mapping = {
         str(section): context.physical_by_section.get(section)
         for section in (1042, 1117)
     }
     report = {
-        "schema": "allen-dense-preflight-v2",
+        "schema": "allen-dense-preflight-v3",
+        "calibration_identities": calibration_identities,
+        "registered_axes_yx": [
+            np.asarray(axis).tolist() for axis in context.registered_axes
+        ],
         "driver": driver,
         "registered_image_shape_yx": list(context.shape),
         "memory_estimate_policy": (
@@ -3619,7 +3585,15 @@ def run(
         assert gpu_worklist is not None and cpu_worklist is not None
         assert schedule_inventory is not None
         schedule = validate_corrected_production_schedule(
-            gpu_worklist, cpu_worklist, schedule_inventory
+            gpu_worklist,
+            cpu_worklist,
+            schedule_inventory,
+            expected_identity=gpu_calibration_identity(
+                context.shape,
+                context.registered_axes,
+                base_config,
+                wsi_repository=wsi_repository,
+            ),
         )
         if set(schedule["inventory_pair_ids"]) != {
             _pair_id(value) for value in pair_groups
@@ -3636,6 +3610,14 @@ def run(
         schedule = json.loads(marker_path.read_text()).get("schedule")
         if not isinstance(schedule, dict):
             raise GlobalRunError("Corrected run identity lacks a validated schedule")
+    if schedule is not None:
+        expected_calibration_identity = gpu_calibration_identity(
+            context.shape,
+            context.registered_axes,
+            base_config,
+            wsi_repository=wsi_repository,
+        )
+        validate_initialized_schedule(schedule, expected_calibration_identity)
     identity = _run_identity(
         context,
         output,
@@ -3715,6 +3697,7 @@ def run(
             driver_reports,
             driver=driver,
             output_format=output_format,
+            wsi_repository=wsi_repository,
         )
     else:
         preflight = json.loads((output / "metadata/preflight.json").read_text())
@@ -3823,6 +3806,13 @@ def run(
     else:
         selected = list(pair_groups) if pair is None else [pair]
 
+    if driver == "annotation" and (device == "auto" or device.startswith("cuda")):
+        if schedule is None:
+            raise GlobalRunError("No current CUDA schedule exists. Run GPU calibration pilots before production; use benchmark_allen_pair_registration.py for explicit calibration probes.")
+        if device == "auto":
+            raise GlobalRunError("Calibrated production requires an explicit scheduled device")
+        if not {_pair_id(value) for value in selected} <= set(schedule["gpu_pair_ids"]):
+            raise GlobalRunError("Requested CUDA pairs violate current measured admission; use the calibration pilot runner to probe beyond coverage")
     reports: list[Mapping[str, Any]] = []
     failures: list[str] = []
     worker_label = worker_id or "serial"
