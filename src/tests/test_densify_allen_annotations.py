@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -560,6 +561,210 @@ def test_process_pair_preserves_nissl_inputs_reuses_partial_outputs_and_skips(
         overwrite=False,
     )
     assert repeated["checkpoint_identity_sha256"] == dense._stable_json_sha256(identity)
+
+
+@pytest.mark.parametrize("multi_active", [False, True])
+def test_annotation_pair_uses_authoritative_wsi_channels(monkeypatch, tmp_path, multi_active):
+    context = _minimal_context(tmp_path)
+    endpoints = {
+        31: np.array([[[0, 20], [10, 20]], [[10, 0], [20, 10]]], np.uint32),
+        265297118: np.array([[[30, 0], [30, 0]], [[0, 30], [0, 30]]], np.uint32),
+    }
+    root = _write_anchor_groups(tmp_path, endpoints)
+    left, right, wleft, wright, keys, driver_report = dense.build_annotation_pair_driver(
+        root, 0, 1, context.graphic_groups
+    )
+    config = {"nt": 10, "combine_velocities": "forward"}
+    original_sha = dense._stable_json_sha256(config)
+    identity = dense._checkpoint_identity(
+        context, driver="annotation", pair_groups=context.graphic_groups,
+        driver_keys=keys, driver_report=driver_report, config=config, wsi_commit="wsi-test",
+    )
+    store = dense.TiffDenseAnnotationStore(
+        tmp_path, context.shape, context.axes[0], compression="none",
+        groups=context.graphic_groups,
+    )
+    for group, values in endpoints.items():
+        # Match initialization's empty TIFF placeholders for unsupported planes.
+        store.write_group_plane(group, 1, np.zeros(context.shape, np.uint32), overwrite=False)
+        for physical, plane in zip((0, 2), values):
+            store.write_group_plane(group, physical, plane, overwrite=False)
+            store.set_state(group, physical, dense.OBSERVED_LABELS)
+
+    class Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def max_memory_allocated():
+            return 0
+
+    class Torch:
+        cuda = Cuda()
+
+    calls = []
+
+    def upsample_between_slices(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["mode"] == "seg"
+        assert kwargs["parallel"] is False
+        assert kwargs["J"].shape == (len(keys), 3, 2, 2)
+        assert kwargs["J"].dtype == np.float32
+        np.testing.assert_array_equal(kwargs["J"][:, 0], left)
+        np.testing.assert_array_equal(kwargs["J"][:, -1], right)
+        assert not np.any(kwargs["J"][:, 1])
+        assert kwargs["W"].shape == (3, 2, 2)
+        assert kwargs["W"].dtype == np.float32
+        np.testing.assert_array_equal(kwargs["W"][0], wleft)
+        np.testing.assert_array_equal(kwargs["W"][-1], wright)
+        assert not np.any(kwargs["W"][1])
+        np.testing.assert_array_equal(kwargs["present_mask"], [True, False, True])
+        assert kwargs["present_mask"].dtype == bool
+        for actual, expected in zip(kwargs["xJ"], (context.axes[0], *context.registered_axes)):
+            np.testing.assert_array_equal(actual, expected)
+        assert kwargs["config"] == {**config, "device": "cuda:0"}
+        assert kwargs["config"] is not config
+        filled = kwargs["J"].copy()
+        # Deliberately different from either endpoint; includes valid cross-group
+        # overlap and optionally one ambiguous pixel within group 31.
+        filled[keys.index((31, 10)), 1] = [[0, 1], [1, 0]]
+        filled[keys.index((31, 20)), 1] = [[0, int(multi_active)], [0, 1]]
+        filled[keys.index((265297118, 30)), 1] = [[1, 1], [0, 0]]
+        return {"J_filled": filled}
+
+    monkeypatch.setattr(
+        dense, "_load_wsi_upsampler",
+        lambda repository: (upsample_between_slices, Torch(), "wsi-test", "/local/upsample.py"),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Annotation mode entered the old Allen interpolation path")
+
+    for name in ("fit_pair_trajectories", "SourceFlowEvaluator", "categorical_pair_plane", "_warp_channels"):
+        monkeypatch.setattr(dense, name, forbidden)
+    if multi_active:
+        with pytest.raises(RuntimeError, match="Ambiguous WSI annotation channels") as error:
+            dense.process_pair(
+                context, tmp_path, store, (0, 2), context.graphic_groups, config,
+                driver="annotation", checkpoint_identity=identity, nt_source="test",
+                wsi_repository=tmp_path, device="cuda:0", overwrite=False,
+            )
+        message = str(error.value)
+        assert "group=31" in message
+        assert "physical_plane=1" in message
+        assert "multi_active_pixel_count=1" in message
+        assert '"pixel_yx": [0, 1]' in message
+        assert '"active_allen_ids": [10, 20]' in message
+        assert len(calls) == 1
+        assert not np.any(store.read_group_plane(31, 1))
+        assert not dense._pair_status_path(tmp_path, (0, 2), "tiff").exists()
+        return
+    report = dense.process_pair(
+        context, tmp_path, store, (0, 2), context.graphic_groups, config,
+        driver="annotation", checkpoint_identity=identity, nt_source="test",
+        wsi_repository=tmp_path, device="cuda:0", overwrite=False,
+    )
+    assert len(calls) == 1
+    np.testing.assert_array_equal(store.read_group_plane(31, 1), [[0, 10], [10, 20]])
+    np.testing.assert_array_equal(store.read_group_plane(265297118, 1), [[30, 30], [0, 0]])
+    for group, values in endpoints.items():
+        assert store.read_group_plane(group, 1).dtype == np.uint32
+        for physical, plane in zip((0, 2), values):
+            np.testing.assert_array_equal(store.read_group_plane(group, physical), plane)
+        for ordinal, channels in enumerate((left, right)):
+            decoded, _ = dense._decode_annotation_channels(
+                channels, keys, group, physical_plane=ordinal * 2
+            )
+            np.testing.assert_array_equal(decoded, values[ordinal])
+    assert report["group_reports"]["31"]["channel_activity_by_canonical_plane"]["1"] == {
+        "zero_active_pixel_count": 1, "one_active_pixel_count": 3, "multi_active_pixel_count": 0,
+    }
+    assert report["map_convention"]["interpolation_owner"] == "wsi_pipeline"
+    assert report["map_convention"]["wsi_module_path"] == "/local/upsample.py"
+    assert "arbitrary-t" not in report["output_sampling"]
+    assert "fusion" not in report["categorical_estimator"]
+    assert dense._stable_json_sha256(config) == original_sha
+    assert report["configuration_sha256"] == original_sha
+    assert "device" not in report["checkpoint_identity"]["solver_configuration"]
+    # Reuse remains fail-closed and does not call WSI again.
+    repeated = dense.process_pair(
+        context, tmp_path, store, (0, 2), context.graphic_groups, config,
+        driver="annotation", checkpoint_identity=identity, nt_source="test",
+        wsi_repository=tmp_path, device="cpu", overwrite=False,
+    )
+    assert repeated["checkpoint_identity"] == identity
+    assert len(calls) == 1
+    old_identity = {key: value for key, value in identity.items()
+                    if key not in {"mapping_backend", "upsample_mode", "channel_decoding"}}
+    assert not dense._checkpoint_matches({
+        "checkpoint_identity": old_identity,
+        "checkpoint_identity_sha256": dense._stable_json_sha256(old_identity),
+    }, identity)
+    previous_decoder_identity = {
+        **identity, "channel_decoding": "active nonzero channels; smallest original Allen ID",
+    }
+    assert not dense._checkpoint_matches({
+        "checkpoint_identity": previous_decoder_identity,
+        "checkpoint_identity_sha256": dense._stable_json_sha256(previous_decoder_identity),
+    }, identity)
+
+
+@pytest.mark.parametrize("failure", ["shape", "endpoint", "fractional"])
+def test_annotation_adapter_rejects_invalid_wsi_output(monkeypatch, tmp_path, failure):
+    context = _minimal_context(tmp_path, groups=(31,))
+    left = np.ones((1, 2, 2), np.float32)
+    right = np.zeros_like(left)
+
+    class Torch:
+        class cuda:
+            @staticmethod
+            def is_available():
+                return False
+
+    def stub(**kwargs):
+        result = kwargs["J"].copy()
+        if failure == "shape":
+            result = result[:, :-1]
+        elif failure == "endpoint":
+            result[:, 0] = 0
+        else:
+            result[:, 1] = 0.25
+        return {"J_filled": result}
+
+    monkeypatch.setattr(dense, "_load_wsi_upsampler", lambda repo: (stub, Torch(), "pin", "path"))
+    with pytest.raises(RuntimeError, match="dimensions|endpoints|rounded"):
+        dense._upsample_annotation_pair_with_wsi(
+            context, (0, 2), left, right, left[0], right[0], {"nt": 10},
+            wsi_repository=tmp_path, device="cpu",
+        )
+
+
+@pytest.mark.parametrize("checkout", ["wsi", "emlddmm"])
+def test_annotation_upsampler_preserves_dependency_pins(monkeypatch, tmp_path, checkout):
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+    em_pin = (dense.PROJECT / "configs/emlddmm-annotation-commit.txt").read_text().strip()
+
+    def revision(command, **kwargs):
+        is_wsi = command[2] == str(tmp_path.resolve())
+        commit = dense.WSI_PIN if is_wsi else em_pin
+        if is_wsi == (checkout == "wsi"):
+            commit = "unexpected-checkout"
+        return SimpleNamespace(stdout=commit)
+
+    monkeypatch.setattr(dense.subprocess, "run", revision)
+    with pytest.raises(RuntimeError, match="required.*pin"):
+        dense._load_wsi_upsampler(tmp_path)
+
+
+def test_annotation_upsampler_rejects_another_imported_copy(monkeypatch, tmp_path):
+    monkeypatch.setattr(dense, "_prepare_wsi_dependencies", lambda repo: "pin")
+    monkeypatch.setitem(
+        sys.modules, "wsi_pipeline.registration.upsample",
+        SimpleNamespace(upsample_between_slices=lambda **kwargs: None),
+    )
+    with pytest.raises(RuntimeError, match="WSI upsampler resolved to"):
+        dense._load_wsi_upsampler(tmp_path)
 
 
 def test_tiff_manifest_maps_canonical_filename_to_z_and_observed_state(tmp_path):

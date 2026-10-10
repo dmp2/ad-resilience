@@ -2,9 +2,9 @@
 """Dense registered-histology Allen annotations on the canonical section lattice.
 
 Two-sided diffeomorphic interpolation can be driven by either placed Nissl images
-or pair-local binary Allen ROI memberships. Both modes use the same WSI fitting,
-source-flow evaluation, and categorical output estimator. Only already
-section-aligned symmetric inputs and the accepted final A2d placement are consumed;
+or pair-local binary Allen ROI memberships. Annotation mode delegates filling to
+WSI upsampling; Nissl mode uses Allen source-flow evaluation and categorical fusion.
+Only already section-aligned symmetric inputs and the accepted final A2d placement are consumed;
 this module does not estimate section placement or transfer data to MRI space.
 """
 
@@ -15,6 +15,7 @@ import contextlib
 import csv
 import gc
 import hashlib
+import inspect
 import json
 import os
 import resource
@@ -60,7 +61,7 @@ DEFAULT_ANNOTATION_GROUPS = (31, 265297118)
 DEFAULT_PAIR_CONFIG = PROJECT / "configs/allen_dense_pairwise.json"
 DEFAULT_WSI_REPOSITORY = PROJECT.parent / "wsi-tissue-pipeline"
 DEFAULT_EMLDDMM_REPOSITORY = PROJECT.parent / "emlddmm"
-WSI_PIN = "e14cb6c59ed9b787ad4889b6aafc982a9d99f58a"
+WSI_PIN = "1ff82fc8b5bdb673394b14df5639939affcd56a1"
 CORRECTED_PRODUCTION_CONFIGURATION_SHA256 = (
     "c77abf66122961056da1d42ec8e544731582a0fb7be84b828b0f69806ae49457"
 )
@@ -1265,9 +1266,8 @@ def _verify_wsi_repository(repository: Path) -> str:
     return actual
 
 
-def _load_wsi(
-    repository: Path,
-) -> tuple[Callable[..., Mapping[str, Any]], Any, Any, Any, Any, str]:
+def _prepare_wsi_dependencies(repository: Path) -> str:
+    """Keep both local registration checkouts pinned before importing WSI."""
     commit = _verify_wsi_repository(repository)
     emlddmm_repository = (
         Path(os.environ.get("EMLDDMM_REPO", str(DEFAULT_EMLDDMM_REPOSITORY)))
@@ -1289,6 +1289,13 @@ def _load_wsi(
         )
     if str(emlddmm_repository) not in sys.path:
         sys.path.insert(0, str(emlddmm_repository))
+    return commit
+
+
+def _load_wsi(
+    repository: Path,
+) -> tuple[Callable[..., Mapping[str, Any]], Any, Any, Any, Any, str]:
+    commit = _prepare_wsi_dependencies(repository)
     try:
         import torch
         from wsi_pipeline.registration.symmetric import (
@@ -1309,6 +1316,138 @@ def _load_wsi(
         _resample_transform_to_domain,
         commit,
     )
+
+
+def _load_wsi_upsampler(repository: Path) -> tuple[Callable[..., Any], Any, str, str]:
+    commit = _prepare_wsi_dependencies(repository)
+    try:
+        import torch
+        from wsi_pipeline.registration.upsample import upsample_between_slices
+    except ImportError as exc:
+        raise RuntimeError("Cannot import the pinned WSI upsampling module") from exc
+    module_path = Path(inspect.getfile(upsample_between_slices)).resolve()
+    expected_path = (
+        repository.expanduser().resolve()
+        / "src/wsi_pipeline/registration/upsample.py"
+    ).resolve()
+    if module_path != expected_path:
+        raise RuntimeError(
+            f"WSI upsampler resolved to {module_path}; expected {expected_path}"
+        )
+    return upsample_between_slices, torch, commit, str(module_path)
+
+
+def _upsample_annotation_pair_with_wsi(
+    context: SourceContext,
+    pair: tuple[int, int],
+    left_image: np.ndarray,
+    right_image: np.ndarray,
+    left_weight: np.ndarray,
+    right_weight: np.ndarray,
+    config: Mapping[str, Any],
+    *,
+    wsi_repository: Path,
+    device: str,
+) -> tuple[np.ndarray, dict[str, Any], Any]:
+    """Adapt Allen pair channels to the public WSI segmentation upsampler."""
+    upsample_between_slices, torch, commit, module_path = _load_wsi_upsampler(wsi_repository)
+    if device == "auto":
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"Requested {device}, but CUDA is unavailable")
+    left_index, right_index = pair
+    z_count = right_index - left_index + 1
+    if z_count < 2 or left_image.shape != right_image.shape:
+        raise RuntimeError("Invalid annotation pair endpoint dimensions")
+    channels, height, width = left_image.shape
+    J_pair = np.zeros((channels, z_count, height, width), dtype=np.float32)
+    J_pair[:, 0] = left_image
+    J_pair[:, -1] = right_image
+    W_pair = np.zeros((z_count, height, width), dtype=np.float32)
+    W_pair[0] = left_weight
+    W_pair[-1] = right_weight
+    present_mask = np.zeros(z_count, dtype=bool)
+    present_mask[[0, -1]] = True
+    xJ_pair = [
+        np.asarray(context.axes[0][left_index : right_index + 1]),
+        np.asarray(context.registered_axes[0]),
+        np.asarray(context.registered_axes[1]),
+    ]
+    wsi_config = dict(config)
+    wsi_config["device"] = device
+    result = upsample_between_slices(
+        xJ=xJ_pair,
+        J=J_pair,
+        W=W_pair,
+        present_mask=present_mask,
+        mode="seg",
+        config=wsi_config,
+        parallel=False,
+    )
+    J_dense = np.asarray(result["J_filled"])
+    if J_dense.shape != J_pair.shape:
+        raise RuntimeError("WSI J_filled has unexpected annotation dimensions")
+    for local_index in range(z_count):
+        plane = J_dense[:, local_index]
+        if not np.all(np.isfinite(plane)) or not np.array_equal(plane, np.trunc(plane)):
+            raise RuntimeError("WSI segmentation channels must be finite and already rounded")
+    if not (
+        np.array_equal(J_dense[:, 0], left_image)
+        and np.array_equal(J_dense[:, -1], right_image)
+    ):
+        raise RuntimeError("WSI J_filled altered observed annotation endpoints")
+    return J_dense, {
+        "mapping_backend": "wsi_pipeline.registration.upsample.upsample_between_slices",
+        "interpolation_owner": "wsi_pipeline",
+        "upsample_mode": "seg",
+        "wsi_module_path": module_path,
+        "wsi_commit": commit,
+        "device": device,
+    }, torch
+
+
+def _decode_annotation_channels(
+    channels: np.ndarray,
+    driver_keys: Sequence[tuple[int, int]],
+    group: int,
+    *,
+    physical_plane: int,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Decode WSI channels, rejecting ambiguous membership within a group."""
+    if channels.ndim != 3 or channels.shape[0] != len(driver_keys):
+        raise RuntimeError("Annotation channel keys do not match the WSI plane")
+    plane = np.zeros(channels.shape[1:], dtype=np.uint32)
+    active_count = np.zeros(plane.shape, dtype=np.uint32)
+    group_channels = [
+        (i, allen_id) for i, (key_group, allen_id) in enumerate(driver_keys)
+        if key_group == group
+    ]
+    for channel, allen_id in group_channels:
+        active = channels[channel] != 0
+        active_count += active
+        plane[active] = allen_id
+    multi_active_count = int(np.count_nonzero(active_count > 1))
+    if multi_active_count:
+        examples = [
+            {
+                "pixel_yx": [int(y), int(x)],
+                "active_allen_ids": [
+                    int(allen_id) for channel, allen_id in group_channels
+                    if channels[channel, y, x] != 0
+                ],
+            }
+            for y, x in np.argwhere(active_count > 1)[:5]
+        ]
+        raise RuntimeError(
+            f"Ambiguous WSI annotation channels: group={group}, "
+            f"physical_plane={physical_plane}, multi_active_pixel_count={multi_active_count}; "
+            f"examples={json.dumps(examples)}"
+        )
+    return plane, {
+        "zero_active_pixel_count": int(np.count_nonzero(active_count == 0)),
+        "one_active_pixel_count": int(np.count_nonzero(active_count == 1)),
+        "multi_active_pixel_count": multi_active_count,
+    }
 
 
 def _as_numpy(value: Any) -> np.ndarray:
@@ -2285,6 +2424,14 @@ def _checkpoint_identity(
         "solver_configuration": dict(config),
         "solver_configuration_sha256": configuration_sha256,
         "wsi_commit": wsi_commit,
+        **(
+            {
+                "mapping_backend": "wsi_pipeline.registration.upsample.upsample_between_slices",
+                "upsample_mode": "seg",
+                "channel_decoding": "active nonzero channels; reject within-group multi-active pixels",
+            }
+            if driver == "annotation" else {}
+        ),
         "authoritative_source_identity": _authoritative_source_identity(context),
     }
 
@@ -2484,16 +2631,29 @@ def process_pair(
         return status
     start_rss = _peak_rss_kib()
     started = time.monotonic()
-    left_flow, right_flow, map_report, em, torch = fit_pair_trajectories(
-        left_image,
-        right_image,
-        left_weight,
-        right_weight,
-        context.registered_axes,
-        config,
-        wsi_repository=wsi_repository,
-        device=device,
-    )
+    if driver == "annotation":
+        J_dense, map_report, torch = _upsample_annotation_pair_with_wsi(
+            context,
+            pair,
+            left_image,
+            right_image,
+            left_weight,
+            right_weight,
+            config,
+            wsi_repository=wsi_repository,
+            device=device,
+        )
+    else:
+        left_flow, right_flow, map_report, em, torch = fit_pair_trajectories(
+            left_image,
+            right_image,
+            left_weight,
+            right_weight,
+            context.registered_axes,
+            config,
+            wsi_repository=wsi_repository,
+            device=device,
+        )
     group_reports: dict[str, Any] = {}
     group_endpoints: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for group in groups:
@@ -2514,27 +2674,48 @@ def process_pair(
             "inferred_canonical_planes_written": 0,
             "compatible_existing_planes_reused": 0,
         }
+        if driver == "annotation":
+            for endpoint_channels, endpoint, physical in (
+                (J_dense[:, 0], endpoint_left, left_index),
+                (J_dense[:, -1], endpoint_right, right_index),
+            ):
+                decoded, _ = _decode_annotation_channels(
+                    endpoint_channels, driver_keys, group, physical_plane=physical
+                )
+                if not np.array_equal(decoded, endpoint):
+                    raise RuntimeError("WSI channel decoding altered an observed Allen endpoint")
+            group_reports[str(group)]["channel_activity_by_canonical_plane"] = {}
     for physical in range(left_index + 1, right_index):
-        t = (float(context.axes[0][physical]) - z0_um) / (z1_um - z0_um)
-        phi_left = left_flow.evaluate(t)
-        phi_right = right_flow.evaluate(1.0 - t)
+        if driver == "nissl":
+            t = (float(context.axes[0][physical]) - z0_um) / (z1_um - z0_um)
+            phi_left = left_flow.evaluate(t)
+            phi_right = right_flow.evaluate(1.0 - t)
         for group in groups:
             current = store.state(group, physical)
             if current in {OBSERVED_LABELS, OBSERVED_VALID_EMPTY}:
                 continue
-            endpoint_left, endpoint_right = group_endpoints[group]
-            vocabulary = group_reports[str(group)]["pair_local_vocabulary"]
-            plane = categorical_pair_plane(
-                endpoint_left,
-                endpoint_right,
-                vocabulary,
-                t,
-                phi_left,
-                phi_right,
-                context.registered_axes,
-                em,
-                torch,
-            )
+            if driver == "annotation":
+                plane, activity = _decode_annotation_channels(
+                    J_dense[:, physical - left_index], driver_keys, group,
+                    physical_plane=physical,
+                )
+                group_reports[str(group)]["channel_activity_by_canonical_plane"][
+                    str(physical)
+                ] = activity
+            else:
+                endpoint_left, endpoint_right = group_endpoints[group]
+                vocabulary = group_reports[str(group)]["pair_local_vocabulary"]
+                plane = categorical_pair_plane(
+                    endpoint_left,
+                    endpoint_right,
+                    vocabulary,
+                    t,
+                    phi_left,
+                    phi_right,
+                    context.registered_axes,
+                    em,
+                    torch,
+                )
             replace_placeholder = False
             if isinstance(store, TiffDenseAnnotationStore) and current == UNSUPPORTED:
                 existing = store.read_group_plane(group, physical)
@@ -2571,6 +2752,8 @@ def process_pair(
         "nt_source": nt_source,
         "canonical_output_planes_between_endpoints": right_index - left_index - 1,
         "output_sampling": (
+            "authoritative canonical z; WSI J_filled planes consumed directly"
+            if driver == "annotation" else
             "authoritative canonical z; t=(z-z0)/(z1-z0); arbitrary-t flow integration"
         ),
         "groups": list(groups),
@@ -2586,8 +2769,14 @@ def process_pair(
         "checkpoint_identity": dict(checkpoint_identity),
         "checkpoint_identity_sha256": _stable_json_sha256(checkpoint_identity),
         "map_convention": map_report,
-        "categorical_estimator": "two-sided unweighted one-hot membership fusion; no Jacobian",
+        "categorical_estimator": (
+            "WSI mode=seg J_filled; Allen channel decoding only"
+            if driver == "annotation" else
+            "two-sided unweighted one-hot membership fusion; no Jacobian"
+        ),
         "tie_rule": (
+            "within-group multi-active channels raise an error; cross-group overlap allowed"
+            if driver == "annotation" else
             "maximum fused membership, then maximum left membership, then maximum right "
             "membership, then smallest original Allen ID"
         ),
@@ -2598,7 +2787,10 @@ def process_pair(
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     _json(status_path, status)
-    del left_flow, right_flow
+    if driver == "annotation":
+        del J_dense
+    else:
+        del left_flow, right_flow
     gc.collect()
     return status
 
@@ -2739,9 +2931,15 @@ def finalize_dense(
         "channel_semantics": channel_semantics,
         "registration_support": registration_support,
         "categorical_interpolation": (
+            "wsi_pipeline.registration.upsample.upsample_between_slices(mode=seg); "
+            "J_filled consumed directly"
+            if driver == "annotation" else
             "two-sided transported one-hot membership fusion"
         ),
-        "hardening": "deterministic argmax",
+        "hardening": (
+            "WSI rounding; active channel decoding rejects within-group multi-active pixels"
+            if driver == "annotation" else "deterministic argmax"
+        ),
         "jacobian_weighting": False,
         "canonical_lattice": {
             "positions": context.canonical_count,
