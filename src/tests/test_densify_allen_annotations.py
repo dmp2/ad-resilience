@@ -1149,3 +1149,387 @@ def test_failure_attempt_classification_distinguishes_originating_stage():
         "first WSI forward EM-LDDMM call at affine inversion",
     )
     assert other == ("other failure", "unclassified attempt stage")
+
+
+def _pseudotime_context(tmp_path, groups=(31, 265297118)):
+    """Four canonical planes with unequal spacing: interior s = 0.25, 0.6."""
+    return dense.replace(
+        _minimal_context(tmp_path, groups),
+        rows=tuple({"allen_section_number": str(100 + i)} for i in range(4)),
+        annotation_sections=(100, 103),
+        physical_by_section={100: 0, 103: 3},
+        observed_nissl=np.array([0, 3]),
+        axes=(
+            np.array([0.0, 5.0, 12.0, 20.0]),
+            np.arange(2, dtype=np.float32),
+            np.arange(2, dtype=np.float32),
+        ),
+        final_a2d=np.zeros((4, 3, 3)),
+        canonical_count=4,
+    )
+
+
+def _single_forward_sampling():
+    return dense.annotation_sampling_identity(
+        dense.ANNOTATION_SAMPLING_PSEUDOTIME, "single-forward"
+    )
+
+
+def _cuda_torch():
+    class Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def max_memory_allocated():
+            return 0
+
+    return SimpleNamespace(cuda=Cuda())
+
+
+def test_annotation_pseudotime_consumes_wsi_samples_at_physical_times(monkeypatch, tmp_path):
+    context = _pseudotime_context(tmp_path)
+    endpoints = {
+        31: np.array([[[0, 20], [10, 20]], [[10, 0], [20, 10]]], np.uint32),
+        265297118: np.array([[[30, 0], [30, 0]], [[0, 30], [0, 30]]], np.uint32),
+    }
+    root = _write_anchor_groups(tmp_path, endpoints)
+    left, right, wleft, wright, keys, driver_report = dense.build_annotation_pair_driver(
+        root, 0, 1, context.graphic_groups
+    )
+    config = {"nt": 10, "combine_velocities": "forward"}
+    sampling = _single_forward_sampling()
+    identity = dense._checkpoint_identity(
+        context, driver="annotation", pair_groups=context.graphic_groups,
+        driver_keys=keys, driver_report=driver_report, config=config,
+        wsi_commit="wsi-test", annotation_sampling=sampling,
+    )
+    store = dense.TiffDenseAnnotationStore(
+        tmp_path, context.shape, context.axes[0], compression="none",
+        groups=context.graphic_groups,
+    )
+    for group, values in endpoints.items():
+        for physical in (1, 2):
+            store.write_group_plane(group, physical, np.zeros(context.shape, np.uint32), overwrite=False)
+        for physical, plane in zip((0, 3), values):
+            store.write_group_plane(group, physical, plane, overwrite=False)
+            store.set_state(group, physical, dense.OBSERVED_LABELS)
+
+    inferred = np.zeros((len(keys), 2, 2, 2), np.float32)
+    inferred[keys.index((31, 10)), 0] = [[1, 1], [0, 0]]
+    inferred[keys.index((31, 20)), 1] = [[0, 0], [1, 1]]
+    inferred[keys.index((265297118, 30)), 1] = [[1, 0], [0, 1]]
+    calls = []
+
+    def upsample_between_slices(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["mode"] == "seg"
+        assert kwargs["path_mode"] == "single-forward"
+        assert kwargs["return_velocities"] is True
+        assert kwargs["parallel"] is False
+        np.testing.assert_array_equal(kwargs["pseudotimes"], [0.25, 0.6])
+        np.testing.assert_array_equal(kwargs["xJ"][0], context.axes[0])
+        np.testing.assert_array_equal(kwargs["J"][:, 0], left)
+        np.testing.assert_array_equal(kwargs["J"][:, -1], right)
+        np.testing.assert_array_equal(kwargs["W"][0], wleft)
+        np.testing.assert_array_equal(kwargs["W"][-1], wright)
+        np.testing.assert_array_equal(kwargs["present_mask"], [True, False, False, True])
+        assert kwargs["config"] == {**config, "device": "cuda:0"}
+        poisoned = np.full_like(kwargs["J"], 7.0)
+        return {
+            # Legacy lattice output must be ignored in this mode.
+            "J_filled": poisoned,
+            "pseudotime_samples": {
+                "pair_indices": np.array([[0, 3], [0, 3]]),
+                "pseudotimes": np.asarray(kwargs["pseudotimes"]).copy(),
+                "path_mode": "single-forward",
+                "z": np.array([5.0, 12.0]),
+                "J": inferred.copy(),
+            },
+            "pair_velocities": {"format": np.array("wsi_pipeline.pair_velocities/2")},
+        }
+
+    persisted = []
+
+    def persist(pair_velocities, path):
+        persisted.append((pair_velocities, path))
+        return {"path": str(path), "format": str(pair_velocities["format"])}
+
+    monkeypatch.setattr(
+        dense, "_load_wsi_upsampler",
+        lambda repository: (upsample_between_slices, _cuda_torch(), "wsi-test", "/local/upsample.py"),
+    )
+    monkeypatch.setattr(dense, "_persist_wsi_pair_velocities", persist)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Pseudotime annotation mode entered an Allen flow helper")
+
+    for name in (
+        "fit_pair_trajectories", "SourceFlowEvaluator", "build_source_flow_evaluator",
+        "categorical_pair_plane", "_warp_channels",
+    ):
+        monkeypatch.setattr(dense, name, forbidden)
+
+    report = dense.process_pair(
+        context, tmp_path, store, (0, 3), context.graphic_groups, config,
+        driver="annotation", checkpoint_identity=identity, nt_source="test",
+        wsi_repository=tmp_path, device="cuda:0", overwrite=False,
+        annotation_sampling=sampling,
+    )
+
+    assert len(calls) == 1
+    np.testing.assert_array_equal(store.read_group_plane(31, 1), [[10, 10], [0, 0]])
+    np.testing.assert_array_equal(store.read_group_plane(31, 2), [[0, 0], [20, 20]])
+    np.testing.assert_array_equal(store.read_group_plane(265297118, 1), np.zeros((2, 2)))
+    np.testing.assert_array_equal(store.read_group_plane(265297118, 2), [[30, 0], [0, 30]])
+    for group, values in endpoints.items():
+        for physical, plane in zip((0, 3), values):
+            np.testing.assert_array_equal(store.read_group_plane(group, physical), plane)
+            assert store.state(group, physical) == dense.OBSERVED_LABELS
+    mapping = report["map_convention"]
+    assert mapping["path_mode"] == "single-forward"
+    assert mapping["requested_pseudotimes"] == [0.25, 0.6]
+    assert mapping["returned_pseudotime_z_um"] == [5.0, 12.0]
+    assert mapping["inferred_canonical_indices"] == [1, 2]
+    assert mapping["legacy_J_filled_consumed"] is False
+    assert mapping["velocities_returned"] is True
+    assert mapping["velocities_persisted"] is True
+    assert mapping["wsi_commit"] == "wsi-test"
+    assert mapping["wsi_module_path"] == "/local/upsample.py"
+    assert mapping["mapping_backend"] == "wsi_pipeline.registration.upsample.upsample_between_slices"
+    assert persisted[0][1] == tmp_path / "metadata/pair_velocities/0000-0003.npz"
+    assert "pseudotime" in report["output_sampling"]
+    assert report["checkpoint_identity"]["annotation_sampling"] == sampling
+    assert report["configuration_sha256"] == dense._stable_json_sha256(config)
+    assert "path_mode" not in report["checkpoint_identity"]["solver_configuration"]
+
+
+def _pseudotime_adapter_inputs(tmp_path):
+    context = _pseudotime_context(tmp_path, groups=(31,))
+    left = np.array([[[1, 0], [1, 0]]], np.float32)
+    right = np.array([[[0, 1], [0, 1]]], np.float32)
+    return context, left, right, left[0], right[0]
+
+
+@pytest.mark.parametrize(
+    "failure", ["none", "times", "z", "path_mode", "fractional", "shape", "velocities"]
+)
+def test_pseudotime_adapter_keeps_observed_endpoints_and_validates_samples(
+    monkeypatch, tmp_path, failure
+):
+    context, left, right, wleft, wright = _pseudotime_adapter_inputs(tmp_path)
+
+    def stub(**kwargs):
+        samples = {
+            "pair_indices": np.array([[0, 3], [0, 3]]),
+            "pseudotimes": np.asarray(kwargs["pseudotimes"]).copy(),
+            "path_mode": kwargs["path_mode"],
+            "z": np.array([5.0, 12.0]),
+            "J": np.ones((1, 2, 2, 2), np.float32),
+        }
+        if failure == "times":
+            samples["pseudotimes"] = np.array([0.25, 0.5])
+        elif failure == "z":
+            samples["z"] = np.array([5.0, 12.5])
+        elif failure == "path_mode":
+            samples["path_mode"] = "two-sided"
+        elif failure == "fractional":
+            samples["J"][0, 0, 0, 0] = 0.5
+        elif failure == "shape":
+            samples["J"] = np.ones((1, 4, 2, 2), np.float32)
+        result = {
+            "J_filled": np.zeros_like(kwargs["J"]),
+            "pseudotime_samples": samples,
+            "pair_velocities": {"format": np.array("wsi_pipeline.pair_velocities/2")},
+        }
+        if failure == "velocities":
+            del result["pair_velocities"]
+        return result
+
+    monkeypatch.setattr(
+        dense, "_load_wsi_upsampler", lambda repo: (stub, _cuda_torch(), "pin", "path")
+    )
+    call = lambda: dense._upsample_annotation_pair_with_wsi(  # noqa: E731
+        context, (0, 3), left, right, wleft, wright, {"nt": 10},
+        wsi_repository=tmp_path, device="cpu", sampling=_single_forward_sampling(),
+    )
+    if failure != "none":
+        with pytest.raises(RuntimeError, match="match|differs|rounded|dimensions|velocities"):
+            call()
+        return
+    J_dense, report, _ = call()
+    assert J_dense.shape == (1, 4, 2, 2)
+    np.testing.assert_array_equal(J_dense[:, 0], left)
+    np.testing.assert_array_equal(J_dense[:, -1], right)
+    np.testing.assert_array_equal(J_dense[:, 1:-1], np.ones((1, 2, 2, 2)))
+    assert report["observed_endpoint_source"] == "observed Allen anchors"
+    assert report["velocities_persisted"] is False
+
+
+def test_canonical_pseudotimes_use_physical_z_not_index_fraction(tmp_path):
+    interior, pseudotimes = dense.canonical_pair_pseudotimes(
+        _pseudotime_context(tmp_path), (0, 3)
+    )
+    np.testing.assert_array_equal(interior, [1, 2])
+    np.testing.assert_array_equal(pseudotimes, [0.25, 0.6])
+
+
+def test_wsi_pair_stack_rejects_weights_off_registered_axes(tmp_path):
+    context, left, right, wleft, _ = _pseudotime_adapter_inputs(tmp_path)
+    with pytest.raises(RuntimeError, match="registered axes"):
+        dense.wsi_pair_stack(context, (0, 3), left, right, wleft, np.ones((3, 2), np.float32))
+
+
+def test_checkpoint_identity_separates_sampling_path_mode_and_wsi_commit(tmp_path):
+    context = _minimal_context(tmp_path)
+    report = {"registration_support": "endpoint foreground union across selected ROI channels"}
+
+    def identity(sampling=None, commit="wsi-a"):
+        return dense._checkpoint_identity(
+            context, driver="annotation", pair_groups=(31,), driver_keys=((31, 10),),
+            driver_report=report, config={"nt": 10}, wsi_commit=commit,
+            annotation_sampling=sampling,
+        )
+
+    lattice = identity()
+    single = identity(_single_forward_sampling())
+    two_sided = identity(
+        dense.annotation_sampling_identity(dense.ANNOTATION_SAMPLING_PSEUDOTIME, "two-sided")
+    )
+    other_commit = identity(_single_forward_sampling(), commit="wsi-b")
+    digests = {dense._stable_json_sha256(value) for value in (lattice, single, two_sided, other_commit)}
+    assert len(digests) == 4
+    assert "annotation_sampling" not in lattice
+    status = {"checkpoint_identity": single, "checkpoint_identity_sha256": dense._stable_json_sha256(single)}
+    for other in (lattice, two_sided, other_commit):
+        assert not dense._checkpoint_matches(status, other)
+    # Sampling controls are not EM-LDDMM optimization inputs.
+    assert {value["solver_configuration_sha256"] for value in (lattice, single, two_sided)} == {
+        dense._stable_json_sha256({"nt": 10})
+    }
+    with pytest.raises(ValueError, match="annotation driver"):
+        dense._checkpoint_identity(
+            context, driver="nissl", pair_groups=(31,), driver_keys=("nissl_red",),
+            driver_report=report, config={"nt": 10}, wsi_commit="wsi-a",
+            annotation_sampling=_single_forward_sampling(),
+        )
+    run_identities = [
+        dense._run_identity(
+            context, tmp_path, {"nt": 10}, driver="annotation", wsi_commit="wsi-a",
+            output_format="tiff", schedule=None, annotation_sampling=sampling,
+        )
+        for sampling in (None, _single_forward_sampling())
+    ]
+    assert "annotation_sampling" not in run_identities[0]
+    assert run_identities[0]["identity_sha256"] != run_identities[1]["identity_sha256"]
+
+
+def test_default_sampling_is_lattice_and_pseudotime_is_single_pair_only(tmp_path):
+    args = dense.build_argument_parser().parse_args([])
+    assert args.annotation_sampling == dense.ANNOTATION_SAMPLING_LATTICE
+    assert args.path_mode is None
+    assert dense.annotation_sampling_identity() is None
+    with pytest.raises(ValueError, match="path_mode requires"):
+        dense.annotation_sampling_identity(dense.ANNOTATION_SAMPLING_LATTICE, "single-forward")
+    with pytest.raises(ValueError, match="requires path_mode"):
+        dense.annotation_sampling_identity(dense.ANNOTATION_SAMPLING_PSEUDOTIME, None)
+    common = dict(
+        dataset=tmp_path, registration=tmp_path, annotations=None, output=tmp_path,
+        pair_config=tmp_path, wsi_repository=tmp_path, device="cuda:0", overwrite=False,
+        annotation_sampling=dense.ANNOTATION_SAMPLING_PSEUDOTIME, path_mode="single-forward",
+    )
+    for overrides, message in (
+        ({"driver": "nissl", "pair": (0, 2)}, "annotation"),
+        ({"driver": "annotation", "pair": None}, "single-pair"),
+        ({"driver": "annotation", "pair": (0, 2), "worker_id": "w"}, "single-pair"),
+        ({"driver": "annotation", "pair": (0, 2), "gpu_worklist": tmp_path}, "single-pair"),
+        ({"driver": "annotation", "pair": (0, 2), "device": "auto"}, "explicit"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            dense.run(**{**common, **overrides})
+
+
+def test_nissl_driver_routes_target_weight_to_w0_and_source_weight_to_wi(monkeypatch):
+    calls = []
+
+    def solver(**kwargs):
+        calls.append(kwargs)
+        return {}
+
+    class Evaluator:
+        nt = 10
+
+        @staticmethod
+        def evaluate(t):
+            return np.zeros((2, 2, 2), np.float32)
+
+    torch = SimpleNamespace(
+        float32=np.float32,
+        as_tensor=lambda value, dtype=None, device=None: np.asarray(value, dtype=dtype),
+        cuda=SimpleNamespace(is_available=lambda: False),
+    )
+    monkeypatch.setattr(
+        dense, "_load_wsi", lambda repo: (solver, None, torch, None, None, "pin")
+    )
+    monkeypatch.setattr(dense, "validate_source_map", lambda *a, **k: 0.0)
+    monkeypatch.setattr(dense, "build_source_flow_evaluator", lambda *a, **k: Evaluator())
+    monkeypatch.setattr(dense, "validate_arbitrary_time_evaluator", lambda *a, **k: {})
+    left, right = np.zeros((3, 2, 2), np.float32), np.ones((3, 2, 2), np.float32)
+    w_left, w_right = np.full((2, 2), 0.25, np.float32), np.full((2, 2), 0.75, np.float32)
+    *_, report, _, _ = dense.fit_pair_trajectories(
+        left, right, w_left, w_right, (np.arange(2), np.arange(2)), {"nt": 10},
+        wsi_repository=dense.PROJECT,
+    )
+    assert len(calls) == 2
+    for call, source, target, w_source, w_target in (
+        (calls[0], left, right, w_left, w_right),
+        (calls[1], right, left, w_right, w_left),
+    ):
+        np.testing.assert_array_equal(call["I"], source)
+        np.testing.assert_array_equal(call["J"], target)
+        np.testing.assert_array_equal(call["W0"], w_target)
+        np.testing.assert_array_equal(call["WI"], w_source)
+    assert report["registration_weights"].startswith("W0=target")
+
+
+def test_nissl_wsi_test_uses_annotation_pseudotimes_in_image_mode(tmp_path):
+    from scripts import run_allen_nissl_wsi_pseudotime_test as nissl_test
+
+    context = _pseudotime_context(tmp_path)
+    root = dense.zarr.open_group(str(tmp_path / "anchors.zarr"), mode="w")
+    nissl = np.stack([np.full((3, 2, 2), value, np.float32) for value in (0.2, 0.8)])
+    weights = np.stack([np.full((2, 2), value, np.float32) for value in (0.5, 1.0)])
+    root.create_array("nissl", data=nissl, chunks=(1, 3, 2, 2))
+    root.create_array("nissl_weight", data=weights, chunks=(1, 2, 2))
+
+    endpoints = nissl_test.nissl_pair_endpoints(context, root, (0, 3))
+    call, interior = nissl_test.nissl_wsi_call(
+        context, (0, 3), *endpoints, {"nt": 10}, device="cuda:0", path_mode="single-forward",
+    )
+    _, annotation_pseudotimes = dense.canonical_pair_pseudotimes(context, (0, 3))
+    assert call["mode"] == "img"
+    assert call["path_mode"] == "single-forward"
+    assert call["return_velocities"] is True
+    assert call["parallel"] is False
+    assert call["config"] == {"nt": 10, "device": "cuda:0"}
+    np.testing.assert_array_equal(call["pseudotimes"], annotation_pseudotimes)
+    np.testing.assert_array_equal(interior, [1, 2])
+    np.testing.assert_array_equal(call["xJ"][0], context.axes[0])
+    assert call["J"].shape == (3, 4, 2, 2)
+    assert call["W"].shape == (4, 2, 2) == (call["J"].shape[1], *call["J"].shape[2:])
+    np.testing.assert_array_equal(call["J"][:, 0], nissl[0])
+    np.testing.assert_array_equal(call["J"][:, -1], nissl[1])
+    np.testing.assert_array_equal(call["W"][0], weights[0])
+    np.testing.assert_array_equal(call["W"][-1], weights[1])
+    assert not np.any(call["J"][:, 1:-1]) and not np.any(call["W"][1:-1])
+    np.testing.assert_array_equal(call["present_mask"], [True, False, False, True])
+
+    columns = nissl_test.montage_columns(call["pseudotimes"], [0.0, 0.3, 0.55, 1.0])
+    assert columns == [("left", None, 0.0), ("inferred", 0, 0.3), ("inferred", 1, 0.55), ("right", None, 1.0)]
+
+    misaligned = dense.zarr.open_group(str(tmp_path / "misaligned.zarr"), mode="w")
+    misaligned.create_array("nissl", data=nissl, chunks=(1, 3, 2, 2))
+    misaligned.create_array("nissl_weight", data=np.ones((2, 3, 2), np.float32), chunks=(1, 3, 2))
+    with pytest.raises(RuntimeError, match="registered axes"):
+        nissl_test.nissl_pair_endpoints(context, misaligned, (0, 3))

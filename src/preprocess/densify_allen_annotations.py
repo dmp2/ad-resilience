@@ -3,7 +3,9 @@
 
 Two-sided diffeomorphic interpolation can be driven by either placed Nissl images
 or pair-local binary Allen ROI memberships. Annotation mode delegates filling to
-WSI upsampling; Nissl mode uses Allen source-flow evaluation and categorical fusion.
+WSI upsampling (its z-lattice J_filled by default, or, as an explicit single-pair
+experiment, its samples at the physical canonical pseudotimes); Nissl mode uses
+Allen source-flow evaluation and categorical fusion.
 Only already section-aligned symmetric inputs and the accepted final A2d placement are consumed;
 this module does not estimate section placement or transfer data to MRI space.
 """
@@ -62,7 +64,13 @@ DEFAULT_ANNOTATION_GROUPS = (31, 265297118)
 DEFAULT_PAIR_CONFIG = PROJECT / "configs/allen_dense_pairwise.json"
 DEFAULT_WSI_REPOSITORY = PROJECT.parent / "wsi-tissue-pipeline"
 DEFAULT_EMLDDMM_REPOSITORY = PROJECT.parent / "emlddmm"
-WSI_PIN = "1ff82fc8b5bdb673394b14df5639939affcd56a1"
+WSI_PIN = "d2733ccc9ac4dcae53dac71c8829ab83ea7a32d9"
+# How annotation-driven pairs are sampled from WSI. The lattice default consumes
+# J_filled; the pseudotime mode consumes WSI pseudotime_samples at the canonical
+# interior z and is limited to explicit single-pair experiments.
+ANNOTATION_SAMPLING_LATTICE = "lattice"
+ANNOTATION_SAMPLING_PSEUDOTIME = "physical-pseudotime"
+WSI_PATH_MODES = ("two-sided", "single-forward")
 CORRECTED_PRODUCTION_CONFIGURATION_SHA256 = (
     "6442fa60eb8db8f8b9056c377359ca2725e2d0418a9a477f0feeebae8cdb6ae1"
 )
@@ -1216,29 +1224,84 @@ def _load_wsi_upsampler(repository: Path) -> tuple[Callable[..., Any], Any, str,
     return upsample_between_slices, torch, commit, str(module_path)
 
 
-def _upsample_annotation_pair_with_wsi(
+def annotation_sampling_identity(
+    sampling: str = ANNOTATION_SAMPLING_LATTICE, path_mode: str | None = None
+) -> dict[str, Any] | None:
+    """Describe a non-default annotation sampling for checkpoint and run identity.
+
+    These controls choose how WSI evaluates fitted velocities, not how EM-LDDMM
+    optimizes, so they stay out of the solver configuration hash. The lattice
+    default returns None and leaves existing identities unchanged.
+    """
+    if sampling == ANNOTATION_SAMPLING_LATTICE:
+        if path_mode is not None:
+            raise ValueError(
+                f"path_mode requires {ANNOTATION_SAMPLING_PSEUDOTIME!r} annotation sampling"
+            )
+        return None
+    if sampling != ANNOTATION_SAMPLING_PSEUDOTIME:
+        raise ValueError(f"Unsupported annotation sampling: {sampling!r}")
+    if path_mode not in WSI_PATH_MODES:
+        raise ValueError(
+            f"{ANNOTATION_SAMPLING_PSEUDOTIME!r} sampling requires path_mode in "
+            f"{WSI_PATH_MODES}; got {path_mode!r}"
+        )
+    return {
+        "sampling": ANNOTATION_SAMPLING_PSEUDOTIME,
+        "path_mode": path_mode,
+        "pseudotime_rule": "s=(z-z0)/(z1-z0) at each canonical interior z",
+        "inferred_plane_source": "WSI pseudotime_samples['J']",
+        "observed_endpoint_source": "observed Allen anchors",
+    }
+
+
+def canonical_pair_pseudotimes(
+    context: SourceContext, pair: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return canonical interior indices and s=(z-z0)/(z1-z0) from context.axes[0]."""
+    left, right = pair
+    z = np.asarray(context.axes[0], dtype=np.float64)
+    z0, z1 = float(z[left]), float(z[right])
+    if not z1 > z0:
+        raise RuntimeError(f"Pair {_pair_id(pair)} endpoints are not increasing in z")
+    interior = np.arange(left + 1, right)
+    pseudotimes = (z[interior] - z0) / (z1 - z0)
+    if interior.size and not (
+        pseudotimes[0] > 0.0
+        and pseudotimes[-1] < 1.0
+        and np.all(np.diff(pseudotimes) > 0.0)
+    ):
+        raise RuntimeError(
+            f"Pair {_pair_id(pair)} canonical pseudotimes are not strictly inside (0, 1)"
+        )
+    return interior, pseudotimes
+
+
+def wsi_pair_stack(
     context: SourceContext,
     pair: tuple[int, int],
     left_image: np.ndarray,
     right_image: np.ndarray,
     left_weight: np.ndarray,
     right_weight: np.ndarray,
-    config: Mapping[str, Any],
-    *,
-    wsi_repository: Path,
-    device: str,
-) -> tuple[np.ndarray, dict[str, Any], Any]:
-    """Adapt Allen pair channels to the public WSI segmentation upsampler."""
-    upsample_between_slices, torch, commit, module_path = _load_wsi_upsampler(wsi_repository)
-    if device == "auto":
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError(f"Requested {device}, but CUDA is unavailable")
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+    """Place two registered endpoints and their weights in a sparse WSI pair stack."""
     left_index, right_index = pair
     z_count = right_index - left_index + 1
-    if z_count < 2 or left_image.shape != right_image.shape:
-        raise RuntimeError("Invalid annotation pair endpoint dimensions")
+    if z_count < 2 or left_image.shape != right_image.shape or left_image.ndim != 3:
+        raise RuntimeError("Invalid pair endpoint dimensions")
     channels, height, width = left_image.shape
+    registered_shape = tuple(len(axis) for axis in context.registered_axes)
+    if (
+        (height, width) != registered_shape
+        or np.shape(left_weight) != (height, width)
+        or np.shape(right_weight) != (height, width)
+    ):
+        raise RuntimeError(
+            "Endpoint images and weights must share the registered axes: "
+            f"images {left_image.shape[1:]}, weights {np.shape(left_weight)}/"
+            f"{np.shape(right_weight)}, axes {registered_shape}"
+        )
     J_pair = np.zeros((channels, z_count, height, width), dtype=np.float32)
     J_pair[:, 0] = left_image
     J_pair[:, -1] = right_image
@@ -1252,8 +1315,79 @@ def _upsample_annotation_pair_with_wsi(
         np.asarray(context.registered_axes[0]),
         np.asarray(context.registered_axes[1]),
     ]
+    return xJ_pair, J_pair, W_pair, present_mask
+
+
+def _persist_wsi_pair_velocities(
+    pair_velocities: Mapping[str, Any], path: Path
+) -> dict[str, Any]:
+    """Write WSI's own velocity dict as WSI documents and reload it with WSI."""
+    from wsi_pipeline.registration.upsample import load_pair_velocities
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f".{path.stem}.{os.getpid()}.npz")
+    np.savez_compressed(staged, **pair_velocities)
+    reloaded = load_pair_velocities(staged)
+    os.replace(staged, path)
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "format": str(reloaded["format"]),
+        "writer": "np.savez_compressed(path, **pair_velocities) per WSI docstring",
+        "verified_with": "wsi_pipeline.registration.upsample.load_pair_velocities",
+    }
+
+
+def _upsample_annotation_pair_with_wsi(
+    context: SourceContext,
+    pair: tuple[int, int],
+    left_image: np.ndarray,
+    right_image: np.ndarray,
+    left_weight: np.ndarray,
+    right_weight: np.ndarray,
+    config: Mapping[str, Any],
+    *,
+    wsi_repository: Path,
+    device: str,
+    sampling: Mapping[str, Any] | None = None,
+    velocity_path: Path | None = None,
+) -> tuple[np.ndarray, dict[str, Any], Any]:
+    """Adapt Allen pair channels to the public WSI segmentation upsampler."""
+    upsample_between_slices, torch, commit, module_path = _load_wsi_upsampler(wsi_repository)
+    if device == "auto":
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"Requested {device}, but CUDA is unavailable")
+    try:
+        xJ_pair, J_pair, W_pair, present_mask = wsi_pair_stack(
+            context, pair, left_image, right_image, left_weight, right_weight
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"Invalid annotation pair endpoint dimensions: {exc}") from exc
     wsi_config = dict(config)
     wsi_config["device"] = device
+    map_report = {
+        "mapping_backend": "wsi_pipeline.registration.upsample.upsample_between_slices",
+        "interpolation_owner": "wsi_pipeline",
+        "upsample_mode": "seg",
+        "wsi_module_path": module_path,
+        "wsi_commit": commit,
+        "device": device,
+    }
+    if sampling is not None:
+        return _sample_annotation_pair_pseudotimes(
+            upsample_between_slices,
+            context,
+            pair,
+            xJ_pair,
+            J_pair,
+            W_pair,
+            present_mask,
+            wsi_config,
+            sampling,
+            velocity_path,
+            map_report,
+        ), map_report, torch
     result = upsample_between_slices(
         xJ=xJ_pair,
         J=J_pair,
@@ -1266,7 +1400,7 @@ def _upsample_annotation_pair_with_wsi(
     J_dense = np.asarray(result["J_filled"])
     if J_dense.shape != J_pair.shape:
         raise RuntimeError("WSI J_filled has unexpected annotation dimensions")
-    for local_index in range(z_count):
+    for local_index in range(J_pair.shape[1]):
         plane = J_dense[:, local_index]
         if not np.all(np.isfinite(plane)) or not np.array_equal(plane, np.trunc(plane)):
             raise RuntimeError("WSI segmentation channels must be finite and already rounded")
@@ -1275,14 +1409,104 @@ def _upsample_annotation_pair_with_wsi(
         and np.array_equal(J_dense[:, -1], right_image)
     ):
         raise RuntimeError("WSI J_filled altered observed annotation endpoints")
-    return J_dense, {
-        "mapping_backend": "wsi_pipeline.registration.upsample.upsample_between_slices",
-        "interpolation_owner": "wsi_pipeline",
-        "upsample_mode": "seg",
-        "wsi_module_path": module_path,
-        "wsi_commit": commit,
-        "device": device,
-    }, torch
+    return J_dense, map_report, torch
+
+
+def _sample_annotation_pair_pseudotimes(
+    upsample_between_slices: Callable[..., Any],
+    context: SourceContext,
+    pair: tuple[int, int],
+    xJ_pair: list[np.ndarray],
+    J_pair: np.ndarray,
+    W_pair: np.ndarray,
+    present_mask: np.ndarray,
+    wsi_config: Mapping[str, Any],
+    sampling: Mapping[str, Any],
+    velocity_path: Path | None,
+    map_report: dict[str, Any],
+) -> np.ndarray:
+    """Consume WSI pseudotime samples as the inferred planes; never J_filled.
+
+    Observed endpoints are copied from the Allen anchors, not from WSI. WSI owns
+    endpoint-weight routing; segmentation samples arrive already rounded.
+    """
+    interior, pseudotimes = canonical_pair_pseudotimes(context, pair)
+    if not interior.size:
+        raise RuntimeError(
+            f"Pair {_pair_id(pair)} has no canonical interior plane to sample"
+        )
+    path_mode = str(sampling["path_mode"])
+    result = upsample_between_slices(
+        xJ=xJ_pair,
+        J=J_pair,
+        W=W_pair,
+        present_mask=present_mask,
+        mode="seg",
+        config=dict(wsi_config),
+        parallel=False,
+        pseudotimes=pseudotimes,
+        path_mode=path_mode,
+        return_velocities=True,
+    )
+    samples = result.get("pseudotime_samples")
+    if samples is None:
+        raise RuntimeError("WSI returned no pseudotime_samples")
+    last = J_pair.shape[1] - 1
+    if (
+        str(samples["path_mode"]) != path_mode
+        or not np.array_equal(
+            np.asarray(samples["pseudotimes"], dtype=np.float64), pseudotimes
+        )
+        or not np.array_equal(
+            np.asarray(samples["pair_indices"]),
+            np.tile([[0, last]], (len(pseudotimes), 1)),
+        )
+    ):
+        raise RuntimeError("WSI pseudotime samples do not match the requested pair times")
+    returned_z = np.asarray(samples["z"], dtype=np.float64)
+    if not np.allclose(
+        returned_z, np.asarray(context.axes[0], dtype=np.float64)[interior],
+        rtol=0.0, atol=1e-6,
+    ):
+        raise RuntimeError("WSI pseudotime z differs from the canonical interior z")
+    inferred = np.asarray(samples["J"])
+    if inferred.shape != (J_pair.shape[0], len(pseudotimes), *J_pair.shape[2:]):
+        raise RuntimeError("WSI pseudotime samples have unexpected annotation dimensions")
+    if not np.all(np.isfinite(inferred)) or not np.array_equal(
+        inferred, np.trunc(inferred)
+    ):
+        raise RuntimeError("WSI segmentation channels must be finite and already rounded")
+    pair_velocities = result.get("pair_velocities")
+    if pair_velocities is None:
+        raise RuntimeError("WSI returned no pair_velocities despite return_velocities=True")
+    archive = (
+        _persist_wsi_pair_velocities(pair_velocities, velocity_path)
+        if velocity_path is not None
+        else None
+    )
+    J_dense = J_pair.copy()
+    J_dense[:, 1:-1] = inferred
+    map_report.update(
+        {
+            "annotation_sampling": dict(sampling),
+            "path_mode": path_mode,
+            "requested_pseudotimes": pseudotimes.tolist(),
+            "returned_pseudotime_z_um": returned_z.tolist(),
+            "inferred_canonical_indices": interior.tolist(),
+            "inferred_plane_source": "WSI pseudotime_samples['J']",
+            "legacy_J_filled_consumed": False,
+            "observed_endpoint_source": "observed Allen anchors",
+            "velocities_returned": True,
+            "velocities_persisted": archive is not None,
+            "pair_velocity_archive": archive,
+            "pair_velocity_format": str(pair_velocities["format"]),
+            "reproducibility_scope": (
+                "WSI input fingerprints identify registration inputs only, "
+                "not the software environment"
+            ),
+        }
+    )
+    return J_dense
 
 
 def _decode_annotation_channels(
@@ -1523,8 +1747,16 @@ def fit_pair_trajectories(
     source_map_errors: list[float] = []
     evaluator_reports: list[dict[str, float]] = []
     evaluators: list[SourceFlowEvaluator] = []
-    for source, target, weight in ((left, right, w_left), (right, left, w_right)):
-        result = solver(xI=x, I=source, xJ=x, J=target, W0=weight, **dict(config))
+    # EM-LDDMM weights matching on the target grid: W0 describes the target, and
+    # the symmetric solver's internal reverse solve is weighted by the source's WI.
+    for source, target, target_weight, source_weight in (
+        (left, right, w_right, w_left),
+        (right, left, w_left, w_right),
+    ):
+        result = solver(
+            xI=x, I=source, xJ=x, J=target, W0=target_weight, WI=source_weight,
+            **dict(config),
+        )
         source_map_errors.append(
             validate_source_map(result, _as_numpy(source), axes, em, torch)
         )
@@ -1560,6 +1792,11 @@ def fit_pair_trajectories(
         "outer_calls": 2,
         "inner_symmetric_optimizations_per_outer_call": 2,
         "source_flow": "v_symmetric integrated as WSI phi_I inverse pullback",
+        "registration_weights": "W0=target endpoint weight; WI=source endpoint weight",
+        "legacy_allen_transport": (
+            "WSI exposes no public map-application primitive; Allen evaluates "
+            "and applies the source flows"
+        ),
         "map_regression_max_abs_errors": source_map_errors,
         "arbitrary_time_evaluator_regression": evaluator_reports,
         "time_sampling": (
@@ -2342,7 +2579,10 @@ def _checkpoint_identity(
     driver_report: Mapping[str, Any],
     config: Mapping[str, Any],
     wsi_commit: str,
+    annotation_sampling: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if annotation_sampling is not None and driver != "annotation":
+        raise ValueError("Annotation sampling applies only to the annotation driver")
     configuration_sha256 = _stable_json_sha256(config)
     serializable_keys = [
         list(key) if isinstance(key, tuple) else key for key in driver_keys
@@ -2364,6 +2604,13 @@ def _checkpoint_identity(
                 "channel_decoding": "active nonzero channels; reject within-group multi-active pixels",
             }
             if driver == "annotation"
+            else {}
+        ),
+        # Sampling never enters the solver hash, but results must not be reused
+        # across sampling modes or path modes. Absent for the lattice default.
+        **(
+            {"annotation_sampling": dict(annotation_sampling)}
+            if annotation_sampling is not None
             else {}
         ),
         "authoritative_source_identity": _authoritative_source_identity(context),
@@ -2420,6 +2667,7 @@ def _pair_checkpoint_identity(
     *,
     driver: str,
     wsi_commit: str,
+    annotation_sampling: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if driver == "nissl":
         driver_keys, driver_report = _nissl_driver_description()
@@ -2441,6 +2689,7 @@ def _pair_checkpoint_identity(
             driver_report=driver_report,
             config=config,
             wsi_commit=wsi_commit,
+            annotation_sampling=annotation_sampling,
         ),
         driver_report,
     )
@@ -2460,6 +2709,7 @@ def process_pair(
     wsi_repository: Path,
     device: str,
     overwrite: bool,
+    annotation_sampling: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     nt = int(config["nt"])
     configuration_sha256 = _stable_json_sha256(config)
@@ -2504,6 +2754,7 @@ def process_pair(
         driver_report=driver_report,
         config=config,
         wsi_commit=str(checkpoint_identity["wsi_commit"]),
+        annotation_sampling=annotation_sampling,
     )
     if actual_identity != checkpoint_identity:
         raise GlobalRunError(
@@ -2576,6 +2827,12 @@ def process_pair(
             config,
             wsi_repository=wsi_repository,
             device=device,
+            sampling=annotation_sampling,
+            velocity_path=(
+                output / "metadata/pair_velocities" / f"{_pair_id(pair)}.npz"
+                if annotation_sampling is not None
+                else None
+            ),
         )
     else:
         left_flow, right_flow, map_report, em, torch = fit_pair_trajectories(
@@ -2686,6 +2943,9 @@ def process_pair(
         "nt_source": nt_source,
         "canonical_output_planes_between_endpoints": right_index - left_index - 1,
         "output_sampling": (
+            "authoritative canonical z; s=(z-z0)/(z1-z0); WSI "
+            f"{annotation_sampling['path_mode']} pseudotime_samples consumed directly"
+            if annotation_sampling is not None else
             "authoritative canonical z; WSI J_filled planes consumed directly"
             if driver == "annotation" else
             "authoritative canonical z; t=(z-z0)/(z1-z0); arbitrary-t flow integration"
@@ -2704,6 +2964,8 @@ def process_pair(
         "checkpoint_identity_sha256": _stable_json_sha256(checkpoint_identity),
         "map_convention": map_report,
         "categorical_estimator": (
+            "WSI mode=seg pseudotime_samples; Allen channel decoding only"
+            if annotation_sampling is not None else
             "WSI mode=seg J_filled; Allen channel decoding only"
             if driver == "annotation" else
             "two-sided unweighted one-hot membership fusion; no Jacobian"
@@ -3146,6 +3408,7 @@ def _run_identity(
     wsi_commit: str,
     output_format: str,
     schedule: Mapping[str, Any] | None,
+    annotation_sampling: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     identity = {
         "schema": RUN_IDENTITY_SCHEMA,
@@ -3159,6 +3422,8 @@ def _run_identity(
         "authoritative_source_identity": _authoritative_source_identity(context),
         "schedule": dict(schedule) if schedule is not None else None,
     }
+    if annotation_sampling is not None:
+        identity["annotation_sampling"] = dict(annotation_sampling)
     return {**identity, "identity_sha256": _stable_json_sha256(identity)}
 
 
@@ -3504,9 +3769,33 @@ def run(
     anchors_only: bool = False,
     output_format: str = "tiff",
     tiff_compression: str = "deflate",
+    annotation_sampling: str = ANNOTATION_SAMPLING_LATTICE,
+    path_mode: str | None = None,
 ) -> dict[str, Any]:
     if driver not in {"nissl", "annotation"}:
         raise ValueError(f"Unsupported registration driver: {driver}")
+    sampling = annotation_sampling_identity(annotation_sampling, path_mode)
+    if sampling is not None:
+        if driver != "annotation":
+            raise ValueError("Pseudotime sampling applies only to --driver annotation")
+        # No GPU calibration covers this mode, so it is never scheduled.
+        if (
+            pair is None
+            or pair_worklist is not None
+            or worker_id is not None
+            or initialize_only
+            or consolidate_only
+            or any(
+                value is not None
+                for value in (gpu_worklist, cpu_worklist, schedule_inventory)
+            )
+        ):
+            raise ValueError(
+                "Pseudotime sampling is an explicit single-pair experiment: use one "
+                "--pair without worklists, workers, initialization, or consolidation"
+            )
+        if device == "auto":
+            raise ValueError("Pseudotime sampling requires an explicit --device")
     if pair is not None and pair_worklist is not None:
         raise ValueError("Use either one --pair or one --pair-worklist, not both")
     if initialize_only and consolidate_only:
@@ -3571,6 +3860,7 @@ def run(
             solver_config,
             driver=driver,
             wsi_commit=wsi_commit,
+            annotation_sampling=sampling,
         )
         checkpoint_identities[endpoint_pair] = identity
         driver_reports[endpoint_pair] = driver_report
@@ -3626,9 +3916,13 @@ def run(
         wsi_commit=wsi_commit,
         output_format=output_format,
         schedule=schedule,
+        annotation_sampling=sampling,
     )
     if worker_mode:
         _validate_or_write_run_identity(output, identity, write=False)
+    elif sampling is not None:
+        # Bind the experimental output root to this sampling, WSI commit, and solver.
+        _validate_or_write_run_identity(output, identity, write=True)
 
     pair_table = []
     for endpoint_pair, groups in pair_groups.items():
@@ -3806,7 +4100,11 @@ def run(
     else:
         selected = list(pair_groups) if pair is None else [pair]
 
-    if driver == "annotation" and (device == "auto" or device.startswith("cuda")):
+    if (
+        driver == "annotation"
+        and sampling is None
+        and (device == "auto" or device.startswith("cuda"))
+    ):
         if schedule is None:
             raise GlobalRunError("No current CUDA schedule exists. Run GPU calibration pilots before production; use benchmark_allen_pair_registration.py for explicit calibration probes.")
         if device == "auto":
@@ -3847,6 +4145,7 @@ def run(
                         wsi_repository=wsi_repository,
                         device=device,
                         overwrite=overwrite,
+                        annotation_sampling=sampling,
                     )
                 )
         except Exception as exc:
@@ -4002,6 +4301,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=tuple(coarse.PROFILE_OVERRIDES),
         help="profile merged into the one-scale pair JSON for annotation registration",
     )
+    parser.add_argument(
+        "--annotation-sampling",
+        choices=(ANNOTATION_SAMPLING_LATTICE, ANNOTATION_SAMPLING_PSEUDOTIME),
+        default=ANNOTATION_SAMPLING_LATTICE,
+        help=(
+            "annotation-driver output sampling: WSI z-lattice J_filled (default) or, "
+            "for one explicit --pair experiment, WSI samples at the canonical "
+            "physical pseudotimes"
+        ),
+    )
+    parser.add_argument(
+        "--path-mode",
+        choices=WSI_PATH_MODES,
+        default=None,
+        help="WSI pseudotime path mode (required with physical-pseudotime sampling)",
+    )
     parser.add_argument("--expected-configuration-sha256", default=None)
     parser.add_argument("--wsi-repository", type=Path, default=DEFAULT_WSI_REPOSITORY)
     parser.add_argument("--device", default="auto")
@@ -4090,6 +4405,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         anchors_only=args.anchors_only,
         output_format=args.output_format,
         tiff_compression=args.tiff_compression,
+        annotation_sampling=args.annotation_sampling,
+        path_mode=args.path_mode,
     )
     exit_code = int(report.pop("exit_code", 0))
     print(json.dumps(report, indent=2, sort_keys=True))

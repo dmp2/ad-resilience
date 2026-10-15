@@ -283,6 +283,10 @@ def main() -> int:
     )
 
     endpoint_z_um = [float(value) for value in pair_manifest["endpoint_z_um"]]
+    sampling = pair_manifest.get("map_convention", {}).get("annotation_sampling")
+    sampling_label = (
+        f"  ·  WSI {sampling['path_mode']} pseudotime samples" if sampling else ""
+    )
     preview_records: list[dict[str, Any]] = []
     for column, physical in enumerate(indices):
         try:
@@ -345,7 +349,8 @@ def main() -> int:
         f"Allen endpoint sections {endpoint_sections[0]} → {endpoint_sections[1]}  ·  "
         f"{pair_manifest['canonical_output_planes_between_endpoints']} inferred "
         f"canonical planes  ·  graphic groups "
-        + ", ".join(map(str, requested_groups)),
+        + ", ".join(map(str, requested_groups))
+        + sampling_label,
         ha="center",
         va="center",
         fontsize=10.5,
@@ -374,6 +379,8 @@ def main() -> int:
         "pair": [left, right],
         "pair_status": pair_manifest["status"],
         "driver": pair_manifest["driver"],
+        "annotation_sampling": sampling,
+        "wsi_commit": pair_manifest.get("map_convention", {}).get("wsi_commit"),
         "endpoint_sections": list(endpoint_sections),
         "groups": requested_groups,
         "preview_planes": preview_records,
