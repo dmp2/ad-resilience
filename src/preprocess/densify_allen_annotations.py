@@ -64,7 +64,7 @@ DEFAULT_ANNOTATION_GROUPS = (31, 265297118)
 DEFAULT_PAIR_CONFIG = PROJECT / "configs/allen_dense_pairwise.json"
 DEFAULT_WSI_REPOSITORY = PROJECT.parent / "wsi-tissue-pipeline"
 DEFAULT_EMLDDMM_REPOSITORY = PROJECT.parent / "emlddmm"
-WSI_PIN = "d2733ccc9ac4dcae53dac71c8829ab83ea7a32d9"
+WSI_PIN = "90a3269f0e74486042de131d1d3fa1c9ea83d6d1"
 # How annotation-driven pairs are sampled from WSI. The lattice default consumes
 # J_filled; the pseudotime mode consumes WSI pseudotime_samples at the canonical
 # interior z and is limited to explicit single-pair experiments.

@@ -268,6 +268,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"Requested {args.device}, but CUDA is unavailable")
 
+    torch_device = torch.device(args.device)
+
+    if torch_device.type == "cuda":
+        cuda_index = (
+            torch_device.index
+            if torch_device.index is not None
+            else torch.cuda.current_device()
+        )
+        torch.cuda.set_device(cuda_index)
+    else:
+        cuda_index = None
+
     context = dense.select_graphic_groups(
         dense.discover_inputs(args.dataset, args.registration_run, args.annotations),
         args.graphic_groups,
@@ -293,10 +305,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     canonical_z = np.asarray(context.axes[0], dtype=np.float64)[interior]
     endpoint_z_um = (float(context.axes[0][pair[0]]), float(context.axes[0][pair[1]]))
 
-    if args.device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats(args.device)
+    if cuda_index is not None:
+        torch.cuda.reset_peak_memory_stats(cuda_index)
     started = time.monotonic()
     result = upsample_between_slices(**call)
+    if cuda_index is not None:
+        torch.cuda.synchronize(cuda_index)
     elapsed = time.monotonic() - started
     samples = result["pseudotime_samples"]
     validate_samples(samples, call, canonical_z, args.path_mode)
@@ -406,8 +420,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "montage_panels": panels,
         "wall_time_seconds": elapsed,
         "peak_cuda_allocated_bytes": (
-            int(torch.cuda.max_memory_allocated(args.device))
-            if args.device.startswith("cuda") else None
+            int(torch.cuda.max_memory_allocated(cuda_index))
+            if cuda_index is not None else None
         ),
         "anchors": anchor_report["zarr"],
         "reproducibility_scope": (
