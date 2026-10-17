@@ -440,3 +440,183 @@ def summarize_nifti_geometry(image: Any, filename: str | Path) -> dict[str, Any]
         "world_bounds_min_mm": world_corners.min(axis=0).tolist(),
         "world_bounds_max_mm": world_corners.max(axis=0).tolist(),
     }
+
+
+def cut_plane(
+    X: np.ndarray,
+    feature_arrays: Sequence[np.ndarray],
+    origin_mm: Sequence[float],
+    u_axis: Sequence[float],
+    v_axis: Sequence[float],
+    half_thickness_mm: float,
+    hemisphere: str | None = None,
+) -> tuple[np.ndarray, list[np.ndarray], dict[str, Any]]:
+    """Keep 3-D particles in a slab around a plane and express them in plane coordinates.
+
+    The plane is ``origin + a*u + b*v`` with orthonormal ``u`` and ``v``; its normal is
+    ``n = u x v``.  A particle is kept when ``|(x - origin) . n| <= half_thickness``.
+    Kept particles are returned as ``(a, b, 0)``, so ``x ~= origin + a*u + b*v``.
+
+    Feature masses are divided by the slab thickness ``2 * half_thickness``.  A volume
+    mass in mm^3 therefore becomes an area mass in mm^2, which is what a 2-D section
+    measure carries.  ``hemisphere`` keeps ``x < 0`` (``"left"``) or ``x > 0``
+    (``"right"``) in the input frame; ``None`` keeps both.
+    """
+
+    X = np.asarray(X, dtype=np.float64)
+    origin = np.asarray(origin_mm, dtype=np.float64)
+    u = np.asarray(u_axis, dtype=np.float64)
+    v = np.asarray(v_axis, dtype=np.float64)
+    if X.ndim != 2 or X.shape[1] != 3 or origin.shape != (3,) or u.shape != (3,) or v.shape != (3,):
+        raise ValueError("cut_plane needs [N, 3] positions and 3-vectors for origin, u, v.")
+    if not np.allclose([u @ u, v @ v, u @ v], [1.0, 1.0, 0.0], atol=1e-9):
+        raise ValueError("u_axis and v_axis must be orthonormal.")
+    thickness = 2.0 * float(half_thickness_mm)
+    if not thickness > 0:
+        raise ValueError("half_thickness_mm must be positive.")
+    normal = np.cross(u, v)
+
+    offset = X - origin
+    keep = np.abs(offset @ normal) <= float(half_thickness_mm)
+    if hemisphere == "left":
+        keep &= X[:, 0] < 0
+    elif hemisphere == "right":
+        keep &= X[:, 0] > 0
+    elif hemisphere is not None:
+        raise ValueError("hemisphere must be 'left', 'right', or None.")
+
+    plane_X = np.zeros((int(keep.sum()), 3), dtype=np.float64)
+    plane_X[:, 0] = offset[keep] @ u
+    plane_X[:, 1] = offset[keep] @ v
+    kept = [np.asarray(array)[keep] / thickness for array in feature_arrays]
+    metadata = {
+        "origin_mm": origin.tolist(),
+        "u_axis": u.tolist(),
+        "v_axis": v.tolist(),
+        "normal": normal.tolist(),
+        "half_thickness_mm": float(half_thickness_mm),
+        "hemisphere": hemisphere,
+        "mass_divisor_mm": thickness,
+        "mass_units": "input mass / mm (mm^3 -> mm^2 for voxel volumes)",
+        "inverse": "world = origin + plane_X[:, 0] * u_axis + plane_X[:, 1] * v_axis",
+        "number_input": int(X.shape[0]),
+        "number_kept": int(keep.sum()),
+    }
+    return plane_X, kept, metadata
+
+
+def group_feature_columns(
+    nu: np.ndarray,
+    labels: Sequence[str],
+    groups: Mapping[str, Sequence[str]],
+    drop: Sequence[str] = (),
+) -> tuple[np.ndarray, list[str]]:
+    """Sum labelled feature columns into named groups.
+
+    Every label must belong to exactly one group or to ``drop``, and every grouped
+    label must exist, so a typo or an unexpected category fails instead of silently
+    losing mass.  Returns ``(nu_grouped, group_names)``.
+    """
+
+    nu = np.asarray(nu)
+    labels = [str(label) for label in labels]
+    if nu.ndim != 2 or nu.shape[1] != len(labels):
+        raise ValueError(f"nu has shape {nu.shape} but {len(labels)} labels were given.")
+    column = {label: index for index, label in enumerate(labels)}
+    assigned: dict[str, str] = {}
+    for name, members in groups.items():
+        for label in members:
+            if label not in column:
+                raise KeyError(f"Group '{name}' names unknown label '{label}'.")
+            if label in assigned:
+                raise ValueError(f"Label '{label}' is in groups '{assigned[label]}' and '{name}'.")
+            assigned[label] = name
+    unassigned = [label for label in labels if label not in assigned and label not in set(drop)]
+    if unassigned:
+        raise ValueError(f"Labels in neither a group nor drop: {unassigned}")
+
+    names = list(groups)
+    grouped = np.zeros((nu.shape[0], len(names)), dtype=nu.dtype)
+    for index, name in enumerate(names):
+        grouped[:, index] = nu[:, [column[label] for label in groups[name]]].sum(axis=1)
+    return grouped, names
+
+
+def bin_particles_2d(
+    X: np.ndarray,
+    feature_arrays: Sequence[np.ndarray],
+    bin_mm: float,
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+    """Aggregate particles into square ``bin_mm`` bins on their first two coordinates.
+
+    Feature masses are summed per bin, so total mass is conserved exactly.  Each bin is
+    placed at the centroid of its particles weighted by the total mass of the first
+    feature array; the third coordinate is 0.  Bins start at the coordinate origin.
+    Returns ``(X_bins, binned_arrays, particles_per_bin)``.
+    """
+
+    X = np.asarray(X, dtype=np.float64)
+    if not bin_mm > 0:
+        raise ValueError("bin_mm must be positive.")
+    keys = np.floor(X[:, :2] / float(bin_mm)).astype(np.int64)
+    _, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    inverse = inverse.reshape(-1)
+    number_bins = counts.shape[0]
+
+    binned = []
+    for array in feature_arrays:
+        array = np.asarray(array, dtype=np.float64)
+        out = np.zeros((number_bins, array.shape[1]), dtype=np.float64)
+        np.add.at(out, inverse, array)
+        binned.append(out)
+
+    weight = np.asarray(feature_arrays[0], dtype=np.float64).sum(axis=1)
+    weight_sum = np.zeros(number_bins)
+    np.add.at(weight_sum, inverse, weight)
+    centroid = np.zeros((number_bins, 2))
+    np.add.at(centroid, inverse, X[:, :2] * weight[:, None])
+    if np.any(weight_sum <= 0):
+        raise ValueError("A bin has no positive mass; drop zero-mass particles first.")
+    X_bins = np.zeros((number_bins, 3))
+    X_bins[:, :2] = centroid / weight_sum[:, None]
+    return X_bins, binned, counts
+
+
+def varifold_score_mm(
+    X_a: np.ndarray,
+    nu_a: np.ndarray,
+    X_b: np.ndarray,
+    nu_b: np.ndarray,
+    sigmas_mm: Sequence[float] = (2.0, 1.0, 0.5),
+) -> float:
+    """Relative Gaussian-kernel distance between two feature-valued measures.
+
+    For each physical scale ``sigma`` (mm), with ``k(x, y) = exp(-|x-y|^2 / 2 sigma^2)``
+    and a linear feature kernel,
+
+        d_sigma = |mu_a - mu_b|^2_sigma / |mu_b|^2_sigma,
+
+    and the score is the mean of ``d_sigma`` over scales.  Unlike xmodmap's training
+    loss, the scales and weights are fixed, so the score can be compared across runs
+    that share the same reference measure ``b``.  0 means identical measures.
+    """
+
+    def inner(X, nu, Y, mu, sigma):
+        total = 0.0
+        for start in range(0, X.shape[0], 2048):
+            stop = start + 2048
+            d2 = ((X[start:stop, None, :] - Y[None, :, :]) ** 2).sum(axis=-1)
+            total += float(np.sum(np.exp(-d2 / (2.0 * sigma * sigma)) * (nu[start:stop] @ mu.T)))
+        return total
+
+    X_a, X_b = np.asarray(X_a, np.float64), np.asarray(X_b, np.float64)
+    nu_a, nu_b = np.asarray(nu_a, np.float64), np.asarray(nu_b, np.float64)
+    if X_a.shape[1] != X_b.shape[1] or nu_a.shape[1] != nu_b.shape[1]:
+        raise ValueError("Measures must share spatial and feature dimensions.")
+    scores = []
+    for sigma in sigmas_mm:
+        bb = inner(X_b, nu_b, X_b, nu_b, sigma)
+        aa = inner(X_a, nu_a, X_a, nu_a, sigma)
+        ab = inner(X_a, nu_a, X_b, nu_b, sigma)
+        scores.append(max(aa + bb - 2.0 * ab, 0.0) / bb)
+    return float(np.mean(scores))

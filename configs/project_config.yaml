@@ -102,6 +102,15 @@ label_maps:
   infer_all_labels:
     infer_all_nonbackground: true
 
+  # AHRAv2 gyral annotation values are Allen *compressed* codes. Decode them with
+  # data/raw/allen/ahrav2/2025/ahrav2_homba_terminology_2025.csv (annotation_value).
+  # Code 30 = HOMBA:12141; its 415,406 voxels match ahrav2_gyral_parcellation_volumes_500um.csv.
+  ahrav2_gyral_mtg:
+    groups:
+      - name: "middle_temporal_gyrus"
+        labels:
+          - {id: 30, name: "middle temporal gyrus (HOMBA:12141)"}
+
 particle_jobs:
   sources:
     # Replace input_nifti with the segmentation/annotation you intend to use. Raw MRI,
@@ -150,6 +159,23 @@ particle_jobs:
       background_labels: [0]
       downsample_factors: [1, 5]
       write_vtk: true
+
+    # Bilateral 3-D MTG particles at native 0.5 mm; one particle per voxel (0.125 mm^3).
+    ahrav2_gyral_mtg:
+      enabled: true
+      input_nifti: "data/raw/allen/ahrav2/2025/ahrav2_gyral_annotations_500um.nii.gz"
+      output_dir: "data/derivatives/allen/ahrav2_2025/particles/gyral_mtg"
+      coordinate_space: "mni_icbm2009b_symmetric"
+      coordinate_mode: "affine_world"
+      construction_backend: "project_affine_block"
+      vtk_coordinate_convention: "xyz"
+      label_map: "ahrav2_gyral_mtg"
+      background_labels: [0]
+      downsample_factors: [1]
+      write_vtk: true
+      notes: >-
+        AHRAv2 2025 gyral annotation (Allen compressed codes); code 30 decoded with the
+        HOMBA 2025 terminology. Both hemispheres share the code.
 
   targets:
     example_target:
@@ -226,6 +252,121 @@ registrations:
       sigma_rkhs: [0.20, 0.10, 0.05]
       sigma_var: [0.20, 0.05, 0.02]
       steps: 50
+
+  # ---------------------------------------------------------------------------------
+  # Atlas plane -> MERFISH section, cross-modal with density-support censoring.
+  # Run by src/scripts/framework_script_AtlasToSectionCrossModalBoundary.py.
+  # Lengths ending in _mm are physical; the script divides them by makePQ's joint
+  # scale s to get xmodmap's unit-box values. lamb_init is held fixed: in 2-D the
+  # density-only support weight does not depend on lambda.
+  # Initialization ids: rDDD = target rotation in degrees, f1 = target reflected
+  # (y -> -y) before rotation. Reflection is preprocessing, not part of the flow.
+  # ---------------------------------------------------------------------------------
+  ahrav2_mtg_plane_to_strip_1194111462:
+    source_particles: "data/derivatives/allen/ahrav2_2025/particles/gyral_mtg/ahrav2_gyral_mtg_coronal_y-30mm_L.npz"
+    target_particles: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/binned_500um_classes_depth_strip.npz"
+    qc_strip_cells: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/qc_depth_strip_cells.npz"
+    output_dir: "results/registrations/ahrav2_mtg_plane_to_strip_1194111462"
+    feature_key: "nu_Sub"
+    target_feature_mode: "classes"
+    vtk_coordinate_convention: "xyz"
+    reference_initialization: "r000_f0"
+    initializations: &atlas_section_initializations
+      [r000_f0, r090_f0, r180_f0, r270_f0, r000_f1, r090_f1, r180_f1, r270_f1]
+    model: &atlas_section_boundary_model
+      seed: 0
+      device: "cuda:0"       # must equal the default device legacy xmodmap sets on import
+      torch_dtype: "float32"
+      sigma_rkhs_mm: [2.0, 1.0, 0.5]
+      sigma_var_mm: [2.0, 1.0, 0.5]
+      dens_sigma_mm: 1.0
+      score_sigmas_mm: [2.0, 1.0, 0.5]
+      steps: 150
+      shooting_time_steps: 10
+      gamma: 0.1
+      c_rotation: 1.0
+      c_translation: 1.0
+      c_nonrigid: 10.0
+      csqpi: 10000.0
+      csqlamb: 100.0
+      eta0: 0.4472135955     # sqrt(0.2), as in the densSupport example
+      lamb_init: 0.4
+      precondition_scale: 1.0
+
+  # Same model and start; target collapsed to total mass and pi fixed to identity.
+  ahrav2_mtg_plane_to_strip_1194111462_geometry_only:
+    source_particles: "data/derivatives/allen/ahrav2_2025/particles/gyral_mtg/ahrav2_gyral_mtg_coronal_y-30mm_L.npz"
+    target_particles: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/binned_500um_classes_depth_strip.npz"
+    qc_strip_cells: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/qc_depth_strip_cells.npz"
+    output_dir: "results/registrations/ahrav2_mtg_plane_to_strip_1194111462_geometry_only"
+    feature_key: "nu_Sub"
+    target_feature_mode: "total_mass"
+    vtk_coordinate_convention: "xyz"
+    reference_initialization: "r000_f0"
+    initializations: *atlas_section_initializations
+    model: *atlas_section_boundary_model
+
+  # Engineering stress test only: censoring the source does not remove the white
+  # matter and non-MTG tissue in the target, so this fit is not interpreted.
+  ahrav2_mtg_plane_to_fullsection_1194111462:
+    source_particles: "data/derivatives/allen/ahrav2_2025/particles/gyral_mtg/ahrav2_gyral_mtg_coronal_y-30mm_L.npz"
+    target_particles: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/binned_500um_classes.npz"
+    qc_strip_cells: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/qc_depth_strip_cells.npz"
+    output_dir: "results/registrations/ahrav2_mtg_plane_to_fullsection_1194111462"
+    feature_key: "nu_Sub"
+    target_feature_mode: "classes"
+    vtk_coordinate_convention: "xyz"
+    reference_initialization: "r000_f0"
+    initializations: *atlas_section_initializations
+    model: *atlas_section_boundary_model
+
+# Groupings of categorical feature labels into coarser named features. Every input
+# label must appear in exactly one group or in drop.
+feature_groupings:
+  seaad_merfish_subclass_classes:
+    groups:
+      excitatory: ["L2/3 IT", "L4 IT", "L5 ET", "L5 IT", "L5/6 NP", "L6 CT", "L6 IT",
+                   "L6 IT Car3", "L6b"]
+      inhibitory: ["Chandelier", "Lamp5", "Lamp5 Lhx6", "Pax6", "Pvalb", "Sncg", "Sst",
+                   "Sst Chodl", "Vip"]
+      astrocyte: ["Astrocyte"]
+      oligodendrocyte: ["Oligodendrocyte"]
+      opc: ["OPC"]
+      microglia_pvm: ["Microglia-PVM"]
+      vascular: ["Endothelial", "VLMC"]
+    drop: ["__missing__"]
+
+# Inputs for src/scripts/prepare_atlas_plane_and_section.py: one provisional atlas
+# plane and the matching compressed MERFISH targets.
+atlas_section_inputs:
+  ahrav2_mtg_coronal_L_to_1194111462:
+    atlas:
+      particles: "data/derivatives/allen/ahrav2_2025/particles/gyral_mtg/ahrav2_gyral_annotations_500um_ds1.npz"
+      annotation_nifti: "data/raw/allen/ahrav2/2025/ahrav2_gyral_annotations_500um.nii.gz"
+      template_nifti: "data/raw/allen/ahrav2/2025/ahrav2_icbm2009b_symmetric_template_500um.nii.gz"
+      terminology_csv: "data/raw/allen/ahrav2/2025/ahrav2_homba_terminology_2025.csv"
+      parcellation_volumes_csv: "data/raw/allen/ahrav2/2025/ahrav2_gyral_parcellation_volumes_500um.csv"
+      label_id: 30
+      expected_name: "middle temporal gyrus"
+      # Provisional initialization, not a claim about where the section was cut.
+      plane:
+        origin_mm: [0.0, -30.0, 0.0]
+        u_axis: [1.0, 0.0, 0.0]
+        v_axis: [0.0, 0.0, 1.0]
+        half_thickness_mm: 0.25
+        hemisphere: "left"
+      output_npz: "data/derivatives/allen/ahrav2_2025/particles/gyral_mtg/ahrav2_gyral_mtg_coronal_y-30mm_L.npz"
+    section:
+      full_npz: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/full_section_particles.npz"
+      full_labels_json: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/sections.json"
+      strip_npz: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/depth_strip_mass_is_depth_um.npz"
+      coordinate_scale: 0.001   # X_spatial_raw um -> mm (checked by nearest-neighbour spacing)
+      bin_mm: 0.5
+      feature_grouping: "seaad_merfish_subclass_classes"
+      full_output_npz: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/binned_500um_classes.npz"
+      strip_output_npz: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/binned_500um_classes_depth_strip.npz"
+      strip_cells_npz: "data/derivatives/sea-ad/merfish/H20.33.001/MTG/1194111462/qc_depth_strip_cells.npz"
+    qc_dir: "results/qc/atlas_section/ahrav2_mtg_coronal_L_to_1194111462"
 
 # Dense scalar-image particles.  The xmodmap-native backend is retained for exact
 # legacy-style experiments; Allen production jobs use the affine/block extension.

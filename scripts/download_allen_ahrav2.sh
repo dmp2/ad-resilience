@@ -55,6 +55,37 @@ download_nii_gz() {
     echo
 }
 
+# Small text files (CSV/JSON) have no gzip container to test; checksum only.
+download_file() {
+    local filename="$1"
+    local url="$2"
+
+    echo "============================================================"
+    echo "File: $filename"
+    echo "URL:  $url"
+    echo "Time: $(date --iso-8601=seconds)"
+
+    if [[ -s "$filename" ]]; then
+        echo "File already exists and is non-empty."
+    else
+        wget \
+            --tries=5 \
+            --timeout=60 \
+            --read-timeout=60 \
+            --retry-connrefused \
+            --waitretry=5 \
+            -O "$filename" \
+            "$url"
+    fi
+
+    echo "Saving checksum..."
+    sha256sum "$filename" \
+        > "$MANIFEST_DIR/${filename}.sha256"
+
+    ls -lh "$filename"
+    echo
+}
+
 # ---------------------------------------------------------------------
 # Allen Human Reference Atlas 3D, version 2 (AHRAv2)
 #
@@ -79,6 +110,26 @@ download_nii_gz \
     "ahrav2_brodmann_annotations_500um.nii.gz" \
     "https://allen-atlas-assets.s3.us-west-2.amazonaws.com/annotation-sets/hmba-adult-human-ahrav2brodmann-annotation/2025/annotations_compressed_500.nii.gz"
 
+# Terminology that decodes the *compressed* annotation values above. Both atlas
+# manifests name hmba-mammalian-homba-terminology/2025; join on annotation_value.
+download_file \
+    "ahrav2_homba_terminology_2025.csv" \
+    "https://allen-atlas-assets.s3.us-west-2.amazonaws.com/terminologies/hmba-mammalian-homba-terminology/2025/terminology.csv"
+
+# Per-term voxel counts for the gyral set; used to cross-check a decoded label.
+download_file \
+    "ahrav2_gyral_parcellation_volumes_500um.csv" \
+    "https://allen-atlas-assets.s3.us-west-2.amazonaws.com/annotation-sets/hmba-adult-human-ahrav2gyral-annotation/2025/parcellation_volumes.csv"
+
+# Atlas manifests: which template, annotation set, and terminology belong together.
+download_file \
+    "ahrav2_gyral_atlas_manifest.json" \
+    "https://allen-atlas-assets.s3.us-west-2.amazonaws.com/atlases/hmba-adult-human-ahrav2gyral-atlas/2025/manifest.json"
+
+download_file \
+    "ahrav2_brodmann_atlas_manifest.json" \
+    "https://allen-atlas-assets.s3.us-west-2.amazonaws.com/atlases/hmba-adult-human-ahrav2brodmann-atlas/2025/manifest.json"
+
 
 # Save a small provenance record alongside the checksums.
 cat > "$MANIFEST_DIR/sources.tsv" <<'EOF'
@@ -86,6 +137,10 @@ local_filename	source_url
 ahrav2_icbm2009b_symmetric_template_500um.nii.gz	https://allen-atlas-assets.s3.us-west-2.amazonaws.com/templates/hmba-adult-human-icbm2009b-template/2025/template_500.nii.gz
 ahrav2_gyral_annotations_500um.nii.gz	https://allen-atlas-assets.s3.us-west-2.amazonaws.com/annotation-sets/hmba-adult-human-ahrav2gyral-annotation/2025/annotations_compressed_500.nii.gz
 ahrav2_brodmann_annotations_500um.nii.gz	https://allen-atlas-assets.s3.us-west-2.amazonaws.com/annotation-sets/hmba-adult-human-ahrav2brodmann-annotation/2025/annotations_compressed_500.nii.gz
+ahrav2_homba_terminology_2025.csv	https://allen-atlas-assets.s3.us-west-2.amazonaws.com/terminologies/hmba-mammalian-homba-terminology/2025/terminology.csv
+ahrav2_gyral_parcellation_volumes_500um.csv	https://allen-atlas-assets.s3.us-west-2.amazonaws.com/annotation-sets/hmba-adult-human-ahrav2gyral-annotation/2025/parcellation_volumes.csv
+ahrav2_gyral_atlas_manifest.json	https://allen-atlas-assets.s3.us-west-2.amazonaws.com/atlases/hmba-adult-human-ahrav2gyral-atlas/2025/manifest.json
+ahrav2_brodmann_atlas_manifest.json	https://allen-atlas-assets.s3.us-west-2.amazonaws.com/atlases/hmba-adult-human-ahrav2brodmann-atlas/2025/manifest.json
 EOF
 
 
