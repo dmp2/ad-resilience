@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -105,27 +106,50 @@ def find_project_root(start: Path) -> Path:
     return p
 
 
-def list_prefix(prefix: str, delimiter: str | None = None) -> list[dict]:
-    """Objects under `prefix`, following continuation tokens.
-
-    With `delimiter="/"` only the objects directly in `prefix` are returned and
-    subdirectories are skipped.
-    """
-    token, out = None, []
+def _list_pages(prefix: str, delimiter: str | None, bucket: str):
+    """Parsed ListObjectsV2 pages under `prefix`, following continuation tokens."""
+    token = None
     while True:
         q = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
         if delimiter:
             q["delimiter"] = delimiter
         if token:
             q["continuation-token"] = token
-        try:
-            with urllib.request.urlopen(BUCKET + "?" + urllib.parse.urlencode(q),
-                                        timeout=120) as r:
-                root = ET.fromstring(r.read())
-        except urllib.error.HTTPError as e:  # a prefix that does not exist
-            if e.code == 404:
-                return out
-            raise
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(bucket + "?" + urllib.parse.urlencode(q),
+                                            timeout=120) as r:
+                    root = ET.fromstring(r.read())
+                break
+            except urllib.error.HTTPError as e:  # a prefix that does not exist
+                if e.code == 404:
+                    return
+                raise
+            except OSError:  # transient reset/timeout across thousands of listings
+                if attempt == 3:
+                    raise
+                time.sleep(2 ** attempt)
+        yield root
+        if root.findtext(NS + "IsTruncated") != "true":
+            return
+        token = root.findtext(NS + "NextContinuationToken")
+
+
+def list_folders(prefix: str, bucket: str = BUCKET) -> list[str]:
+    """Immediate subfolder prefixes of `prefix`, each ending in "/"."""
+    return [p.findtext(NS + "Prefix") for root in _list_pages(prefix, "/", bucket)
+            for p in root.findall(NS + "CommonPrefixes")]
+
+
+def list_prefix(prefix: str, delimiter: str | None = None,
+                bucket: str = BUCKET) -> list[dict]:
+    """Objects under `prefix`, following continuation tokens.
+
+    With `delimiter="/"` only the objects directly in `prefix` are returned and
+    subdirectories are skipped.
+    """
+    out = []
+    for root in _list_pages(prefix, delimiter, bucket):
         for c in root.findall(NS + "Contents"):
             key = c.findtext(NS + "Key")
             if key.endswith("/"):
@@ -139,9 +163,7 @@ def list_prefix(prefix: str, delimiter: str | None = None) -> list[dict]:
                 "size_bytes": int(c.findtext(NS + "Size")),
                 "last_modified": c.findtext(NS + "LastModified"),
             })
-        if root.findtext(NS + "IsTruncated") != "true":
-            return out
-        token = root.findtext(NS + "NextContinuationToken")
+    return out
 
 
 def download(key: str, dest: Path, max_bytes: int | None) -> int:

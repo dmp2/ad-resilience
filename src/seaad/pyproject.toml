@@ -17,6 +17,9 @@ dependencies = [
   "pandas>=2.1",
   "pyarrow>=15.0",
   "scipy>=1.11",
+  "imagecodecs>=2024.1",
+  "matplotlib>=3.8",
+  "tifffile>=2024.1",
 ]
 
 [project.scripts]
@@ -29,13 +32,15 @@ seaad-omics-extract-genes = "cli.omics_extract_genes:main"
 seaad-omics-build-signature-registry = "cli.omics_build_signature_registry:main"
 seaad-omics-state-scores = "cli.omics_state_scores:main"
 seaad-omics-competitive-scores = "cli.omics_competitive_scores:main"
+seaad-qnp-download = "qnp.download:main"
+seaad-qnp-montage = "qnp.montage:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["seaad_mtg*", "acquisition*", "omics*", "cli*"]
+include = ["seaad_mtg*", "acquisition*", "omics*", "cli*", "qnp*"]
 
 [tool.setuptools.package-data]
 seaad_mtg = ["bundled_scripts/*.py"]
