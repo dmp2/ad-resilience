@@ -118,8 +118,10 @@ def load_inputs(config: dict, record: dict) -> dict[str, Any]:
             raise ValueError(f"{name} particles are not planar (z != 0); prepare them first.")
     if source_meta.get("coordinate_space") != "mni_icbm2009b_symmetric_plane":
         raise ValueError(f"Unexpected source space {source_meta.get('coordinate_space')!r}.")
-    if target_meta.get("coordinate_space") != "seaad_section_mm":
-        raise ValueError(f"Unexpected target space {target_meta.get('coordinate_space')!r}.")
+    expected_target_space = record.get("target_coordinate_space", "seaad_section_mm")
+    if target_meta.get("coordinate_space") != expected_target_space:
+        raise ValueError(f"Unexpected target space {target_meta.get('coordinate_space')!r}; "
+                         f"record expects {expected_target_space!r}.")
 
     mode = record.get("target_feature_mode", "classes")
     if mode == "total_mass":
@@ -133,6 +135,13 @@ def load_inputs(config: dict, record: dict) -> dict[str, Any]:
 
     S2, T2 = S[:, :2].astype(np.float64), T[:, :2].astype(np.float64)
     source_center, target_center = S2.mean(axis=0), T2.mean(axis=0)
+    # "shared_target": both measures were already placed in one frame (e.g. a rigid scan
+    # result), so subtract the same center and keep that placement.
+    center_mode = record.get("center_mode", "independent")
+    if center_mode == "shared_target":
+        source_center = target_center
+    elif center_mode != "independent":
+        raise ValueError("center_mode must be 'independent' or 'shared_target'.")
     return {
         "source_file": source_file, "target_file": target_file,
         "source_meta": source_meta, "target_meta": target_meta,
@@ -397,6 +406,8 @@ def fit_initialization(api, config, record, inputs, model, init_id, steps, outpu
     strip_w = torch.ones((len(strip_tilde), 1), dtype=dtype, device=device)
     _, _, _, _, strip_back, _ = built["shooting_back"](px1, pw1, shot[2], shot[3], strip_tilde, strip_w)[-1]
     strip_back_plane = api.resize_data(strip_back.detach(), s, m).cpu().numpy() + inputs["source_center"]
+    np.savez_compressed(output_dir / "qc_points_pulled_back.npz", X_plane=strip_back_plane,
+                        depth=inputs["strip_depth_um"], coordinate_space=np.asarray("source plane mm"))
 
     # ---- canonical-frame scores (fixed scales; comparable across starts and models) ----
     M = built["M"]
@@ -477,6 +488,7 @@ def fit_initialization(api, config, record, inputs, model, init_id, steps, outpu
         "target_raw_to_mm_scale": inputs["target_meta"].get("coordinate_scale_from_raw"),
         "target_a_cell_mm2": inputs["target_meta"].get("a_cell_mm2"),
         "target_center_section_mm": inputs["target_center"].tolist(),
+        "center_mode": record.get("center_mode", "independent"),
         "initialization": init_id,
         "initial_transform_matrix_M": M.tolist(),
         "initial_transform_convention": "T_init = (T_section_mm - target_center) @ M.T; reflection is "
