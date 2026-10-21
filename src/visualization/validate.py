@@ -194,9 +194,11 @@ def neuroglancer_checks(out_dir: Path) -> list[dict]:
 def determinism_checks(render: Callable[[Path], list[Path]], label: str) -> dict:
     """Render twice into temporary folders and compare bytes."""
 
+    scratch = Path.home() / ".cache" / "ad-resilience" / "validation"
+    scratch.mkdir(parents=True, exist_ok=True)
     digests = []
     for _ in range(2):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=scratch) as tmp:
             paths = render(Path(tmp))
             digests.append({p.suffix: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
     same = {k: digests[0][k] == digests[1][k] for k in digests[0]}

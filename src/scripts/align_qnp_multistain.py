@@ -17,6 +17,10 @@ Independent checks, never used by the fit:
     on their own tissue (inventory) are checked.
   * white-matter Dice between each aligned slide and the reference (p_wm > 0.5).
 
+Use ``--export-od-only`` to export existing OD archives with ``transforms.json``
+without fitting, feature regeneration or figures (``--overwrite`` replaces local OD exports).
+Native OD archives remain in particle_dir; local archives end in ``_od_bins_<tag>_local.npz``.
+
 Outputs (``alignment`` block of the job): ``transforms.json`` (graph edges with
 scores, runner-up gaps and checks), per-stain particles in ``qnp_local_mm``, a gray/
 white consensus over the structural stains, a multistain feature table on the
@@ -42,6 +46,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from config_setup.project_config import load_config, resolve_path
+from preprocess.dense_image_utils import save_dense_particle_archive
 from preprocess.particle_utils import FeatureDefinition, load_particle_archive, save_particle_archive
 from preprocess.qnp_particles import tissue_class_particles
 from preprocess.section_alignment import FootprintScorer, Similarity2D, refine, search
@@ -59,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--job", required=True)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--export-od-only", action="store_true",
+                        help="Export native OD archives to qnp_local_mm using saved transforms; no fitting or figures.")
     return parser.parse_args()
 
 
@@ -89,6 +96,60 @@ def dice(a: np.ndarray, b: np.ndarray) -> float:
     return float(2 * np.sum(a & b) / max(a.sum() + b.sum(), 1))
 
 
+def export_od_local(job: dict, particle_dir: Path, out_dir: Path, overwrite: bool = False) -> None:
+    """Move existing OD particles with saved rigid transforms, retaining all feature arrays."""
+
+    transform_path = out_dir / "transforms.json"
+    record = json.loads(transform_path.read_text())
+    reference = job["reference_stain"]
+    if record["job"] != job["_name"] or record["reference_stain"] != reference:
+        raise ValueError("Saved alignment does not match the requested job/reference")
+    # Resolve and check every input before writing any output. No inventory, maps or fits needed.
+    exports = []
+    for stain in job["stains"]:
+        edge = None if stain == reference else record["edges"][stain]
+        stem = record["reference_slide"] if edge is None else edge["slide"]
+        transform = None if edge is None else Similarity2D.from_dict(edge["transform"])
+        matrix = np.eye(3).tolist() if transform is None else homogeneous(transform, "to_local")
+        if transform is not None:
+            if transform.scale != 1.0:
+                raise ValueError(f"{stain}: OD export requires a saved rigid transform (scale = 1)")
+            if not np.allclose(matrix, edge["slide_mm_to_local_mm"], rtol=0, atol=1e-9):
+                raise ValueError(f"{stain}: saved transform directions disagree")
+        for bin_mm in job["bins_mm"]:
+            tag = f"{int(round(bin_mm * 1000))}um"
+            source = particle_dir / f"{stem}_od_bins_{tag}.npz"
+            target = out_dir / f"{stem}_od_bins_{tag}_local.npz"
+            if source.resolve() == target.resolve():
+                raise ValueError("Native and local OD archives must be separate")
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            if target.exists() and not overwrite:
+                raise FileExistsError(f"{target}; use --overwrite to replace local OD exports")
+            exports.append((source, target, transform, matrix))
+    for source, target, transform, matrix in exports:
+        X, nu_intensity, meta = load_particle_archive(source, "nu_intensity")
+        if meta["coordinate_space"] != "qnp_slide_mm":
+            raise ValueError(f"{source}: expected native qnp_slide_mm coordinates")
+        with np.load(source, allow_pickle=False) as archive:
+            nu_bin = archive["nu_bin"]
+            # Includes feature names and bin definitions; the dense writer retains these verbatim.
+            bin_arrays = {k: archive[k] for k in archive.files
+                          if k not in {"X", "nu_intensity", "nu_bin", "metadata_json"}}
+        if transform is not None:
+            X = X.copy()
+            X[:, :2] = transform.moving_to_section(X)
+        save_dense_particle_archive(target, X, nu_intensity, nu_bin, bin_arrays, {
+            **meta, "particle_role": "qnp_section_in_local_frame", "coordinate_space": "qnp_local_mm",
+            "coordinate_definition": f"slide mm of reference {reference} ({record['reference_slide']}); "
+                                     "x right, y down, z = 0",
+            "source_archive": str(source.resolve()),
+            "source_coordinate_definition": meta["coordinate_definition"],
+            "alignment_transforms": str(transform_path.resolve()), "slide_to_local": matrix,
+        }, write_vtk=False)
+        print(f"OD local: {target}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -96,6 +157,9 @@ def main() -> None:
     settings = dict(job.get("alignment", {}))
     particle_dir = resolve_path(config, job["particle_dir"])
     out_dir = resolve_path(config, settings.get("output_dir", job["particle_dir"] + "/aligned"))
+    if args.export_od_only:
+        export_od_local(job, particle_dir, out_dir, args.overwrite)
+        return
     qc_dir = resolve_path(config, job["qc_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     inventory = json.loads((qc_dir / "inventory.json").read_text())
