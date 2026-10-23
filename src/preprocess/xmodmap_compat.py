@@ -252,3 +252,55 @@ def dense_bins_xmodmap_native(
             "check the selected repository commit and image dimensionality."
         )
     return points[mask_flat], features[mask_flat]
+
+
+def save_atlas_outputs(write_particle, write_vtk, get_entropy, summary, savedir,
+                       source_names=None, target_names=None):
+    """Assemble reference summary fields using xmodmap's particle/VTK writers.
+
+    ``get_entropy`` is upstream getEntropy. ``jac`` / ``Jacobian`` alias the
+    upstream getJacobian mass ratio; support diagnostics do not censor measures.
+    """
+    import torch
+
+    savedir = Path(savedir)
+    summary = dict(summary)
+    D, nu_D, nu_Dpi = (summary[k] for k in ("D", "nu_D", "nu_Dpi"))
+    ratio = summary["mass_ratio_proxy"]
+    summary["jac"] = ratio
+    write_particle(D, nu_D, str(savedir / "atlas_nu_D.vtk"), norm=True,
+                   condense=False, featNames=source_names, sW=None)
+    write_particle(D, nu_Dpi, str(savedir / "atlas_nu_Dpi.vtk"), norm=True,
+                   condense=False, featNames=target_names, sW=None)
+    atlas, mapped = nu_D.detach().cpu().numpy(), nu_Dpi.detach().cpu().numpy()
+    values = [atlas.sum(-1), atlas.argmax(-1) + 1, mapped.sum(-1), mapped.argmax(-1) + 1,
+              ratio.detach().cpu().numpy().reshape(-1), np.asarray(get_entropy(mapped)).reshape(-1)]
+    names = ["Weight_AtlasFeatures", "MaxVal_AtlasFeatures", "Weight_TargetFeatures",
+             "MaxVal_TargetFeatures", "Jacobian", "Entropy"]
+    values.append(values[4])
+    names.append("MassRatioProxy")
+    if "relative_support_weight" in summary:
+        values.append(summary["relative_support_weight"].detach().cpu().numpy().reshape(-1))
+        names.append("RelativeSupportWeight")
+    write_vtk(D, values, names, str(savedir / "atlas_deformationSummary.vtk"))
+    torch.save(summary, savedir / "atlas_deformationSummary.pt")
+
+
+def save_target_outputs(write_particle, write_vtk, get_entropy, summary, savedir, suffix=""):
+    """Save the inverse-transported target with the same compatibility aliases."""
+    import torch
+
+    savedir = Path(savedir)
+    summary = dict(summary)
+    Td, nu = summary["Td"], summary["nu_Td"]
+    ratio = summary["mass_ratio_proxy"]
+    summary["jac"] = ratio
+    write_particle(Td, nu, str(savedir / f"target_nu_Td{suffix}.vtk"), norm=True,
+                   condense=False, featNames=None, sW=None)
+    masses = nu.detach().cpu().numpy()
+    ratio_np = ratio.detach().cpu().numpy().reshape(-1)
+    write_vtk(Td, [masses.sum(-1), masses.argmax(-1) + 1, ratio_np,
+                   np.asarray(get_entropy(masses)).reshape(-1), ratio_np],
+              ["Weight_TargetFeatures", "MaxVal_TargetFeatures", "Jacobian", "Entropy", "MassRatioProxy"],
+              str(savedir / f"target_deformationSummary{suffix}.vtk"))
+    torch.save(summary, savedir / f"target_deformationSummary{suffix}.pt")

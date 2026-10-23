@@ -65,7 +65,12 @@ from scipy.spatial import ConvexHull
 
 from config_setup.project_config import load_config, resolve_path, write_resolved_config
 from preprocess.particle_utils import load_particle_archive, varifold_score_mm
-from preprocess.xmodmap_compat import load_xmodmap, write_particle_vtk_xyz, write_vtk_xyz
+from preprocess.xmodmap_compat import (
+    load_xmodmap,
+    save_atlas_outputs,
+    write_particle_vtk_xyz,
+    write_vtk_xyz,
+)
 from scripts.framework_script_HighFieldToLowFieldIndividual import (
     _registration_record,
     _save_original,
@@ -386,16 +391,10 @@ def fit_initialization(api, config, record, inputs, model, init_id, steps, outpu
     nu_D = torch.squeeze(qw1)[..., None] * built["zeta_S"]
     nu_Dpi = nu_D @ pi
     mass_ratio = api.get_mass_ratio(D, built["nu_S"], nu_D)
-    writeParticleVTK(D, nu_D, str(output_dir / "atlas_nu_D.vtk"), norm=True, featNames=inputs["source_names"])
-    writeParticleVTK(D, nu_Dpi, str(output_dir / "atlas_nu_Dpi.vtk"), norm=True, featNames=inputs["target_names"])
-    writeVTK(D, [nu_D.sum(-1).cpu().numpy(), nu_Dpi.sum(-1).cpu().numpy(),
-                 np.argmax(nu_Dpi.cpu().numpy(), axis=-1) + 1, np.squeeze(mass_ratio.cpu().numpy()),
-                 np.squeeze(support.cpu().numpy())],
-             ["Weight_AtlasFeatures", "Weight_TargetFeatures", "MaxVal_TargetFeatures", "MassRatioProxy",
-              "RelativeSupportWeight"], str(output_dir / "atlas_deformationSummary.vtk"))
-    torch.save({"D": D, "nu_D": nu_D, "nu_Dpi": nu_Dpi, "mass_ratio_proxy": mass_ratio,
-                "relative_support_weight": support, "raw_density": density},
-               output_dir / "atlas_deformationSummary.pt")
+    save_atlas_outputs(writeParticleVTK, writeVTK, api.get_entropy,
+                       {"D": D, "nu_D": nu_D, "nu_Dpi": nu_Dpi, "mass_ratio_proxy": mass_ratio,
+                        "relative_support_weight": support, "raw_density": density},
+                       output_dir, inputs["source_names"], inputs["target_names"])
 
     # Target bins and strip cells carried back to the atlas plane.
     _, _, _, _, Td, wTd = built["shooting_back"](px1, pw1, shot[2], shot[3], built["T_tilde"], built["w_T"])[-1]

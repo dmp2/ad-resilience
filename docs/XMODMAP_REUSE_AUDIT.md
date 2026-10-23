@@ -207,3 +207,75 @@ xmodmap, not a competing registration library.
 - `xmodmap/model/`
 - `examples/runtime/framework_script_densSupport_halfBrainBarSeqD076_1L_ToAllen.py`
 - representative single- and cross-modality examples
+
+## xIV outputs accompanying the Omics and QNP prototypes
+
+The reference is `vendor/xIV-LDDMM-Particle/examples/framework_script_2DAllenToBarSeqCells.py`.
+The cross-modal pipeline now writes its atlas and target summaries through
+`src/preprocess/xmodmap_compat.py`, including the reference fields and compatibility aliases.
+
+To export complete bundles for existing figure A–C contexts without rerunning optimization:
+
+```bash
+PYTHONPATH=src:src/seaad:src/preprocess:src/config_setup:src/scripts \
+  ~/miniconda3/envs/ad-resilience-xiv/bin/python -m visualization.cli xiv-outputs --modality all
+```
+
+Use the xIV environment (PyTorch and PyKeOps), rather than the rendering-only environment.
+The exporter uses the vendored xIV VTK writers. `--modality omics` or `qnp` restricts the export.
+It replaces only its derived bundles; the fitted registration directories remain untouched.
+
+Output paths relative to `results/visualization_prototypes/`:
+
+| Bundle | Saved registration context |
+|---|---|
+| `omics/xiv_outputs/baseline/` | `ahrav2_mtg_plane_to_strip_1194111462/init_r000_f0` |
+| `omics/xiv_outputs/iv_modality/` | `omics/iv_modality/registration/init_r000_f0`, when completed |
+| `qnp/xiv_outputs/pose_A/` | `ahrav2_tissue_plane_to_qnp_H20.33.034_MTG_A/init_r000_f0` |
+| `qnp/xiv_outputs/pose_B/` | `ahrav2_tissue_plane_to_qnp_H20.33.034_MTG_B/init_r000_f0` |
+
+Each bundle contains:
+
+- `originalAtlas.vtk`, `originalTarget.vtk`: exact copies from the saved fit.
+- `atlas_nu_D.vtk`, `atlas_nu_Dpi.vtk`: transported atlas and mapped target features.
+- `atlas_deformationSummary.pt`: `D`, `nu_D`, `nu_Dpi`, `jac`, `mass_ratio_proxy`, and preserved support diagnostics.
+- `atlas_deformationSummary.vtk`: `Weight_AtlasFeatures`, `MaxVal_AtlasFeatures`,
+  `Weight_TargetFeatures`, `MaxVal_TargetFeatures`, `Jacobian`, `Entropy`,
+  `MassRatioProxy`, and `RelativeSupportWeight` when available.
+- `target_nu_Td.vtk`: inverse-transported target features.
+- `target_deformationSummary.pt`: `Td`, `nu_Td`, `jac`, `mass_ratio_proxy`.
+- `target_deformationSummary.vtk`: `Weight_TargetFeatures`, `MaxVal_TargetFeatures`,
+  `Jacobian`, `Entropy`, `MassRatioProxy`.
+- `input_manifest.json`, `transform_chain.json`, and `manifest.json` with source/output
+  checksums, tensor-preservation checks, and VTK read-back results.
+
+`xiv_outputs_all.json` indexes the full export (restricted exports use `xiv_outputs_omics.json`
+or `xiv_outputs_qnp.json`). Figures A/B show measured or compressed inputs; figure C uses
+the registration context. The bundles accompany those families without implying a separate
+registration for each figure or a registration between the two donors. QNP representation
+variants share the same two atlas pose fits; input compression does not create a new atlas fit.
+
+Coordinates remain in physical mm in the fit's centered, initialized frame. Use the copied
+transform chain to place them in a section or atlas frame. Feature maxima are one-based.
+Atlas summary entropy is computed on `nu_Dpi`; target summary entropy uses `nu_Td`,
+with upstream `getEntropy` (natural logarithm). Measures are saved before support censoring.
+The upstream spelling `Weight_TargetFeaturs` is corrected to `Weight_TargetFeatures`.
+
+Upstream `getJacobian` computes the transported particle mass ratio
+`sum(nu_deformed) / sum(nu_initial)`. `Jacobian` and `jac` are compatibility aliases
+for `MassRatioProxy` and `mass_ratio_proxy`; they do not denote a determinant calculated
+from spatial derivatives.
+
+Validation reads back every VTK file, checks finite values, compares coordinates and summary
+scalars to the saved tensors, and verifies tensor equality and alias equality after PT reload.
+Focused tests cover mapped entropy, uncensored feature mass, one-based maxima, single-particle
+shapes, and target output suffixes:
+
+```bash
+PYTHONPATH=src:src/preprocess:src/config_setup ~/miniconda3/envs/ad-resilience-xiv/bin/python -m pytest src/tests/test_project_extensions.py -q
+```
+
+The export command lives in `src/visualization/cli.py`; read-back validation lives in
+`src/visualization/validate.py`. No separate xIV output modules are needed. The particle
+VTKs preserve upstream writeParticleVTK behavior, including its negative entropy sign;
+summary VTKs call upstream getEntropy, matching the reference example's positive Shannon entropy.

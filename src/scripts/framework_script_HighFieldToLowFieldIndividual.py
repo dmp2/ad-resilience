@@ -68,6 +68,7 @@ from preprocess.particle_utils import load_particle_archive
 from config_setup.project_config import load_config, resolve_path, write_resolved_config
 from preprocess.xmodmap_compat import (
     load_xmodmap,
+    save_target_outputs,
     write_particle_vtk_xyz,
     write_vtk_xyz,
 )
@@ -277,34 +278,10 @@ def _save_target(
     nu_target_initial = target_weight_initial * target_composition
     mass_ratio_proxy = getMassRatio(target_deformed, nu_target_initial, nu_target_deformed)
 
-    writeParticleVTK(
-        target_deformed,
-        nu_target_deformed,
-        str(savedir / f"target_nu_Td{suffix}.vtk"),
-        norm=True,
-        condense=False,
-        featNames=None,
-        sW=None,
-    )
-    torch.save(
-        {
-            "Td": target_deformed,
-            "nu_Td": nu_target_deformed,
-            "mass_ratio_proxy": mass_ratio_proxy,
-            "jac": mass_ratio_proxy,  # legacy compatibility only
-        },
-        savedir / f"target_deformationSummary{suffix}.pt",
-    )
-    writeVTK(
-        target_deformed,
-        [
-            np.sum(nu_target_deformed.cpu().numpy(), axis=-1),
-            np.argmax(nu_target_deformed.cpu().numpy(), axis=-1) + 1,
-            np.squeeze(mass_ratio_proxy.cpu().numpy()),
-            np.squeeze(getEntropy(nu_target_deformed.cpu().numpy())),
-        ],
-        ["Weight_TargetFeatures", "MaxVal_TargetFeatures", "MassRatioProxy", "Entropy"],
-        str(savedir / f"target_deformationSummary{suffix}.vtk"),
+    save_target_outputs(
+        writeParticleVTK, writeVTK, getEntropy,
+        {"Td": target_deformed, "nu_Td": nu_target_deformed,
+         "mass_ratio_proxy": mass_ratio_proxy}, savedir, suffix,
     )
 
 

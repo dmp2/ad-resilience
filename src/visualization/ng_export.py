@@ -142,8 +142,9 @@ def write_slide_zarr(svs: Path, out_dir: Path, level: int = 1, overwrite: bool =
 
 
 def write_annotations(out_dir: Path, kind: str, geometry: Sequence, properties: Mapping[str, tuple[str, np.ndarray]],
-                      enums: Mapping[str, Sequence[str]] | None = None) -> dict:
-    """Precomputed annotations in an (x, y) um coordinate space.
+                      enums: Mapping[str, Sequence[str]] | None = None,
+                      dimensions: Sequence[str] = ("x", "y")) -> dict:
+    """Precomputed annotations in a named 2-D or 3-D um coordinate space.
 
     ``geometry`` holds (N, 2) points for ``point`` or a list of (K, 2) vertex arrays for
     ``polyline``; ``properties`` maps id -> (numpy dtype name, values per annotation).
@@ -162,7 +163,7 @@ def write_annotations(out_dir: Path, kind: str, geometry: Sequence, properties: 
         if pid in enums:
             spec.update(enum_values=list(range(len(enums[pid]))), enum_labels=list(enums[pid]))
         specs.append(ng.AnnotationPropertySpec(**spec))
-    space = ng.CoordinateSpace(names=["x", "y"], units="um", scales=[1.0, 1.0])
+    space = ng.CoordinateSpace(names=list(dimensions), units="um", scales=[1.0] * len(dimensions))
     writer = AnnotationWriter(space, kind, properties=specs)
     add = writer.add_point if kind == "point" else writer.add_polyline
     for i, geom in enumerate(geometry):
@@ -393,12 +394,18 @@ def screenshot(state: dict, path: Path, size: tuple[int, int] = (1200, 900), tim
     cmd = [chrome, "--headless=new", "--no-sandbox", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
            "--hide-scrollbars", f"--window-size={size[0]},{size[1] + 200}", "--remote-debugging-port=0",
            "--enable-logging=stderr", "--v=0", viewer.get_viewer_url()]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    # Chrome's Unix socket path must fit sockaddr_un (108 bytes on Linux).
+    # Long result-directory TMPDIR values can abort Chrome before it connects.
+    scratch = PROJECT / ".cache" / "ng"
+    scratch.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                            env={**os.environ, "TMPDIR": str(scratch)})
     holder: dict[str, Any] = {}
     worker = threading.Thread(target=lambda: holder.setdefault("reply", viewer.screenshot(size=list(size))), daemon=True)
     started = time.time()
     worker.start()
-    worker.join(timeout_s)
+    while worker.is_alive() and proc.poll() is None and time.time() - started < timeout_s:
+        worker.join(1.0)
     resolved = viewer.state.to_json()
     proc.terminate()
     try:
@@ -409,7 +416,8 @@ def screenshot(state: dict, path: Path, size: tuple[int, int] = (1200, 900), tim
     errors = [line.split("CONSOLE", 1)[-1][:300] for line in stderr.splitlines()
               if "CONSOLE" in line and ("rror" in line or "ailed" in line)]
     if "reply" not in holder:
-        return {"ok": False, "reason": f"no screenshot within {timeout_s} s", "console_errors": errors}
+        return {"ok": False, "reason": f"no screenshot after {time.time() - started:.1f} s; Chrome exit {proc.returncode}",
+                "startup_stderr": stderr[-2000:], "console_errors": errors}
     png = holder["reply"].screenshot.image
     path.write_bytes(png)
     pixels = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"), dtype=np.int16)

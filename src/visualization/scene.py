@@ -623,3 +623,185 @@ def load_qnp_layer_measures(config: Mapping, donor: str, measures: Sequence[str]
 
 QNP_TABLE_SOURCE = ("SEA-AD QNP release 2026-06-30 (sea-ad-quantitative-neuropathology-063026.xlsx), "
                     "tab 'MTG', one row per donor x analysis region")
+
+
+def build_mtg_multimodal_3d(config: Mapping, rotations: Mapping[str, float] | None = None,
+                            include_donor_sections: bool = False) -> dict[str, Any]:
+    """Read existing MTG assets; add display-only slabs in MNI world mm.
+
+    Display z means the coronal plane normal (MNI -Y), not MNI superior Z.
+    Optional donor sections inherit the reviewed section's affine without fitting.
+    """
+    from scan_atlas_planes_for_qnp import atlas_setup
+    from skimage.measure import marching_cubes
+
+    rotations = dict(rotations or {})
+    job = qnp_job(config)
+    atlas = atlas_setup(config, job['atlas_scan'])
+    mask = atlas['fine']['MTG'][atlas['labels']]
+    # Hemisphere selection in world coordinates, using the atlas's own affine.
+    indices = np.argwhere(mask)
+    world = indices @ atlas['affine'][:3, :3].T + atlas['affine'][:3, 3]
+    mask[tuple(indices[world[:, 0] >= 0].T)] = False
+    vertices, faces, _, _ = marching_cubes(mask.astype(np.uint8), level=.5)
+    vertices = vertices @ atlas['affine'][:3, :3].T + atlas['affine'][:3, 3]
+    plane_id = 'p+000_w+000_y-027.5'
+    hyp = load_plane_hypothesis(job, plane_id, None)
+    transforms = load_qnp_transforms(job)
+    order = ('NEUN', 'LFB', 'AT', 'ASYN', 'I6', 'GFAP')
+    if set(rotations) - set(order):
+        raise ValueError('Unknown QNP stain in display rotations')
+    sources = [PROJECT / 'configs/project_config.yaml',
+               resolve(config, job['atlas_scan']['annotation_nifti']),
+               resolve(config, job['atlas_scan']['terminology_csv']),
+               job['_aligned_dir'] / 'transforms.json', job['_scan_dir'] / 'transform_graph.json',
+               job['_scan_dir'] / f'export_{plane_id}.json',
+               Path(hyp['export']['paths']['qc_points_npz'])]
+    layers = []
+
+    def add(name, modality, xy, plane, offset, color, meta):
+        u, v, n = (np.asarray(plane[k], float) for k in ('u_axis', 'v_axis', 'normal'))
+        if not (np.allclose(u, [1,0,0]) and np.allclose(v, [0,0,1]) and np.allclose(n, [0,-1,0])):
+            raise ValueError(f'{name}: expected stored coronal plane (X,Z; caudal normal)')
+        origin = np.asarray(plane['origin_mm'], float)
+        xyz = origin + xy[:, :1] * u + xy[:, 1:2] * v + offset * n
+        if not np.isfinite(xyz).all() or not len(xyz):
+            raise ValueError(f'Invalid geometry: {name}')
+        layers.append(dict(name=name, modality=modality, xyz=xyz, normal=n, color=color,
+                           metadata=dict(meta, plane=plane, orientation='coronal; rostrocaudal stacking',
+                                         z_offset_mm=float(offset),
+                                         thickness_mm=.005, rendered_points=len(xyz),
+                                         bounds_world_mm=[xyz.min(0).tolist(), xyz.max(0).tolist()])))
+
+    for i, stain in enumerate(order):
+        path = job['_particle_dir'] / f"{job['_slides'][stain].stem}_tissue_classes_500um.npz"
+        points = load_qnp_particles(path, slide_frame(job['_slides'][stain]))
+        chain = transforms[stain].then(hyp['local_to_plane'])
+        xy = chain.apply(points.xy)
+        angle = float(rotations.get(stain, 0.))
+        if not np.isfinite(angle):
+            raise ValueError('Display rotations must be finite')
+        pivot = xy.mean(0)
+        theta = np.deg2rad(angle)
+        R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+        xy = (xy - pivot) @ R.T + pivot
+        add(stain, 'QNP', xy, hyp['plane'], (i - (len(order)-1)/2)*.020,
+            ('#86b6ef', '#5598e7', '#2a78d6', '#1c5cab', '#0d366b', '#5e53a5')[i],
+            dict(source=str(path), transform=chain.describe(), rotation_degrees=angle,
+                 rotation_pivot_plane_mm=pivot.tolist(), order=i, source_points=len(xy)))
+        sources.append(path)
+
+    placement_path = PROJECT / 'results/analysis/omics_atlas_affine_initialization/initial_affine_candidates.json'
+    placement = json.loads(placement_path.read_text())
+    selected = placement['selected']
+    to_plane = Affine2D(np.asarray(selected['inverse']), 'merfish_section_mm', 'atlas_plane_mm:coronal_y-30')
+    manifest_path = PROJECT / 'results/registrations/ahrav2_mtg_plane_to_strip_1194111462/init_r000_f0/input_manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    omics_plane = manifest['source_metadata']['plane']
+    base = PROJECT / 'data/derivatives/sea-ad/merfish/H20.33.001/MTG'
+    inventory_path = base / 'sections.json'
+    inventory = json.loads(inventory_path.read_text())
+    barcodes = sorted(inventory['sections']) if include_donor_sections else ['1194111462']
+    for i, barcode in enumerate(barcodes):
+        path = base / barcode / 'full_section_particles.npz'
+        # Original full-section export uses Z in provider micrometres (scene validation convention).
+        with np.load(path, allow_pickle=False) as archive:
+            xy = archive['Z'][:, :2].astype(float) * 1e-3
+        count = len(xy)
+        xy = xy[::max(1, int(np.ceil(count/12000)))]
+        add(barcode, 'OMICS', to_plane.apply(xy), omics_plane, (i-(len(barcodes)-1)/2)*5.,
+            ('#eb6834', '#bc4720', '#f29a60')[i],
+            dict(source=str(path), transform=to_plane.describe(), selected_placement=selected,
+                 placement_status=('reviewed provisional C5' if barcode == '1194111462' else
+                                   'unvalidated transfer of 1194111462 display affine'),
+                 rotation_degrees=0., order=i, source_points=count, input_units='um'))
+        sources.append(path)
+    sources += [placement_path, manifest_path, inventory_path]
+    return dict(vertices=vertices, faces=faces, layers=layers, sources=sources,
+                frame='MNI ICBM2009b symmetric world mm',
+                display_z='plane normal = MNI -Y; in-plane axes = MNI X and Z',
+                spacing_mm=dict(QNP=.020, OMICS=5.), thickness_mm=.005,
+                include_donor_sections=include_donor_sections)
+
+
+def add_mtg_biological_detail(scene: dict, config: Mapping) -> None:
+    """Attach existing RGB maps, measured class3 cells, and provider layer outlines.
+
+    Original scene coordinates and transforms are left intact. No representation
+    is recomputed; the existing provider-polygon frame check is reused as-is.
+    """
+    job = qnp_job(config)
+    rgb_sources = []
+    h5ad = resolve(config, 'data/raw/sea-ad/merfish/SEAAD_MTG_MERFISH.2024-12-11.h5ad')
+    grouping = config['feature_groupings']['seaad_merfish_subclass_classes']['groups']
+    production = json.loads((job['_aligned_dir'] / 'transforms.json').read_text())
+
+    def embed(xy, layer):
+        meta = layer['metadata']
+        plane = meta['plane']
+        return (np.asarray(plane['origin_mm']) + xy[:, :1]*np.asarray(plane['u_axis'])
+                + xy[:, 1:2]*np.asarray(plane['v_axis'])
+                + meta['z_offset_mm']*layer['normal'])
+
+    for layer in scene['layers']:
+        meta = layer['metadata']
+        transform = Affine2D(np.asarray(meta['transform']['matrix_3x3']),
+                             meta['transform']['source'], meta['transform']['target'])
+        if layer['modality'] == 'QNP':
+            maps = load_qnp_map(job, layer['name'])
+            raster, mask = maps['rgb'], maps['mask'].array.astype(bool)
+            rows, cols = np.nonzero(mask)
+            r0, r1 = max(0, rows.min()-2), min(mask.shape[0], rows.max()+3)
+            c0, c1 = max(0, cols.min()-2), min(mask.shape[1], cols.max()+3)
+            rgba = np.dstack((raster.array[r0:r1,c0:c1], mask[r0:r1,c0:c1]*255)).astype(np.uint8)
+            corners = np.array([[c0-.5,r0-.5],[c1-.5,r0-.5],
+                                [c1-.5,r1-.5],[c0-.5,r1-.5]])
+            native = corners*np.asarray(raster.px) + np.asarray(raster.origin)
+            xy = transform.apply(native)
+            angle = np.deg2rad(meta['rotation_degrees'])
+            rotation = np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+            pivot = np.asarray(meta['rotation_pivot_plane_mm'])
+            xy = (xy-pivot)@rotation.T+pivot
+            layer.update(rgb_quad=embed(xy,layer), rgba=rgba)
+            path = job['_particle_dir'] / f"{job['_slides'][layer['name']].stem}_maps_32um.npz"
+            rgb_sources.append(path)
+            edge = production['edges'].get(layer['name'])
+            meta['biological_representation'] = dict(
+                source=str(path), representation='existing 32um RGB block-mean map from coarsest Aperio level',
+                transparency='existing tissue mask; no new segmentation', shape_rgba=list(rgba.shape),
+                native_crop_rows_cols=[int(r0),int(r1),int(c0),int(c1)],
+                raster_origin_mm=list(raster.origin), raster_pixel_mm=list(raster.px),
+                texture_world_corners_mm=layer['rgb_quad'].tolist(),
+                production_theta_degrees=edge['transform']['theta_deg'] if edge else 0.,
+                production_reflection=edge['transform']['flip'] if edge else False,
+                additional_orientation_degrees=0.,
+                orientation_note='Saved chain applied once; GFAP alignment remains unreliable' if layer['name']=='GFAP'
+                                 else 'Saved chain applied once; no additional 180-degree adjustment')
+        else:
+            cells = load_merfish_cells(h5ad, layer['name'], grouping)
+            try:
+                polygons, to_section, check = merfish_layer_polygons(h5ad, cells)
+            except (KeyError, ValueError) as exc:
+                # Missing or label-incompatible provider polygons are not displayed.
+                # Never transfer another section's annotations to fill this gap.
+                polygons, to_section, check = None, None, dict(unavailable=str(exc))
+            world = embed(transform.apply(cells.xy),layer)
+            stride = max(1,int(np.ceil(len(cells.xy)/12000)))
+            error = float(np.max(np.abs(world[::stride]-layer['xyz'])))
+            if error > 1e-5:
+                raise ValueError(f"{layer['name']}: measured cells do not reproduce saved display placement")
+            polygon_world = ([embed(transform.apply(to_section.apply(ring)),layer) for ring in polygons.rings]
+                             if polygons is not None else [])
+            layer.update(cell_xyz=world, cell_class3=cells.categories['class3'].codes,
+                         polygon_world=polygon_world,
+                         polygon_labels=polygons.labels if polygons is not None else [],
+                         layer_names=polygons.label_names if polygons is not None else ())
+            meta['biological_representation'] = dict(
+                source=str(h5ad), representation='all measured cells, existing CLASS3 grouping; no new bins/clustering',
+                cells=len(world), class_names=list(cells.categories['class3'].names),
+                class_counts={name:int(np.sum(cells.categories['class3'].codes==i))
+                              for i,name in enumerate(cells.categories['class3'].names)},
+                polygons=polygons.provenance if polygons is not None else 'unavailable for this section',
+                polygon_to_section=to_section.describe() if to_section is not None else None,
+                provider_frame_check=check, sampled_coordinate_agreement_mm=error)
+    scene['sources'].extend([*rgb_sources,h5ad])

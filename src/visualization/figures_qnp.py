@@ -48,6 +48,10 @@ def _particle_squares(ax, points: S.Points, bin_mm: float, values: np.ndarray, c
     """Each particle as a square at its position, area proportional to its mass (capped at the bin)."""
 
     mass = points.scalars["area_mm2"].values
+    if points.meta.get("compression_method") == "image_varifold":
+        # Marker area is a mass encoding in points², never a physical tissue parcel.
+        return ax.scatter(*points.xy.T, s=12 * mass / mass_ref, c=values, cmap=cmap,
+                          norm=norm, linewidths=0, rasterized=True)
     side = bin_mm * np.sqrt(np.clip(mass / mass_ref, 0, 1))
     patches = [Rectangle((x - s / 2, y - s / 2), s, s) for (x, y), s in zip(points.xy, side)]
     coll = PatchCollection(patches, cmap=cmap, norm=norm, linewidths=0, rasterized=True)
@@ -71,7 +75,7 @@ def _hbar(fig, mappable, rect, label, ticks=None):
 # A - scale space
 # --------------------------------------------------------------------------------------
 
-def figure_a(config: Mapping, job_name: str, out_dir: Path) -> list[Path]:
+def figure_a(config: Mapping, job_name: str, out_dir: Path, representation: dict | None = None) -> list[Path]:
     job = S.qnp_job(config, job_name)
     stain = job["reference_stain"]
     slide = job["_slides"][stain]
@@ -88,19 +92,29 @@ def figure_a(config: Mapping, job_name: str, out_dir: Path) -> list[Path]:
     p = maps["p_wm"].array.astype(float)
     p[~maps["mask"].array.astype(bool)] = np.nan
     im = axes[1].imshow(p, extent=maps["p_wm"].extent, cmap=st.SEQ_BLUE, norm=norm, rasterized=True)
-    st.panel_title(axes[1], "b", "p(white matter), 32 µm pixels", "derived")
+    st.panel_title(axes[1], "b", "p(white matter), 32 µm pixels",
+                   "fixed surrogate reference" if representation else "derived")
     for ax, letter, tag in ((axes[2], "c", "500um"), (axes[3], "d", "1000um")):
-        points = S.load_qnp_particles(job["_particle_dir"] / f"{slide.stem}_tissue_classes_{tag}.npz", frame)
+        points = (representation["points"][tag] if representation else
+                  S.load_qnp_particles(job["_particle_dir"] / f"{slide.stem}_tissue_classes_{tag}.npz", frame))
         bin_mm = summary[tag]["bin_mm_actual"]
-        _particle_squares(ax, points, bin_mm, points.scalars["white_fraction"].values, st.SEQ_BLUE, norm, bin_mm**2)
-        st.panel_title(ax, letter, f"{len(points.xy):,} particles, {bin_mm * 1000:.0f} µm bins", "derived")
+        _particle_squares(ax, points, bin_mm, points.scalars[representation.get("scalar", "white_fraction") if representation else "white_fraction"].values, st.SEQ_BLUE, norm, bin_mm**2)
+        title = f"{len(points.xy):,} particles, {bin_mm * 1000:.0f} µm bins"
+        status = "derived"
+        if representation:
+            title = f"{len(points.xy):,} particles: " + ("500 µm reference" if tag == "500um" else representation["variant"])
+            status = "deterministic reference" if tag == "500um" else "optimized XY and nonnegative masses"
+            title = representation.get("titles", {}).get(tag, title)
+            status = representation.get("statuses", {}).get(tag, status)
+        st.panel_title(ax, letter, title, status)
     for ax in axes:
         st.map_axes(ax, extent)
         st.scale_bar(ax, 5, "5 mm")
     st.axes_glyph(axes[0], "+x", "+y", y_down=True)
-    _hbar(fig, im, [0.30, 0.17, 0.40, 0.022], "white-matter fraction: p(WM) per pixel (b); white area / tissue area "
-          "per particle (c, d)", ticks=[0, 0.25, 0.5, 0.75, 1])
-    st.caption(fig, [
+    label = (representation["color_label"] if representation else
+             "white-matter fraction: p(WM) per pixel (b); white area / tissue area per particle (c, d)")
+    _hbar(fig, im, [0.30, representation.get("colorbar_y", 0.20) if representation else 0.17, 0.40, 0.022], label, ticks=[0, 0.25, 0.5, 0.75, 1])
+    st.caption(fig, representation["caption"] if representation else [
         f"{slide.stem} in its own frame {frame}: x right, y down, origin at the top-left baseline pixel; the block's "
         "anatomical orientation is undocumented.",
         "c, d: binned soft gray/white area masses (prepare_qnp_section_particles); each square sits at the particle "
@@ -122,7 +136,7 @@ def _spread_labels(y: np.ndarray, gap: float) -> np.ndarray:
     return out
 
 
-def figure_b(config: Mapping, job_name: str, out_dir: Path) -> list[Path]:
+def figure_b(config: Mapping, job_name: str, out_dir: Path, representation: dict | None = None, consensus_title: str | None = None) -> list[Path]:
     job = S.qnp_job(config, job_name)
     donor = job_name.split("_")[0]
     stain = job["reference_stain"]
@@ -189,24 +203,37 @@ def figure_b(config: Mapping, job_name: str, out_dir: Path) -> list[Path]:
         ax = fig.add_axes([0.355 + (i % 3) * (gw + 0.012), 0.345 - (i // 3) * (gh + 0.06), gw, gh])
         p = ms["p_wm"][i].astype(float)
         p[~ms["tissue"][i]] = np.nan
-        im = ax.imshow(p, extent=ext, cmap=st.SEQ_BLUE, norm=norm, rasterized=True)
+        if representation:
+            points = representation["aligned_points"][s]
+            im = _particle_squares(ax, points, 1.0, points.scalars[representation["scalar"]].values,
+                                   st.SEQ_BLUE, norm, 1.0)
+        else:
+            im = ax.imshow(p, extent=ext, cmap=st.SEQ_BLUE, norm=norm, rasterized=True)
         st.map_axes(ax, crop)
         role = "structural" if job["stains"][s].get("structural", False) else "feature only"
         if transforms[s].status.startswith("unreliable"):
             role = "alignment unreliable"
-        st.panel_title(ax, "ghijkl"[i], f"{STAIN_LABEL[s]}, sep. {sep[s]:.2f}", role)
+        title = f"{STAIN_LABEL[s]}, sep. {sep[s]:.2f}"
+        if representation:
+            title = STAIN_LABEL[s] + (": OD" if representation["variant"] == "iv_modality" else ": surrogate")
+            role = "OD; fixed rigid" if representation["variant"] == "iv_modality" else "IV surrogate; fixed rigid"
+            if transforms[s].status.startswith("unreliable"):
+                role = "native; unreliable"
+        st.panel_title(ax, "ghijkl"[i], title, role)
         if i == 0:
             st.scale_bar(ax, 5, "5 mm")
-    _hbar(fig, im, [0.37, 0.115, 0.38, 0.012], "p(white matter) in the NeuN frame (32 µm); sep. = Otsu separability",
-          ticks=[0, 0.5, 1])
+    _hbar(fig, im, [0.37, 0.115, 0.38, 0.012],
+          representation["color_label_b"] if representation else
+          "p(white matter) in the NeuN frame (32 µm); sep. = Otsu separability", ticks=[0, 0.5, 1])
     ax = fig.add_axes([0.79, 0.19, 0.19, 0.28])
     sd = ms["structural_disagreement_sd"].astype(float)
     sd[~ms["consensus_mask"]] = np.nan
     im2 = ax.imshow(sd, extent=ext, cmap=st.SEQ_ORANGE, vmin=0, vmax=0.5, rasterized=True)
     st.map_axes(ax, crop)
-    st.panel_title(ax, "m", "SD of p(WM): NeuN, LFB, AT8", "derived")
+    st.panel_title(ax, "m", consensus_title or "SD of p(WM): NeuN, LFB, AT8",
+                   "fixed structural reference" if representation else "derived")
     _hbar(fig, im2, [0.80, 0.155, 0.17, 0.012], "across-stain SD", ticks=[0, 0.25, 0.5])
-    st.caption(fig, [
+    st.caption(fig, representation["caption_b"] if representation else [
         f"a-e: {S.QNP_TABLE_SOURCE}.",
         "HALO layer means measured on each stain's own slide, painted on the NeuN HALO layer raster (32 µm); each "
         "panel has its own scale. The release gives one mean per layer,",
@@ -255,7 +282,7 @@ def ribbon_dice_checks(job: Mapping) -> dict:
     return out
 
 
-def figure_c(config: Mapping, job_name: str, out_dir: Path) -> list[Path]:
+def figure_c(config: Mapping, job_name: str, out_dir: Path, representation: dict | None = None) -> list[Path]:
     job = S.qnp_job(config, job_name)
     checks = ribbon_dice_checks(job)
     ref_poly = checks.pop("_reference")
@@ -340,7 +367,7 @@ def figure_c(config: Mapping, job_name: str, out_dir: Path) -> list[Path]:
              "template; neither pose is independently\nverified. A is provisional (dissection prior).",
              fontsize=5.5, color=st.TEXT_2, va="top", linespacing=1.3)
     fmt = lambda v: "[" + ", ".join(f"{x:.2f}" for x in v) + "]"  # noqa: E731
-    st.caption(fig, [
+    st.caption(fig, representation["caption_c"] if representation else [
         "a, b: frame qnp_local_mm (= NeuN slide mm; x right, y down). c, d: in-plane atlas mm; MNI T1 with resliced "
         "AHRAv2 label outlines; ribbon points subsampled 1:7.",
         f"Plane axes (MNI): A u = {fmt(planes['A']['u_axis'])}, v = {fmt(planes['A']['v_axis'])}; "

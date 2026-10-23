@@ -24,10 +24,7 @@ def _check(name: str, value: float, tol: float, detail: str, compare: str = "<="
 
 
 def _vtk_points(path: Path) -> np.ndarray:
-    lines = path.read_text().split("\n")
-    i = next(k for k, line in enumerate(lines) if line.startswith("POINTS"))
-    n = int(lines[i].split()[1])
-    return np.array([[float(v) for v in line.split()] for line in lines[i + 1:i + 1 + n]])[:, :2]
+    return read_particle_vtk(path)[0][:, :2]
 
 
 def merfish_checks(cells: S.Points, merfish: Mapping) -> list[dict]:
@@ -218,3 +215,46 @@ def run(config: Mapping, cells_fn: Callable[[], S.Points], qnp_job_name: str, me
                                             "failed": [c["check"] for c in checks if not c["passed"]]}}
     (out_dir / "validation.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
+
+
+def read_particle_vtk(path):
+    lines = Path(path).read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("POINTS "))
+    count = int(lines[start].split()[1])
+    points = np.loadtxt(lines[start + 1:start + 1 + count]).reshape(count, 3)
+    arrays = {}
+    for i, line in enumerate(lines):
+        if line.startswith("SCALARS "):
+            arrays[line.split()[1]] = np.loadtxt(lines[i + 2:i + 2 + count]).reshape(count)
+    if not np.isfinite(points).all() or not all(np.isfinite(v).all() for v in arrays.values()):
+        raise ValueError(f"Non-finite VTK data in {path}")
+    return points, arrays
+
+
+def validate_xiv_vtks(out_dir, atlas, target, convention, get_entropy, files):
+    checks = {}
+    for filename in (name for name in files if name.endswith(".vtk")):
+        points, arrays = read_particle_vtk(out_dir / filename)
+        checks[filename] = {"particles": len(points), "fields": list(arrays), "finite": True}
+        if filename.startswith("original"):
+            continue
+        state = target if filename.startswith("target") else atlas
+        key = "Td" if filename.startswith("target") else "D"
+        expected = state[key].numpy()
+        if expected.shape[1] == 2:
+            expected = np.column_stack([expected, np.zeros(len(expected))])
+        if convention == "xmodmap_yxz":
+            expected = expected[:, [1, 0, 2]]
+        np.testing.assert_allclose(points, expected, rtol=0, atol=1e-6)
+        if "deformationSummary" in filename:
+            mass = state["nu_Td" if key == "Td" else "nu_Dpi"].numpy()
+            np.testing.assert_allclose(arrays["Entropy"], get_entropy(mass), rtol=1e-6, atol=1e-8)
+            np.testing.assert_allclose(arrays["Jacobian"], state["mass_ratio_proxy"], rtol=1e-6, atol=1e-8)
+            np.testing.assert_array_equal(arrays["Jacobian"], arrays["MassRatioProxy"])
+            np.testing.assert_allclose(arrays["Weight_TargetFeatures"], mass.sum(-1), rtol=1e-6, atol=1e-8)
+            np.testing.assert_array_equal(arrays["MaxVal_TargetFeatures"], mass.argmax(-1) + 1)
+            if key == "D":
+                np.testing.assert_allclose(arrays["Weight_AtlasFeatures"], state["nu_D"].numpy().sum(-1),
+                                           rtol=1e-6, atol=1e-8)
+                np.testing.assert_array_equal(arrays["MaxVal_AtlasFeatures"], state["nu_D"].numpy().argmax(-1) + 1)
+    return checks

@@ -8,11 +8,14 @@ moments/bins, and the VTK coordinate adapter.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import torch
 
 from dense_image_utils import IntensityTransform, construct_dense_image_particles
 from particle_utils import FeatureDefinition, construct_particles
-from xmodmap_compat import XmodmapAPI, write_vtk_xyz
+from xmodmap_compat import XmodmapAPI, write_vtk_xyz, save_atlas_outputs, save_target_outputs
 
 
 def test_categorical_mass_conservation() -> None:
@@ -79,3 +82,51 @@ def test_vtk_xyz_adapter_cancels_xmodmap_swap() -> None:
     xyz = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     write_vtk_xyz(api, xyz, [np.ones(2)], ["test"], "unused.vtk")
     assert np.array_equal(captured["vtk_points"], xyz)
+
+
+def test_atlas_reference_fields_use_mapped_features_without_support_censoring(tmp_path):
+    D = torch.tensor([[1., 2.], [3., 4.]])
+    atlas = torch.tensor([[0., 4.], [2., 0.]])
+    mapped = atlas @ torch.tensor([[1., 3.], [2., 0.]])
+    ratio = torch.tensor([2., .5])
+    summary = dict(D=D, nu_D=atlas, nu_Dpi=mapped, mass_ratio_proxy=ratio,
+                   relative_support_weight=torch.tensor([[0.], [.25]]))
+    particles, scalars = {}, {}
+    def particle(points, mass, filename, **kwargs):
+        particles[Path(filename).name] = (points, mass, kwargs)
+    def vtk(points, values, names, filename):
+        scalars.update(zip(names, values))
+    def mapped_entropy(masses):
+        np.testing.assert_array_equal(masses, mapped.numpy())
+        return np.array([0., -(0.25*np.log(.25)+.75*np.log(.75))])
+    save_atlas_outputs(particle, vtk, mapped_entropy, summary, tmp_path, ['a', 'b'], ['x', 'y'])
+    np.testing.assert_array_equal(scalars['Weight_AtlasFeatures'], [4., 2.])
+    np.testing.assert_array_equal(scalars['MaxVal_AtlasFeatures'], [2, 1])
+    np.testing.assert_array_equal(scalars['Weight_TargetFeatures'], [8., 8.])
+    np.testing.assert_array_equal(scalars['MaxVal_TargetFeatures'], [1, 2])
+    np.testing.assert_allclose(scalars['Entropy'], [0., -(0.25*np.log(.25)+.75*np.log(.75))])
+    np.testing.assert_array_equal(scalars['Jacobian'], ratio)
+    np.testing.assert_array_equal(scalars['MassRatioProxy'], ratio)
+    assert particles['atlas_nu_Dpi.vtk'][2]['featNames'] == ['x', 'y']
+    assert particles['atlas_nu_Dpi.vtk'][2]['sW'] is None
+    saved = torch.load(tmp_path/'atlas_deformationSummary.pt', weights_only=False)
+    torch.testing.assert_close(saved['D'], D)
+    torch.testing.assert_close(saved['nu_Dpi'], mapped)
+    torch.testing.assert_close(saved['jac'], ratio)
+
+
+def test_single_target_particle_keeps_vector_fields_and_suffix(tmp_path):
+    calls = []
+    def vtk(points, values, names, filename):
+        assert all(v.shape == (1,) for v in values)
+        calls.append((Path(filename).name, dict(zip(names, values))))
+    state = dict(Td=torch.tensor([[4., 5.]]), nu_Td=torch.tensor([[0., 2.]]),
+                 mass_ratio_proxy=torch.tensor([.5]))
+    save_target_outputs(lambda *args, **kwargs: None, vtk, lambda masses: np.zeros(len(masses)), state, tmp_path, '_qc')
+    name, values = calls[0]
+    assert name == 'target_deformationSummary_qc.vtk'
+    np.testing.assert_array_equal(values['MaxVal_TargetFeatures'], [2])
+    np.testing.assert_array_equal(values['Jacobian'], [.5])
+    np.testing.assert_array_equal(values['Entropy'], [0.])
+    saved = torch.load(tmp_path/'target_deformationSummary_qc.pt', weights_only=False)
+    torch.testing.assert_close(saved['jac'], state['mass_ratio_proxy'])

@@ -150,6 +150,30 @@ def export_od_local(job: dict, particle_dir: Path, out_dir: Path, overwrite: boo
         print(f"OD local: {target}", flush=True)
 
 
+def registration_particles(particle_dir: Path, stem: str, tag: str, representation: str = "tissue_classes"):
+    """Route existing native archives to the unchanged registration objective."""
+    feature_key = {"tissue_classes": "nu_Sub", "od_bins": "nu_bin"}[representation]
+    X, nu, meta = load_particle_archive(particle_dir / f"{stem}_{representation}_{tag}.npz", feature_key)
+    return X[:, :2].astype(np.float64), nu.astype(np.float64), meta
+
+
+def fit_registration_stages(scorer_coarse, scorer_fine, P, mu, Pf, muf, settings):
+    """Existing rigid search/refinement, retaining the coarse starts for provenance.
+
+    Fine inputs are supplied separately so a coarse representation can change without
+    changing the refinement measure. Each fine fit starts from its own ranked winner.
+    """
+    ranked = search(scorer_coarse, P, mu, thetas=np.arange(0, 360, float(settings.get("theta_step_deg", 10))),
+                    scales=[1.0], flips=[False, True], scale_bounds=(1.0, 1.0), h=0.5, blur_mm=1.0,
+                    refine_top=int(settings.get("refine_top", 4)))
+    best_score, best = refine(scorer_fine, Pf, muf, ranked[0][1], (1.0, 1.0), max_evals=200)
+    runner = next(((v, t) for v, t in ranked[1:] if t.flip != best.flip or
+                   abs((t.theta_deg - best.theta_deg + 180) % 360 - 180) > 20 or
+                   np.hypot(*np.subtract(t.tau, best.tau)) > 3), None)
+    free_score, free = refine(scorer_fine, Pf, muf, best, (0.85, 1.15), max_evals=200)
+    return ranked, best_score, best, runner, free_score, free
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -172,8 +196,7 @@ def main() -> None:
     coarse_tag, fine_tag = settings.get("search_bin_tag", "1000um"), settings.get("refine_bin_tag", "500um")
 
     def particles(stain, tag):
-        X, nu, meta = load_particle_archive(particle_dir / f"{stems[stain]}_tissue_classes_{tag}.npz", "nu_Sub")
-        return X[:, :2].astype(np.float64), nu.astype(np.float64), meta
+        return registration_particles(particle_dir, stems[stain], tag)
 
     ref_coarse, ref_fine = particles(reference, coarse_tag), particles(reference, fine_tag)
     scorer_coarse = FootprintScorer(ref_coarse[0], ref_coarse[1], sigmas)
@@ -185,15 +208,9 @@ def main() -> None:
         if stain == reference:
             continue
         P, mu, _ = particles(stain, coarse_tag)
-        ranked = search(scorer_coarse, P, mu, thetas=np.arange(0, 360, float(settings.get("theta_step_deg", 10))),
-                        scales=[1.0], flips=[False, True], scale_bounds=(1.0, 1.0), h=0.5, blur_mm=1.0,
-                        refine_top=int(settings.get("refine_top", 4)))
         Pf, muf, _ = particles(stain, fine_tag)
-        best_score, best = refine(scorer_fine, Pf, muf, ranked[0][1], (1.0, 1.0), max_evals=200)
-        runner = next(((v, t) for v, t in ranked[1:] if t.flip != best.flip or
-                       abs((t.theta_deg - best.theta_deg + 180) % 360 - 180) > 20 or
-                       np.hypot(*np.subtract(t.tau, best.tau)) > 3), None)
-        free_score, free = refine(scorer_fine, Pf, muf, best, (0.85, 1.15), max_evals=200)
+        ranked, best_score, best, runner, free_score, free = fit_registration_stages(
+            scorer_coarse, scorer_fine, P, mu, Pf, muf, settings)
         fitted[stain] = best
         transforms[stain] = {
             "slide": stems[stain], "structural": stain in structural,
@@ -201,6 +218,8 @@ def main() -> None:
             "slide_mm_to_local_mm": homogeneous(best, "to_local"),
             "local_mm_to_slide_mm": homogeneous(best, "to_slide"),
             "score_fine": best_score, "score_coarse_best": ranked[0][0],
+            "coarse_candidates": [{"score": v, "transform": t.as_dict()} for v, t in ranked],
+            "fine_initial_transform": ranked[0][1].as_dict(),
             "runner_up_distinct_coarse": None if runner is None else {"score": runner[0], "transform": runner[1].as_dict()},
             "runner_up_gap_coarse": None if runner is None else runner[0] - ranked[0][0],
             "free_scale_diagnostic": {"scale": free.scale, "score": free_score},

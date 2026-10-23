@@ -45,6 +45,9 @@ def _cell_spacing_mm(cells: S.Points) -> float:
 def _bin_squares(ax, binned: S.Points, facecolors, mass_ref: float):
     """Bins drawn on their grid squares, area proportional to cell count (capped at the bin)."""
 
+    if binned.meta.get("compression_method") == "image_varifold":
+        return ax.scatter(*binned.xy.T, s=12 * binned.scalars["cells_per_bin"].values / mass_ref,
+                          c=facecolors, linewidths=0, rasterized=True)
     bin_mm = binned.meta["bin_mm"]
     counts = binned.scalars["cells_per_bin"].values
     side = bin_mm * np.sqrt(np.clip(counts / mass_ref, 0, 1))
@@ -77,14 +80,16 @@ def _section_axes(ax, extent, letter, title, status, bar=True, glyph=False):
 # A - scale space
 # --------------------------------------------------------------------------------------
 
-def figure_a(cells: S.Points, out_dir: Path) -> list[Path]:
+def figure_a(cells: S.Points, out_dir: Path, representation: dict | None = None) -> list[Path]:
     extent = _extent(cells)
     spacing = _cell_spacing_mm(cells)
     klass3 = cells.categories["class3"]
     order = np.argsort(cells.scalars[f"lognorm:{GENE_A}"].values)
     gene = cells.scalars[f"lognorm:{GENE_A}"].values
     gnorm = Normalize(0, float(np.percentile(gene, 99)))
-    binned = [S.bin_merfish(cells, b, [f"lognorm:{GENE_A}"]) for b in BINS_MM]
+    references = [S.bin_merfish(cells, b, [f"lognorm:{GENE_A}"]) for b in BINS_MM]
+    binned = ([representation["points"].get(b, ref) for b, ref in zip(BINS_MM, references)]
+              if representation else references)
 
     fig = st.figure(st.FULL_WIDTH_MM, 118)
     width, height = 0.185, 0.33
@@ -102,23 +107,34 @@ def figure_a(cells: S.Points, out_dir: Path) -> list[Path]:
                 title, status = f"{len(idx):,} cells", "measured"
             else:
                 b = binned[col - 1]
-                ref = float(np.percentile(b.scalars["cells_per_bin"].values, 95))
+                # Compressed class masses do not retain genes: use the original measured
+                # gene aggregation at its original positions, never assign genes to moved points.
+                if kind == "gene" and f"lognorm:{GENE_A}" not in b.scalars:
+                    b = references[col - 1]
+                ref = float(np.percentile(references[col - 1].scalars["cells_per_bin"].values, 95))
                 faces = (_class3_rgba(b.meta["nu_class"], b.meta["class_names"]) if kind == "class"
                          else st.SEQ_BLUE(gnorm(b.scalars[f"lognorm:{GENE_A}"].values)))
                 _bin_squares(ax, b, faces, ref)
                 title, status = f"{len(b.xy):,} bins, {BINS_MM[col - 1] * 1000:g} µm", "derived"
+                if representation:
+                    if b.meta.get("compression_method") == "image_varifold":
+                        title, status = f"{len(b.xy):,} particles, {BINS_MM[col - 1] * 1000:g} µm", "optimized class masses"
+                    else:
+                        status = "deterministic gene mean" if kind == "gene" else "deterministic reference"
             _section_axes(ax, extent, next(letters), title, status, bar=col == 0, glyph=(col == 0 and row == 0))
     handles = [Line2D([], [], marker="s", ls="", color=c, ms=5, label=n) for n, c in zip(S.CLASS3, st.CAT3)]
     fig.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.01, 0.105), ncol=3, frameon=False, fontsize=6,
-               title="a-e: cell class; bins show the dominant group, opacity = its share of cells (1/3 to 1)",
+               title=("a-e: dominant class group; opacity = fraction of class mass" if representation else
+                      "a-e: cell class; bins show the dominant group, opacity = its share of cells (1/3 to 1)"),
                title_fontsize=5.5, alignment="left")
     cax = fig.add_axes([0.52, 0.15, 0.44, 0.013])
     from matplotlib.cm import ScalarMappable
     cb = fig.colorbar(ScalarMappable(norm=gnorm, cmap=st.SEQ_BLUE), cax=cax, orientation="horizontal")
-    cb.set_label(f"f-j: {GENE_A}, ln(1 + spots per 10K spots in the cell); bins = mean over cells;\none scale "
-                 "for all columns (0 to the cell 99th percentile)", fontsize=5.5)
+    cb.set_label((f"f-j: {GENE_A}, original measured cells and deterministic bin means;\none scale, no genes assigned to moved class particles" if representation else
+                  f"f-j: {GENE_A}, ln(1 + spots per 10K spots in the cell); bins = mean over cells;\none scale "
+                  "for all columns (0 to the cell 99th percentile)"), fontsize=5.5)
     cb.ax.tick_params(labelsize=5, width=0.4, length=2)
-    st.caption(fig, [
+    st.caption(fig, representation["caption"] if representation else [
         f"{cells.meta['donor']} section {cells.meta['barcode']} ({cells.meta['section']}); frame merfish_section_mm "
         "= X_spatial_raw / 1000, drawn x right, y down (orientation as stored).",
         f"Cells drawn as {CELL_DISC_MM * 1000:.0f} µm discs (median nearest-neighbour spacing {spacing * 1000:.1f} µm). Bins: "
@@ -133,7 +149,7 @@ def figure_a(cells: S.Points, out_dir: Path) -> list[Path]:
 # B - feature maps
 # --------------------------------------------------------------------------------------
 
-def figure_b(cells: S.Points, out_dir: Path, polygons=None) -> list[Path]:
+def figure_b(cells: S.Points, out_dir: Path, polygons=None, representation: dict | None = None) -> list[Path]:
     from matplotlib.cm import ScalarMappable
 
     if polygons is None:
@@ -203,14 +219,14 @@ def figure_b(cells: S.Points, out_dir: Path, polygons=None) -> list[Path]:
         ax = fig.add_axes([0.012 + i * (w + 0.012), 0.11, w, h])
         st.map_axes(ax, extent)
         _bin_squares(ax, b, st.SEQ_BLUE(fnorm(b.scalars[f"fraction:{cls}"].values)), ref)
-        _section_axes(ax, extent, "mnopqr"[i], cls.replace("_", "-"), "derived; per 250 µm bin",
-                      bar=i == 0)
+        _section_axes(ax, extent, "mnopqr"[i], cls.replace("_", "-"),
+                      "fixed 250 µm reference" if representation else "derived; per 250 µm bin", bar=i == 0)
     cax = fig.add_axes([0.30, 0.075, 0.40, 0.009])
     cb = fig.colorbar(ScalarMappable(norm=fnorm, cmap=st.SEQ_BLUE), cax=cax, orientation="horizontal")
     cb.set_label("m-r: fraction of the bin's cells in the class (provider Subclass grouped as in "
                  "feature_groupings); square area = cell count", fontsize=5.5)
     cb.ax.tick_params(labelsize=5, width=0.4, length=2)
-    st.caption(fig, [
+    st.caption(fig, representation["caption_b"] if representation else [
         "Genes were chosen a priori as known markers (labels under each title); the control is the per-cell mean of "
         "the 40 blank probes (one probe-equivalent). Nothing is ranked by the data.",
         "X in this h5ad holds raw spot counts (rows sum to 'Number of spots'), despite uns/X_normalization; the "
@@ -222,7 +238,7 @@ def figure_b(cells: S.Points, out_dir: Path, polygons=None) -> list[Path]:
 # C - correspondence
 # --------------------------------------------------------------------------------------
 
-def figure_c(cells: S.Points, out_dir: Path, polygons=None, xiv=None) -> list[Path]:
+def figure_c(cells: S.Points, out_dir: Path, polygons=None, xiv=None, representation: dict | None = None) -> list[Path]:
     from .cli import MERFISH, merfish_polygons
 
     poly, to_section, check = polygons or merfish_polygons()
@@ -263,6 +279,8 @@ def figure_c(cells: S.Points, out_dir: Path, polygons=None, xiv=None) -> list[Pa
     ax = fig.add_axes([0.33, 0.12, 0.36, 0.72])
     allp = np.vstack([cells.xy, deformed, rigid])
     ext_b = [allp[:, 0].min() - 0.5, allp[:, 0].max() + 0.5, allp[:, 1].min() - 0.5, allp[:, 1].max() + 0.5]
+    if representation and "extent_b" in representation:
+        ext_b = representation["extent_b"]
     st.map_axes(ax, ext_b)
     disc = st.marker_size(ax, CELL_DISC_MM)
     ax.scatter(*cells.xy.T, s=disc, c="#d6d5ce", linewidths=0, rasterized=True)
@@ -283,7 +301,8 @@ def figure_c(cells: S.Points, out_dir: Path, polygons=None, xiv=None) -> list[Pa
                Line2D([], [], color=st.TEXT, lw=0.8, label="mean displacement (arrow)")]
     fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.70, 0.86), frameon=False, fontsize=5.5)
     score = xiv["scores"].get("score_total_mass")
-    fig.text(0.705, 0.585, "Registration QC, not accuracy: one MTG label\nfitted to the 50-bin depth strip; placement is\n"
+    fit_target = "50-particle" if representation else "50-bin"
+    fig.text(0.705, 0.585, f"Registration QC, not accuracy: one MTG label\nfitted to the {fit_target} depth strip; placement is\n"
              f"under-determined (relative varifold distance {score:.3f}).", fontsize=5.5, color=st.TEXT_2,
              va="top", linespacing=1.3)
 
@@ -295,7 +314,7 @@ def figure_c(cells: S.Points, out_dir: Path, polygons=None, xiv=None) -> list[Pa
     ax.spines[["top", "right"]].set_visible(False)
     st.panel_title(ax, "c", f"Mean shift ({shift[0]:.2f}, {shift[1]:.2f}) mm", f"residual median {np.median(residual_um):.1f} µm")
 
-    st.caption(fig, [
+    st.caption(fig, representation["caption"] if representation else [
         "Frame merfish_section_mm (x right, y down). a: polygons are stored in (-y, x) um; the frame is identified "
         "by label agreement, not assumed. b: initial placement = barycentre",
         "alignment of the plane (M = I); xIV deformation from atlas_deformationSummary (D + target centre). The "
