@@ -26,7 +26,11 @@ from nibabel.processing import resample_from_to
 import numpy as np
 import torch
 
-PROJECT = Path(__file__).resolve().parents[1]
+PROJECT = next(
+    parent
+    for parent in Path(__file__).resolve().parents
+    if (parent / "data").is_dir() and (parent / "results").is_dir()
+)
 EMLDDMM_HOME = PROJECT.parent / "emlddmm"
 sys.path.insert(0, str(EMLDDMM_HOME))
 import emlddmm
