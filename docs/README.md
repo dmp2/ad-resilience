@@ -34,6 +34,9 @@ Accordingly, the setup file uses three different space names: `ding_raw_native`,
   xIV-LDDMM registration.
 - `src/inspect_spaces.py`: NIfTI grid/affine report.
 - `legacy/`: untouched uploaded scripts.
+- Section-to-atlas mapping (2-D sections → 3-D atlas, SEA-AD QNP): method, workflow and
+  code map in [section_mapping.md](section_mapping.md), results in
+  [section_mapping_findings.md](section_mapping_findings.md).
 
 ## First setup on Dalet
 

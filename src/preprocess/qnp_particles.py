@@ -38,7 +38,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -147,15 +147,41 @@ def _otsu(values: np.ndarray, bins: int = 256) -> float:
     return float(threshold_otsu(values, nbins=bins))
 
 
+def remove_border_bands(mask: np.ndarray, px_mm: float, max_mm: float = 1.5,
+                        coverage: float = 0.95) -> tuple[np.ndarray, dict[str, int]]:
+    """Clear full-width border lines (scanner bands); returns the mask and lines cleared per edge."""
+
+    out = mask.copy()
+    limit = int(round(max_mm / px_mm))
+    removed = {}
+    views = {"top": lambda m: m, "bottom": lambda m: m[::-1], "left": lambda m: m.T, "right": lambda m: m.T[::-1]}
+    for edge, view in views.items():
+        lines = view(out)
+        n = 0
+        while n < min(limit, len(lines)) and lines[n].mean() >= coverage:
+            n += 1
+        lines[:n] = False  # views share memory with ``out``
+        removed[edge] = n
+    return out, removed
+
+
 def tissue_mask(od: np.ndarray, pixel_area_mm2: float, smooth_px: float = 3.0,
                 min_object_mm2: float = 1.0, max_hole_mm2: float = 0.05,
-                opening_radius_mm: float = 0.075) -> tuple[np.ndarray, dict]:
+                opening_radius_mm: float = 0.075, border_band_max_mm: float = 1.5,
+                border_band_coverage: float = 0.95) -> tuple[np.ndarray, dict]:
     """Tissue = smoothed total OD above a log-domain Otsu threshold, minus specks, small holes filled.
 
     The threshold is Otsu on log(OD + 0.01): in linear OD, slides with a dark rim and a
     pale interior (GFAP) split rim from interior instead of tissue from glass.  Large
     holes (tears, sulcal gaps) are kept as background: they are real absence of tissue
     on the glass.  Thin slide-edge lines are removed by the size filter.
+
+    Scanner border bands (a dark vignette ramping to black along one image edge, seen on
+    H20.33.043 NeuN/ASYN) span the whole image width, glass included, so they join the
+    tissue and survive the opening.  Contiguous edge rows/columns, up to
+    ``border_band_max_mm`` deep, in which the thresholded mask covers at least
+    ``border_band_coverage`` of the line are removed: real tissue never fills an entire
+    image line, glass margins and all.
     """
 
     from skimage.morphology import disk, remove_small_holes, remove_small_objects
@@ -163,6 +189,7 @@ def tissue_mask(od: np.ndarray, pixel_area_mm2: float, smooth_px: float = 3.0,
     total = ndi.gaussian_filter(od.sum(axis=-1), smooth_px)
     threshold = float(np.exp(_otsu(np.log(total + 0.01))) - 0.01)
     mask = total > threshold
+    mask, bands = remove_border_bands(mask, np.sqrt(pixel_area_mm2), border_band_max_mm, border_band_coverage)
     # Opening removes structures thinner than ~2 * opening_radius (coverslip/slide-edge
     # lines); the size filter then removes specks.
     radius = max(1, int(round(opening_radius_mm / np.sqrt(pixel_area_mm2))))
@@ -172,7 +199,8 @@ def tissue_mask(od: np.ndarray, pixel_area_mm2: float, smooth_px: float = 3.0,
     labels, number = ndi.label(mask)
     sizes = np.bincount(labels.ravel())[1:] * pixel_area_mm2
     return mask, {"threshold_total_od": threshold, "threshold_rule": "exp(otsu(log(od + 0.01))) - 0.01",
-                  "opening_radius_mm": opening_radius_mm, "smooth_px": smooth_px, "tissue_area_mm2": float(mask.sum() * pixel_area_mm2),
+                  "opening_radius_mm": opening_radius_mm, "smooth_px": smooth_px,
+                  "border_bands_removed_px": bands, "tissue_area_mm2": float(mask.sum() * pixel_area_mm2),
                   "components": int(number), "component_areas_mm2": sorted(np.round(sizes, 2).tolist(), reverse=True)[:5]}
 
 
@@ -363,3 +391,115 @@ def optical_density_particles(slide: Slide, mask: np.ndarray, od: np.ndarray, bi
     X, nu_intensity, nu_bin, diagnostics, bin_arrays = _particles_2d(
         slide.px_mm, mask, transform.forward(total), bin_mm, bins)
     return X, nu_intensity, nu_bin, transform, diagnostics, bin_arrays
+
+
+# --------------------------------------------------------------------------------------
+# Positive-only HALO annotations as particle masses (xIV anatomical term)
+# --------------------------------------------------------------------------------------
+# The NeuN slide's HALO layer polygons mark MTG cortex (layers 1 to 5-6).  For the xIV
+# anatomical term they are *positive-only* evidence: annotated tissue is MTG gray matter,
+# unannotated tissue is unknown (mass 0), never "not MTG".  All layers are one feature.
+
+ANNOTATION_FEATURE = "HALO_MTG_cortex_all_layers"
+NO_ANNOTATION = "no_annotation"
+
+
+def annotated_tissue_masses(maps_file: str | Path, target_X: np.ndarray, target_nu: np.ndarray,
+                            downsample_factor: int) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Annotated tissue area (mm^2, QNP local frame) for each consensus particle.
+
+    ``target_X`` / ``target_nu`` are the consensus particles in the local frame (as
+    written by ``align_qnp_multistain.py``) and ``downsample_factor`` is their block size
+    in 32 um map pixels (``metadata["particles"]["downsample_factor"]``).
+
+    Returns ``(masses, record)``: ``masses`` is (N, 1) float64 with
+    0 <= masses <= tissue area per particle, or ``None`` when the maps carry no annotation
+    (``record["status"] == NO_ANNOTATION``).
+    """
+
+    with np.load(maps_file, allow_pickle=False) as maps:
+        if "reference_ribbon" not in maps.files or not maps["reference_ribbon"].any():
+            return None, {"status": NO_ANNOTATION, "maps": str(maps_file),
+                          "rule": "the reference stain has no HALO layer annotation on the consensus grid"}
+        mask = maps["consensus_mask"].astype(bool)
+        ribbon = maps["reference_ribbon"].astype(bool)
+        px = tuple(float(v) for v in maps["px_mm"])
+        origin = np.asarray(maps["origin_mm"], dtype=np.float64)
+
+    bin_mm = int(downsample_factor) * float(np.mean(px))
+    X, nu, _ = tissue_class_particles(px, mask, ribbon.astype(np.float64), bin_mm)
+    X = X + np.array([origin[0], origin[1], 0.0], dtype=np.float32)
+    if X.shape != target_X.shape or not np.array_equal(X, np.asarray(target_X, dtype=np.float32)):
+        raise ValueError("annotation particles do not reproduce the target positions; were the consensus particles "
+                         f"built from {maps_file} with downsample factor {downsample_factor}?")
+    tissue = np.asarray(target_nu, dtype=np.float64).sum(axis=1)
+    rebuilt = nu.astype(np.float64).sum(axis=1)
+    if not np.allclose(rebuilt, tissue, rtol=1e-5, atol=1e-9):
+        raise ValueError("annotation particles do not reproduce the target tissue masses (max |diff| "
+                         f"{float(np.max(np.abs(rebuilt - tissue))):.3g} mm^2)")
+    annotated = np.minimum(nu[:, 1].astype(np.float64), tissue)[:, None]  # float32 binning noise only
+    pixel_area = px[0] * px[1]
+    record = {
+        "status": "annotated",
+        "feature": ANNOTATION_FEATURE,
+        "rule": "annotated tissue = consensus_mask & reference_ribbon (union of the reference stain's HALO layers); "
+                "unannotated tissue is unknown (mass 0 here), not negative evidence",
+        "maps": str(maps_file),
+        "layers": "all (union of HALO layers L1..L5-6)",
+        "ribbon_area_mm2": float(ribbon.sum() * pixel_area),
+        "ribbon_on_consensus_tissue_fraction": float((ribbon & mask).sum() / ribbon.sum()),
+        "annotated_tissue_area_mm2": float(annotated.sum()),
+        "tissue_area_mm2": float(tissue.sum()),
+        "annotated_tissue_fraction": float(annotated.sum() / tissue.sum()),
+        "particles_with_annotation": int((annotated[:, 0] > 0).sum()),
+        "particles": int(len(annotated)),
+        "mass_units": "mm^2 (QNP local frame)",
+    }
+    return annotated, record
+
+
+def section_annotation_masses(maps: Mapping[str, np.ndarray], X_slide: np.ndarray, nu: np.ndarray,
+                              ) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Annotated tissue area (mm^2) per particle of one slide, from the slide's own HALO layers.
+
+    ``maps`` is the slide's ``*_maps_32um.npz`` (``mask``, ``layers``, ``px_mm``; slide frame, rows =
+    y); ``X_slide`` / ``nu`` its 500 um particles in the slide frame.  The particles were binned at
+    full resolution, which the 32 um maps cannot reproduce exactly, so each 32 um tissue pixel is
+    given to its nearest particle and a particle's annotated mass is
+
+        (annotated tissue pixels / tissue pixels assigned to it) x the particle's exact tissue mass,
+
+    which lies in [0, tissue mass] by construction.  Returns ``(None, record)`` without layers.
+    """
+
+    from scipy.spatial import cKDTree
+
+    if "layers" not in maps:
+        return None, {"status": "no_annotation", "rule": "the slide has no HALO layer raster fitting its tissue"}
+    mask = np.asarray(maps["mask"], bool)
+    ribbon = np.asarray(maps["layers"]) > 0
+    px = np.asarray(maps["px_mm"], float)  # (row, col) = (y, x) pixel size
+    rows, cols = np.nonzero(mask)
+    centres = np.column_stack([(cols + 0.5) * px[1], (rows + 0.5) * px[0]])
+    tree = cKDTree(np.asarray(X_slide, float)[:, :2])
+    distance, owner = tree.query(centres)
+    n = len(X_slide)
+    tissue_px = np.bincount(owner, minlength=n).astype(float)
+    annotated_px = np.bincount(owner, weights=ribbon[rows, cols].astype(float), minlength=n)
+    fraction = np.divide(annotated_px, tissue_px, out=np.zeros(n), where=tissue_px > 0)
+    tissue = np.asarray(nu, float).sum(1)
+    annotated = (fraction * tissue)[:, None]
+    pixel_area = float(px[0] * px[1])
+    record = {
+        "status": "annotated", "feature": ANNOTATION_FEATURE,
+        "rule": "the slide's own HALO layers (union L1..L5-6) on its own tissue; per particle: annotated share of "
+                "the 32 um tissue pixels nearest to it x its exact tissue mass; unannotated tissue is unknown (0)",
+        "ribbon_on_tissue_area_mm2_32um": float((ribbon & mask).sum() * pixel_area),
+        "annotated_tissue_area_mm2": float(annotated.sum()),
+        "tissue_area_mm2": float(tissue.sum()),
+        "annotated_tissue_fraction": float(annotated.sum() / tissue.sum()),
+        "particles_with_annotation": int((annotated[:, 0] > 0).sum()), "particles": int(n),
+        "pixel_to_particle_distance_mm_p99": float(np.percentile(distance, 99)),
+        "mass_units": "mm^2 (QNP slide area; rigid slide -> local transform keeps it)",
+    }
+    return annotated, record

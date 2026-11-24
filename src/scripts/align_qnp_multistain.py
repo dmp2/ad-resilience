@@ -6,7 +6,7 @@ Inputs: the particles and 32 um maps from ``prepare_qnp_section_particles.py``.
 The reference stain's slide frame (``qnp_section_inputs.<job>.reference_stain``, NeuN)
 is the donor-local frame ``qnp_local_mm``.  Every other slide is aligned to it with a
 2-D rigid transform plus an optional reflection (sections can be mounted face down),
-using gray/white tissue-class particles and ``section_alignment.search``: a 1 mm
+using gray/white tissue-class particles and ``section_mapping.alignment.search``: a 1 mm
 search, then refinement on 0.5 mm particles.  Scale is held at 1 (same block, same
 scanner); the best free scale is reported as a diagnostic only.
 
@@ -46,10 +46,11 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from config_setup.project_config import load_config, resolve_path
+from config_setup.qnp_jobs import resolve_qnp_job
 from preprocess.dense_image_utils import save_dense_particle_archive
 from preprocess.particle_utils import FeatureDefinition, load_particle_archive, save_particle_archive
 from preprocess.qnp_particles import tissue_class_particles
-from preprocess.section_alignment import FootprintScorer, Similarity2D, refine, search
+from section_mapping.alignment import FootprintScorer, Similarity2D, refine, search
 from preprocess.xmodmap_compat import entropy_numpy, load_xmodmap, write_vtk_xyz
 
 TISSUE_FEATURES = FeatureDefinition(fine_ids=(0, 1), fine_names=("gray_matter", "white_matter"),
@@ -177,7 +178,7 @@ def fit_registration_stages(scorer_coarse, scorer_fine, P, mu, Pf, muf, settings
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    job = dict(config["qnp_section_inputs"][args.job], _name=args.job)
+    job = resolve_qnp_job(config, args.job)
     settings = dict(job.get("alignment", {}))
     particle_dir = resolve_path(config, job["particle_dir"])
     out_dir = resolve_path(config, settings.get("output_dir", job["particle_dir"] + "/aligned"))
@@ -199,21 +200,42 @@ def main() -> None:
         return registration_particles(particle_dir, stems[stain], tag)
 
     ref_coarse, ref_fine = particles(reference, coarse_tag), particles(reference, fine_tag)
-    scorer_coarse = FootprintScorer(ref_coarse[0], ref_coarse[1], sigmas)
-    scorer_fine = FootprintScorer(ref_fine[0], ref_fine[1], sigmas)
+    # Features per moving stain (``stains.<S>.align_features``): "gmwm" (default) or "tissue"
+    # (gray + white collapsed to one channel: the outline only, for stains whose gray/white
+    # map is unreliable, e.g. glial stains).  The reference is collapsed the same way.
+    scorers: dict[str, tuple[FootprintScorer, FootprintScorer]] = {}
+
+    def scorer_pair(mode):
+        if mode not in scorers:
+            collapse = (lambda nu: nu.sum(1, keepdims=True)) if mode == "tissue" else (lambda nu: nu)
+            scorers[mode] = (FootprintScorer(ref_coarse[0], collapse(ref_coarse[1]), sigmas),
+                             FootprintScorer(ref_fine[0], collapse(ref_fine[1]), sigmas))
+        return scorers[mode]
 
     transforms: dict[str, Any] = {}
     fitted: dict[str, Similarity2D | None] = {reference: None}
+    opposite: dict[str, tuple[float, Similarity2D] | None] = {}
     for stain in job["stains"]:
         if stain == reference:
             continue
+        mode = job["stains"][stain].get("align_features", "gmwm")
+        if mode not in ("gmwm", "tissue"):
+            raise ValueError(f"{stain}: align_features must be 'gmwm' or 'tissue', not {mode!r}")
         P, mu, _ = particles(stain, coarse_tag)
         Pf, muf, _ = particles(stain, fine_tag)
+        if mode == "tissue":
+            mu, muf = mu.sum(1, keepdims=True), muf.sum(1, keepdims=True)
+        scorer_coarse, scorer_fine = scorer_pair(mode)
         ranked, best_score, best, runner, free_score, free = fit_registration_stages(
             scorer_coarse, scorer_fine, P, mu, Pf, muf, settings)
         fitted[stain] = best
+        # Reflection check: the best start with the other handedness, refined the same way.
+        other = search(scorer_coarse, P, mu, thetas=np.arange(0, 360, float(settings.get("theta_step_deg", 10))),
+                       scales=[1.0], flips=[not best.flip], scale_bounds=(1.0, 1.0), h=0.5, blur_mm=1.0,
+                       refine_top=int(settings.get("refine_top", 4)))
+        opposite[stain] = refine(scorer_fine, Pf, muf, other[0][1], (1.0, 1.0), max_evals=200)
         transforms[stain] = {
-            "slide": stems[stain], "structural": stain in structural,
+            "slide": stems[stain], "structural": stain in structural, "align_features": mode,
             "transform": best.as_dict(),
             "slide_mm_to_local_mm": homogeneous(best, "to_local"),
             "local_mm_to_slide_mm": homogeneous(best, "to_slide"),
@@ -226,7 +248,7 @@ def main() -> None:
             "reflection": "slide mirrored relative to the reference (mounted face down, or the reverse)"
                           if best.flip else "same handedness as the reference",
         }
-        print(f"{stain}: theta {best.theta_deg:.1f} flip {best.flip} score {best_score:.3f} "
+        print(f"{stain} [{mode}]: theta {best.theta_deg:.1f} flip {best.flip} score {best_score:.3f} "
               f"(runner-up gap {transforms[stain]['runner_up_gap_coarse']}) free scale {free.scale:.3f}", flush=True)
 
     # ---- common grid in the local frame (reference map pixels, 32 um) ----------------
@@ -258,8 +280,31 @@ def main() -> None:
             # The same check without our transform: slide pixels read as if already aligned.
             identity = resample_map(maps[stain], None, grid_xy, "layers", 0).reshape(rows, cols) > 0
             checks["halo_ribbon_dice_untransformed"] = dice(identity, sampled[reference]["ribbon"])
+        if opposite.get(stain) is not None:
+            o_score, o_t = opposite[stain]
+            o_mask = resample_map(maps[stain], o_t, grid_xy, "mask", 0).reshape(rows, cols) > 0.5
+            o_wm = o_mask & (resample_map(maps[stain], o_t, grid_xy, "p_wm", 1).reshape(rows, cols) > 0.5)
+            reflection = {"chosen_flip": fitted[stain].flip, "opposite_flip_score_fine": o_score,
+                          "score_gap_opposite_minus_chosen": o_score - entry["score_fine"],
+                          "opposite_transform": o_t.as_dict(),
+                          "opposite_tissue_dice": dice(o_mask, sampled[reference]["mask"]),
+                          "opposite_white_matter_dice": dice(o_wm, ref_wm)}
+            if "halo_ribbon_dice_vs_reference" in checks:
+                o_rib = resample_map(maps[stain], o_t, grid_xy, "layers", 0).reshape(rows, cols) > 0
+                reflection["opposite_halo_ribbon_dice"] = dice(o_rib, sampled[reference]["ribbon"])
+            # Confirmed when the independent signals agree with the score: the chosen
+            # handedness wins on white-matter Dice and, where available, ribbon Dice.
+            reflection["confirmed"] = bool(
+                checks["white_matter_dice_vs_reference"] > reflection["opposite_white_matter_dice"]
+                and checks.get("halo_ribbon_dice_vs_reference", 1.0) > reflection.get("opposite_halo_ribbon_dice", 0.0))
+            entry["reflection_check"] = reflection
         entry["independent_checks"] = checks
         print(f"{stain}: {json.dumps({k: round(v, 3) for k, v in checks.items()})}", flush=True)
+        if "reflection_check" in entry:
+            r = entry["reflection_check"]
+            print(f"  reflection: chosen flip {r['chosen_flip']}, opposite score +{r['score_gap_opposite_minus_chosen']:.3f}, "
+                  f"opposite WM Dice {r['opposite_white_matter_dice']:.2f}, opposite ribbon Dice "
+                  f"{r.get('opposite_halo_ribbon_dice', float('nan')):.2f} -> confirmed {r['confirmed']}", flush=True)
 
     # ---- consensus and per-stain particles in the local frame -------------------------
     api = load_xmodmap(config)

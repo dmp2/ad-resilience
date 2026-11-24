@@ -76,7 +76,7 @@ def merfish_checks(cells: S.Points, merfish: Mapping) -> list[dict]:
 
 
 def qnp_checks(config: Mapping, job_name: str) -> list[dict]:
-    from section_alignment import Similarity2D
+    from section_mapping.alignment import Similarity2D
 
     from .figures_qnp import ribbon_dice_checks
 

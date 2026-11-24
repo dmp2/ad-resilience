@@ -10,7 +10,7 @@ sys.path[:0] = [str(SRC), str(SRC / 'preprocess'), str(SRC / 'config_setup')]
 
 from scripts import align_qnp_multistain as align
 from scripts.compare_qnp_iv_structural import particle_source
-from preprocess.section_alignment import Similarity2D
+from section_mapping.alignment import Similarity2D
 
 
 def test_only_coarse_particles_use_variant_archives(tmp_path):

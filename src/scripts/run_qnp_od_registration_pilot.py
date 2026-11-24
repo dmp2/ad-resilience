@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from config_setup.project_config import load_config, resolve_path
-from preprocess.section_alignment import FootprintScorer, Similarity2D
+from section_mapping.alignment import FootprintScorer, Similarity2D
 from scripts.align_qnp_multistain import (
     MAP_CENTER, dice, fit_registration_stages, homogeneous,
     registration_particles, resample_map,

@@ -14,7 +14,7 @@ from scipy import ndimage as ndi
 from matplotlib.lines import Line2D
 
 from preprocess.qnp_particles import read_slide
-from preprocess.section_alignment import Similarity2D
+from section_mapping.alignment import Similarity2D
 from scripts.align_qnp_multistain import dice, resample_map
 from visualization import scene as S, style as st, ng_export as nx
 from visualization.figures_qnp import ribbon_mask

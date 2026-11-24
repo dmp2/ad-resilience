@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from config_setup.project_config import load_config, resolve_path
+from config_setup.qnp_jobs import resolve_qnp_job
 from preprocess.particle_utils import FeatureDefinition, save_particle_archive
 from preprocess.qnp_particles import (
     LAYER_ORDER,
@@ -81,6 +82,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", required=True, choices=["inventory", "particles"])
     parser.add_argument("--stain", action="append", help="Restrict --stage particles to these stains.")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--no-binned-figures", action="store_true",
+                        help="Skip particles_<tag>.png (binned-particle QC); the image-varifold "
+                             "compression figures replace them.")
     return parser.parse_args()
 
 
@@ -281,10 +285,7 @@ def particle_qc_figure(out_dir: Path, slides: dict[str, Path], bin_tag: str, pat
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    jobs = config.get("qnp_section_inputs", {})
-    if args.job not in jobs:
-        raise KeyError(f"Unknown job '{args.job}'. Available: {', '.join(sorted(jobs)) or '<none>'}")
-    job = dict(jobs[args.job], _name=args.job)
+    job = resolve_qnp_job(config, args.job)
     qc_dir = resolve_path(config, job["qc_dir"])
     out_dir = resolve_path(config, job["particle_dir"])
     qc_dir.mkdir(parents=True, exist_ok=True)
@@ -312,7 +313,7 @@ def main() -> None:
         print(json.dumps({k: summaries[stain][k] for k in ("stain", "particles")}), flush=True)
     summary_file.write_text(json.dumps(summaries, indent=2) + "\n", encoding="utf-8")
     finished = {s: p for s, p in slides.items() if (out_dir / f"{p.stem}_maps_32um.npz").exists()}
-    for bin_mm in job["bins_mm"]:
+    for bin_mm in ([] if args.no_binned_figures else job["bins_mm"]):
         tag = f"{int(round(bin_mm * 1000))}um"
         particle_qc_figure(out_dir, finished, tag, qc_dir / f"particles_{tag}.png")
     print(f"Wrote particles to {out_dir} and QC to {qc_dir}")

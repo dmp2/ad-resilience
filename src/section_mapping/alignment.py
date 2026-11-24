@@ -1,28 +1,41 @@
-"""2-D similarity search between section measures, and atlas reslicing at oblique planes.
+"""Geometric alignment (CPU reference): 2-D similarity, support-censored varifold score, search, poses.
 
-Model
+Roles
 =====
-A section measure ``mu_Q`` (QNP particles, fixed) is compared with a moving measure
-``mu_P`` (another stain, or an atlas plane) under a 2-D similarity
+The *target* (fixed) is the data section measure ``mu_T = (X, nu)``; it defines the support.
+The *template* (moving) is an atlas plane (or another section) ``mu_S = (P, mu)``.  Never swap
+them: the support censoring exists to protect incomplete data.
 
+Transform
+=========
     p = A (x - tau),    A = s R(theta) F,    F = diag(1, -1) if flip else I,
 
-which maps section coordinates x (mm) to moving-frame coordinates p (mm).  ``s`` is
-moving-frame mm per section mm: for atlas planes it absorbs paraffin shrinkage,
-template size and atrophy together, so it is a nuisance parameter, not a measurement.
+maps section coordinates x (mm) to moving-frame coordinates p (mm).  ``s`` is moving mm per
+section mm: for atlas planes it absorbs shrinkage, template size and atrophy together, so it is
+a nuisance parameter, not a measurement.  Moving particles are pulled into the section frame
+(``moving_to_section``) with masses divided by s^2, so area is conserved.
 
-The score is ``particle_utils.varifold_score_mm`` with the section as the reference
-measure, after the moving particles are pulled into the section frame (masses divided
-by s^2, so area is conserved) and multiplied by a *footprint weight*: the section's own
-kernel density divided by a quarter of its median over the section particles and
-clipped to 1 (so every section particle has weight 1).
-Moving tissue far from the section therefore does not count, as in the density support
-of ``LossVarifoldNormBoundary_Partial``; moving tissue missing where the section has
-tissue does count.  0 is a perfect match; 1 is "no overlapping tissue".
+Score (0 = identical, 1 = no overlapping tissue)
+=================================================
+    w(y)  = min(1, D_T(y) / (c * median_i D_T(x_i))),   D_T(y) = sum_i |nu_i| exp(-|y - x_i|^2 / 2 sigma_f^2)
+    score = mean_sigma |w mu_S - mu_T|^2_sigma / |mu_T|^2_sigma
 
-Search = FFT cross-correlation of Gaussian-blurred rasters over translation for a grid
-of (theta, s, flip), then Nelder-Mead refinement of the best candidates with the exact
-particle score.  Everything here is deterministic numpy/scipy.
+with sigma_f = 0.5 mm, c = 0.25, moving particles with w <= 1e-3 dropped, and SDs 2, 1, 0.5 mm
+(drop SDs < h/2 for particles at spacing h: ``level_sigmas``).  Moving tissue far from the
+section does not count (absent tissue is censored), moving tissue missing where the section has
+tissue does.  It censors *absent* tissue, not *present-but-wrong* tissue.
+
+Search
+======
+FFT cross-correlation of Gaussian-blurred rasters over translation for a grid of (theta, s, flip)
+gives approximate ranking values; the best distinct candidates are refined with the exact score
+(Nelder-Mead here, batched Adam in ``alignment_gpu``).
+
+Poses after a deformable fit
+============================
+``similarity_lsq`` reads the similarity off shot atlas particles; ``compose`` folds it into the
+start pose.  ``CommonScore`` ranks fitted poses of one section on one fixed target in the section
+frame (the native xIV loss is normalised per run and cannot rank across runs).
 """
 
 from __future__ import annotations
@@ -34,6 +47,11 @@ import numpy as np
 from scipy import ndimage as ndi
 from scipy.optimize import minimize
 from scipy.signal import correlate
+
+from section_mapping.measures import gauss_inners
+
+FOOTPRINT_CUTOFF = 1e-3   # moving particles with support weight <= this are dropped
+TRUNCATE_SIGMAS = 5.0     # truncation of the footprint density kernel
 
 
 # --------------------------------------------------------------------------------------
@@ -67,14 +85,28 @@ class Similarity2D:
                 "convention": "moving = A @ (section - tau); section = A^-1 @ moving + tau; "
                               "moving masses are divided by scale^2 in the section frame"}
 
+    def as_row(self) -> dict[str, Any]:
+        """Flat table columns (theta wrapped to [0, 360))."""
+
+        return {"theta_deg": float(self.theta_deg % 360), "scale": float(self.scale), "flip": bool(self.flip),
+                "tau_x": float(self.tau[0]), "tau_y": float(self.tau[1])}
+
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "Similarity2D":
         return cls(float(values["theta_deg"]), float(values["scale"]), bool(values["flip"]),
                    tuple(float(v) for v in values["tau"]))
 
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any], prefix: str = "") -> "Similarity2D":
+        """From flat columns (CSV strings or JSON values); ``prefix`` e.g. 'fit_'."""
+
+        return cls(float(row[prefix + "theta_deg"]), float(row[prefix + "scale"]),
+                   str(row[prefix + "flip"]) in ("True", "true", "1"),
+                   (float(row[prefix + "tau_x"]), float(row[prefix + "tau_y"])))
+
 
 # --------------------------------------------------------------------------------------
-# Footprint-restricted score
+# Support-censored score
 # --------------------------------------------------------------------------------------
 
 def _gauss_sum(X: np.ndarray, Y: np.ndarray, weights: np.ndarray, sigma: float, tree=None) -> np.ndarray:
@@ -84,9 +116,16 @@ def _gauss_sum(X: np.ndarray, Y: np.ndarray, weights: np.ndarray, sigma: float, 
 
     tree_y = tree if tree is not None else cKDTree(Y)
     # "ndarray" output keeps zero distances (coincident points), unlike the sparse formats.
-    pairs = cKDTree(X).sparse_distance_matrix(tree_y, 5.0 * sigma, output_type="ndarray")
+    pairs = cKDTree(X).sparse_distance_matrix(tree_y, TRUNCATE_SIGMAS * sigma, output_type="ndarray")
     values = np.exp(-pairs["v"] ** 2 / (2 * sigma * sigma)) * weights[pairs["j"]]
     return np.bincount(pairs["i"], values, minlength=len(X))
+
+
+def level_sigmas(sigmas: Sequence[float], h_mm: float | None) -> list[float]:
+    """Score SDs for particles at spacing h: drop SDs < h/2."""
+
+    kept = [float(s) for s in sigmas if h_mm is None or float(s) >= float(h_mm) / 2]
+    return kept or [max(float(s) for s in sigmas)]
 
 
 class FootprintScorer:
@@ -123,7 +162,7 @@ class FootprintScorer:
 
         return np.minimum(self._density(Y) / self.density_ref, 1.0)
 
-    def restricted(self, Y: np.ndarray, mu: np.ndarray, cutoff: float = 1e-3):
+    def restricted(self, Y: np.ndarray, mu: np.ndarray, cutoff: float = FOOTPRINT_CUTOFF):
         weight = self.footprint(Y)
         keep = weight > cutoff
         return Y[keep], mu[keep] * weight[keep, None], weight
@@ -199,13 +238,15 @@ def fft_candidates(scorer: FootprintScorer, P: np.ndarray, mu_P: np.ndarray, the
     return out
 
 
-def _distinct(candidates, k: int, min_shift_mm: float, min_angle_deg: float):
+def distinct_poses(candidates, k: int, min_shift_mm: float = 3.0, min_angle_deg: float = 20.0):
+    """The first k (score, Similarity2D) that differ in flip, translation or rotation."""
+
     chosen: list[tuple[float, Similarity2D]] = []
     for value, t in candidates:
         if all(t.flip != c.flip or np.hypot(*np.subtract(t.tau, c.tau)) > min_shift_mm
                or abs((t.theta_deg - c.theta_deg + 180) % 360 - 180) > min_angle_deg for _, c in chosen):
             chosen.append((value, t))
-        if len(chosen) == k:
+        if len(chosen) == int(k):
             break
     return chosen
 
@@ -240,82 +281,132 @@ def search(scorer: FootprintScorer, P: np.ndarray, mu_P: np.ndarray, *, thetas, 
 
     candidates = fft_candidates(scorer, P, mu_P, thetas, scales, flips, h=h, blur_mm=blur_mm)
     refined = [refine(scorer, P, mu_P, t, scale_bounds, max_evals) for _, t in
-               _distinct(candidates, refine_top, min_shift_mm=3.0, min_angle_deg=20.0)]
+               distinct_poses(candidates, refine_top, min_shift_mm=3.0, min_angle_deg=20.0)]
     return sorted(refined, key=lambda item: item[0])
 
 
 # --------------------------------------------------------------------------------------
-# Atlas planes
+# Pose algebra (after a deformable fit)
 # --------------------------------------------------------------------------------------
 
-def plane_basis(pitch_deg: float, yaw_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Orthonormal (u, v, n) of a coronal plane tilted by pitch (about x) then yaw (about z).
+def similarity_lsq(P0: np.ndarray, P1: np.ndarray, w: np.ndarray | None = None) -> dict[str, Any]:
+    """Weighted least-squares P1 ~ c R P0 + b (rotation only: the flow cannot reflect)."""
 
-    pitch = yaw = 0 gives u = +x, v = +z, n = u x v = -y, the convention of the
-    MERFISH pilot's coronal plane.
+    w = np.ones(len(P0)) if w is None else np.asarray(w, float).ravel()
+    w = w / w.sum()
+    m0, m1 = w @ P0, w @ P1
+    A0, A1 = P0 - m0, P1 - m1
+    H = (A0 * w[:, None]).T @ A1
+    U, S, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    D = np.diag([1.0, d])
+    R = Vt.T @ D @ U.T
+    var0 = float((w * (A0 ** 2).sum(1)).sum())
+    c = float((S * np.diag(D)).sum() / var0)
+    b = m1 - c * R @ m0
+    residual = np.sqrt(((P1 - (c * P0 @ R.T + b)) ** 2).sum(1))
+    return {"scale": c, "rotation_deg": float(np.degrees(np.arctan2(R[1, 0], R[0, 0]))), "R": R, "b": b,
+            "residual_mm": {"p50": float(np.percentile(residual, 50)), "max": float(residual.max())}}
+
+
+def compose(t_init: Similarity2D, fit: Mapping[str, Any]) -> Similarity2D:
+    """The fitted pose as one ``Similarity2D`` (section -> atlas plane).
+
+    The start places the section at p = A0 (q - tau0); the fit moves the atlas x -> c R x + b onto
+    it.  So q = A0^-1 (c R x + b) + tau0, i.e. x = A (q - tau) with A = (c R)^-1 A0 and
+    tau = tau0 + A0^-1 b.
     """
 
-    p, y = np.deg2rad(pitch_deg), np.deg2rad(yaw_deg)
-    Rx = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
-    Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
-    R = Rz @ Rx
-    u, v = R @ np.array([1.0, 0, 0]), R @ np.array([0, 0, 1.0])
-    return u, v, np.cross(u, v)
+    A0 = t_init.matrix
+    tau = np.asarray(t_init.tau, float) + np.linalg.solve(A0, fit["b"])
+    return Similarity2D((t_init.theta_deg - fit["rotation_deg"]) % 360.0, t_init.scale / fit["scale"], t_init.flip,
+                        (float(tau[0]), float(tau[1])))
 
 
-def reslice_labels(labels: np.ndarray, affine: np.ndarray, origin: Sequence[float], u: np.ndarray,
-                   v: np.ndarray, half_width_mm: float, spacing_mm: float) -> tuple[np.ndarray, np.ndarray]:
-    """Nearest-neighbour label grid on ``origin + a u + b v``; returns (grid[b, a], axis)."""
+def pose_distance(a: Similarity2D, b: Similarity2D, X: np.ndarray) -> float:
+    """Median displacement (mm, section frame) between two poses applied to section points X."""
 
-    axis = np.arange(-half_width_mm, half_width_mm + 1e-9, spacing_mm)
-    aa, bb = np.meshgrid(axis, axis, indexing="xy")
-    world = np.asarray(origin, float) + aa[..., None] * u + bb[..., None] * v
-    ijk = (world.reshape(-1, 3) - affine[:3, 3]) @ np.linalg.inv(affine[:3, :3]).T
-    grid = ndi.map_coordinates(labels, ijk.T, order=0, mode="constant", cval=0)
-    return grid.reshape(aa.shape), axis
+    return float(np.median(np.linalg.norm(a.section_to_moving(X) - b.section_to_moving(X), axis=1)))
 
 
-def label_class_masses(grid: np.ndarray, axis: np.ndarray, spacing_mm: float, classes: Mapping[str, np.ndarray],
-                       aggregate: int = 1) -> tuple[np.ndarray, np.ndarray]:
-    """Particles (a, b, 0) with per-class area masses (mm^2), summed over aggregate^2 pixels.
+def section_frame_atlas(pose: Similarity2D, P_plane: np.ndarray, masses: Sequence[np.ndarray]
+                        ) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Atlas plane particles carried to the section frame by ``pose``, areas pushed forward (/ s^2)."""
 
-    ``classes`` maps a feature name to a boolean lookup table over label values.
+    return pose.moving_to_section(P_plane), [np.asarray(m, float) / pose.scale ** 2 for m in masses]
+
+
+# --------------------------------------------------------------------------------------
+# Common post-fit score (fixed section frame)
+# --------------------------------------------------------------------------------------
+
+@dataclass
+class EvaluationSettings:
+    sigmas_mm: tuple[float, ...] = (8.0, 4.0, 2.0, 1.0)
+    footprint_sigma_mm: float = 0.5
+    lambda_struct: float = 1.0
+    lambda_anat: float = 1.0
+
+    @classmethod
+    def from_config(cls, block: Mapping[str, Any]) -> "EvaluationSettings":
+        if str(block.get("sigma_weights", "inverse")) != "inverse":
+            raise ValueError("evaluation.sigma_weights: only 'inverse' (1/sigma) is implemented")
+        return cls(tuple(float(s) for s in block.get("sigmas_mm", (8.0, 4.0, 2.0, 1.0))),
+                   float(block.get("footprint_sigma_mm", 0.5)), float(block.get("lambda_struct", 1.0)),
+                   float(block.get("lambda_anat", 1.0)))
+
+    @property
+    def weights(self) -> np.ndarray:
+        w = 1.0 / np.asarray(self.sigmas_mm)
+        return w / w.sum()
+
+
+class CommonScore:
+    """Post-fit score of atlas poses against one section, in the section's fixed frame::
+
+        R_term = sum_s w_s |mu_A - mu_T|^2_s / |mu_T|^2_s,   w_s proportional to 1 / sigma_s
+        R_struct: gray/white, atlas weighted by the section's fixed footprint (0.5 mm)
+        R_anat:   atlas anatomical channel vs the section's annotation, uncensored
+        R_combined = lambda_struct R_struct + lambda_anat R_anat
+
+    ``section`` needs ``X``, ``nu`` (gray/white), ``annotation`` ((N, 1) or None) and ``annotated``.
     """
 
-    n = (len(axis) // aggregate) * aggregate
-    grid = grid[:n, :n]
-    masses = []
-    for table in classes.values():
-        member = table[np.clip(grid, 0, len(table) - 1)] & (grid < len(table))
-        masses.append(member.reshape(n // aggregate, aggregate, n // aggregate, aggregate).sum((1, 3)))
-    nu = np.stack(masses, -1).reshape(-1, len(classes)).astype(np.float64) * spacing_mm ** 2
-    centers = axis[:n].reshape(-1, aggregate).mean(1)
-    aa, bb = np.meshgrid(centers, centers, indexing="xy")
-    X = np.column_stack([aa.ravel(), bb.ravel(), np.zeros(aa.size)])
-    keep = nu.sum(1) > 0
-    return X[keep], nu[keep]
+    def __init__(self, section, settings: EvaluationSettings):
+        self.section, self.settings = section, settings
+        self.footprint = FootprintScorer(section.X, section.nu, [1.0], footprint_sigma_mm=settings.footprint_sigma_mm)
+        s = settings.sigmas_mm
+        self.target_self_struct = gauss_inners(section.X, section.nu, section.X, section.nu, s)
+        self.target_self_anat = (gauss_inners(section.X, section.annotation, section.X, section.annotation, s)
+                                 if section.annotated else None)
 
+    def _relative(self, aa, ab, bb) -> dict[str, Any]:
+        w = self.settings.weights
+        per_sigma = (aa + bb - 2.0 * ab) / bb
+        return {"R": float(w @ per_sigma), "per_sigma": per_sigma.tolist(),
+                "atlas_self": float(w @ (aa / bb)), "target_self": 1.0, "cross": float(w @ (2.0 * ab / bb))}
 
-def lookup_tables(max_label: int, white_matter: Sequence[int], drop: Sequence[int],
-                  fine_regions: Mapping[str, Sequence[int]]) -> tuple[dict, dict]:
-    """Boolean tables for coarse (gray, white) and fine (named regions, other gray, white).
+    def evaluate(self, Y: np.ndarray, nu_gmwm: np.ndarray, nu_anat: np.ndarray) -> dict[str, Any]:
+        """``Y``: atlas particles in the section frame (mm); masses already pushed forward (mm^2)."""
 
-    Gray matter is every non-zero label that is neither white matter nor dropped
-    (ventricles, choroid plexus): an anatomical correspondence fixed in advance, not
-    learned from the data.
-    """
-
-    size = max_label + 1
-    white = np.zeros(size, bool); white[list(white_matter)] = True
-    dropped = np.zeros(size, bool); dropped[list(drop)] = True; dropped[0] = True
-    gray = ~white & ~dropped
-    coarse = {"gray_matter": gray, "white_matter": white}
-    fine: dict[str, np.ndarray] = {}
-    named = np.zeros(size, bool)
-    for name, codes in fine_regions.items():
-        table = np.zeros(size, bool); table[list(codes)] = True
-        fine[name] = table & gray
-        named |= table
-    fine["other_gray_matter"] = gray & ~named
-    fine["white_matter"] = white
-    return coarse, fine
+        s, sec = self.settings.sigmas_mm, self.section
+        weight = self.footprint.footprint(Y)[:, None]
+        cut = weight[:, 0] > FOOTPRINT_CUTOFF
+        Ys, mus = Y[cut], (nu_gmwm * weight)[cut]
+        struct = self._relative(gauss_inners(Ys, mus, Ys, mus, s), gauss_inners(Ys, mus, sec.X, sec.nu, s),
+                                self.target_self_struct)
+        out: dict[str, Any] = {
+            "R_struct": struct["R"], "struct": struct,
+            "atlas_area_in_footprint_mm2": float((nu_gmwm * weight).sum()),
+            "atlas_mtg_mass_mm2": float(nu_anat.sum()),
+            "atlas_mtg_mass_in_footprint_mm2": float((nu_anat * weight).sum()),
+            "section_area_mm2": float(sec.nu.sum()),
+        }
+        if sec.annotated:
+            anat = self._relative(gauss_inners(Y, nu_anat, Y, nu_anat, s), gauss_inners(Y, nu_anat, sec.X, sec.annotation, s),
+                                  self.target_self_anat)
+            out.update(R_anat=anat["R"], anat=anat, annotated_area_mm2=float(sec.annotation.sum()),
+                       R_combined=self.settings.lambda_struct * struct["R"] + self.settings.lambda_anat * anat["R"])
+        else:
+            out.update(R_anat=None, anat=None, annotated_area_mm2=None, R_combined=None)
+        return out
