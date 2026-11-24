@@ -341,12 +341,15 @@ def save_particle_archive(
     *,
     vtk_writer: Any | None = None,
     entropy_function: Any | None = None,
+    extra_arrays: Mapping[str, np.ndarray] | None = None,
 ) -> None:
     """Save a self-describing NPZ and an optional xmodmap-compatible VTK.
 
     The first three arrays deliberately remain ``X``, ``nu_Sub``, and ``nu_All`` in
     that order for compatibility with the colleague's scripts.  New code should still
-    access them by key rather than relying on archive order.
+    access them by key rather than relying on archive order.  ``extra_arrays`` are
+    stored after the standard keys (e.g. ``nu_Anat``, the one-hot anatomical atlas
+    features); they may not reuse a standard key.
 
     VTK output is delegated to :mod:`xmodmap.io.getOutput` through the adapter supplied
     by the calling script.  This avoids maintaining a second VTK implementation while
@@ -356,6 +359,11 @@ def save_particle_archive(
     output_npz = Path(output_npz)
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     metadata_json = json.dumps(dict(metadata), sort_keys=True)
+    extra = dict(extra_arrays or {})
+    reserved = {"X", "nu_Sub", "nu_All", "fine_feature_ids", "fine_feature_names", "coarse_feature_names",
+                "fine_to_coarse", "metadata_json"}
+    if reserved & set(extra):
+        raise ValueError(f"extra_arrays may not replace standard keys: {sorted(reserved & set(extra))}")
     np.savez_compressed(
         output_npz,
         X=np.asarray(X, dtype=np.float32),
@@ -366,6 +374,7 @@ def save_particle_archive(
         coarse_feature_names=np.asarray(features.coarse_names, dtype=str),
         fine_to_coarse=np.asarray(features.fine_to_coarse, dtype=np.int64),
         metadata_json=np.asarray(metadata_json),
+        **{key: np.asarray(value) for key, value in extra.items()},
     )
 
     if write_vtk:

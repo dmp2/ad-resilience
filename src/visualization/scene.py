@@ -423,7 +423,9 @@ QNP_TABLE_LAYERS = {"Layer1": "L1", "Layer2": "L2", "Layer3": "L3", "Layer4": "L
 
 
 def qnp_job(config: Mapping, job: str = "H20.33.034_MTG") -> dict:
-    spec = dict(config["qnp_section_inputs"][job])
+    from config_setup.qnp_jobs import resolve_qnp_job
+
+    spec = resolve_qnp_job(config, job)
     slide_dir = resolve(config, spec["slide_dir"])
     slides = {}
     for path in sorted(slide_dir.glob("*.svs")):
@@ -546,7 +548,7 @@ def resolve_ribbon(job: Mapping) -> Path:
 def load_plane_hypothesis(job: Mapping, plane_id: str, fit_dir: str | Path | None) -> dict[str, Any]:
     """One atlas-plane pose hypothesis: local -> plane similarity and the ribbon in the plane."""
 
-    from section_alignment import Similarity2D
+    from section_mapping.alignment import Similarity2D
 
     export = json.loads((job["_scan_dir"] / f"export_{plane_id}.json").read_text())
     similarity = Similarity2D.from_dict(export["similarity_qnp_local_to_plane"])
@@ -573,8 +575,8 @@ def atlas_plane_classes(config: Mapping, job: Mapping, plane: Mapping, spacing_m
     import nibabel as nib
     from scipy import ndimage as ndi
 
-    from scan_atlas_planes_for_qnp import FINE_ORDER_TAIL, atlas_setup
-    from section_alignment import reslice_labels
+    from qnp_atlas_planes import atlas_setup
+    from section_mapping.atlas import FINE_ORDER_TAIL, reslice_labels
 
     scan = job["atlas_scan"]
     atlas = atlas_setup(config, scan)
@@ -591,7 +593,7 @@ def atlas_plane_classes(config: Mapping, job: Mapping, plane: Mapping, spacing_m
     ijk = (world.reshape(-1, 3) - template.affine[:3, 3]) @ np.linalg.inv(template.affine[:3, :3]).T
     t1 = ndi.map_coordinates(np.asanyarray(template.dataobj).astype(np.float32), ijk.T, order=1).reshape(aa.shape)
     frame = f"atlas_plane_mm:{plane['plane_id']}"
-    prov = f"section_alignment.reslice_labels of {scan['annotation_nifti']} at {plane['plane_id']} ({spacing_mm} mm)"
+    prov = f"section_mapping.atlas.reslice_labels of {scan['annotation_nifti']} at {plane['plane_id']} ({spacing_mm} mm)"
     return {"classes": Raster("AHRAv2 classes", frame, classes, (axis[0], axis[0]), (spacing_mm, spacing_mm),
                               "measured", prov, "class index"),
             "labels": Raster("AHRAv2 labels", frame, grid, (axis[0], axis[0]), (spacing_mm, spacing_mm), "measured", prov),
@@ -632,7 +634,7 @@ def build_mtg_multimodal_3d(config: Mapping, rotations: Mapping[str, float] | No
     Display z means the coronal plane normal (MNI -Y), not MNI superior Z.
     Optional donor sections inherit the reviewed section's affine without fitting.
     """
-    from scan_atlas_planes_for_qnp import atlas_setup
+    from qnp_atlas_planes import atlas_setup
     from skimage.measure import marching_cubes
 
     rotations = dict(rotations or {})

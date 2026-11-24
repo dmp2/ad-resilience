@@ -478,19 +478,247 @@ particle_reconstruction_jobs:
 
 
 # ---------------------------------------------------------------------------------
-# SEA-AD QNP slides -> 2-D particles -> within-QNP alignment -> AHRAv2 plane scan.
+# SEA-AD QNP slides -> 2-D particles -> within-QNP alignment -> AHRAv2 stacking -> xIV.
 # Run by src/scripts/prepare_qnp_section_particles.py, align_qnp_multistain.py and
-# scan_atlas_planes_for_qnp.py (see their docstrings).  Section order and spacing within
+# map_qnp_sections.py (workflow: docs/section_mapping.md).  Section order and spacing within
 # the block are undocumented, so slides stay independent 2-D objects (no z).
 # ---------------------------------------------------------------------------------
+# Shared settings for every QNP job, merged under each qnp_section_inputs block by
+# src/config_setup/qnp_jobs.py (the job block wins).  A new donor needs only
+#   <donor>_<REGION>: {donor: "<donor>", region: "<bucket region prefix>"}
+# Slide stems (block names such as A07 vs A7), the stains present and annotation_misfit
+# (from the inventory's on-tissue fraction) are read from the data, not written here.
+# Templates: {donor} {region} {job} {slide_dir} {particle_dir} {qc_dir} {aligned_dir}
+# {structural} {reference_stem} {stem[STAIN]}; {plane_id} is filled by --stage export.
+qnp_section_defaults:
+  slide_dir: "data/raw/sea-ad/qnp/{region}/{donor}"
+  particle_dir: "data/derivatives/sea-ad/qnp/particles/{region}/{donor}"
+  qc_dir: "results/qc/qnp/{job}"
+  pyramid_level: -1
+  stains:
+    NEUN: {feature: "red_od_share", wm_high: true, structural: true}
+    LFB:  {feature: "red_od_share", wm_high: true, structural: true}
+    AT:   {feature: "red_od_share", wm_high: true, structural: true}
+    # align_features: what the within-QNP rigid fit to the reference compares.  Tissue
+    # outline for non-structural stains: on both donors so far the glial GFAP gray/white
+    # map dragged the gm/wm fit to a wrong pose (scale at its 0.85 bound).
+    ASYN: {feature: "red_od_share", wm_high: true, structural: false, align_features: "tissue"}
+    GFAP: {feature: "red_od_share", wm_high: true, structural: false, align_features: "tissue"}
+    I6:   {feature: "red_od_share", wm_high: true, structural: false, align_features: "tissue"}
+  reference_stain: "NEUN"
+  annotation_on_tissue_min: 0.9
+  smoothing_um: 100.0
+  membership_softness: 0.05
+  membership_edge_exclusion_um: 300.0
+  bins_mm: [1.0, 0.5]            # 1000 um: multistain search level; 500 um: refinement / full level
+  od_bins: 8
+  ribbon_point_step_px: 4
+  alignment:
+    output_dir: "{particle_dir}/aligned"
+    search_bin_tag: "1000um"
+    refine_bin_tag: "500um"
+    theta_step_deg: 10
+    refine_top: 4
+    score_sigmas_mm: [2.0, 1.0, 0.5]
+    consensus_min_votes: 2
+    grid_pad_px: 60
+  atlas_scan:
+    annotation_nifti: "data/raw/allen/ahrav2/2025/ahrav2_gyral_annotations_500um.nii.gz"
+    template_nifti: "data/raw/allen/ahrav2/2025/ahrav2_icbm2009b_symmetric_template_500um.nii.gz"
+    terminology_csv: "data/raw/allen/ahrav2/2025/ahrav2_homba_terminology_2025.csv"
+    fine_regions:
+      MTG: {codes: [30], expected_name: "middle temporal gyrus"}
+      STG: {codes: [29], expected_name: "superior temporal gyrus"}
+      ITG: {codes: [31], expected_name: "inferior temporal gyrus"}
+      FuG: {codes: [2032], expected_name: "fusiform (occipitotemporal) gyrus"}
+    white_matter_codes: [220, 222, 223, 224, 231, 233, 234, 235, 239, 244, 245, 246, 247, 249, 251, 253,
+                         367, 369, 370, 372, 374, 378, 464, 465, 468, 471, 473, 474, 475, 476, 477,
+                         1792, 1819, 1829, 2049, 2442, 2481]
+    drop_codes: [258, 259, 260, 261, 262, 264, 270, 332, 382, 482, 483, 1756, 1765, 2047, 2426]
+    # Canonical one-hot anatomical atlas channels (src/section_mapping/atlas.py):
+    # <region>_gray_matter for each gray_regions entry (names from fine_regions), then
+    # other_gray_matter (all remaining gray: FuG, insula, opercula, TTG/PLT/PLP, TP, deep
+    # gray) and one shared white_matter channel.  Exported as nu_Anat; nu_Sub stays the
+    # gmwm projection, so scans and xIV keep matching gray/white unless a registration sets
+    # source_feature_projection.  docs/section_mapping.md (Representation).
+    anatomical_features:
+      gray_regions: [STG, MTG, ITG]
+      parcellation_volumes_csv: "data/raw/allen/ahrav2/2025/ahrav2_gyral_parcellation_volumes_500um.csv"
+      figure_y_mm: [-60.0, -45.0, -27.5, -15.0, 0.0]   # representative coronal planes over MTG's y-extent
+      reference_y_mm: -27.5                             # projection figure (H20.33.034 basin A)
+    hemisphere: "left"
+    half_width_mm: 35.0
+    reslice_mm: 0.5
+    scan_bin_mm: 1.0
+    y_range_mm: [-70.0, 10.0]
+    y_step_mm: 2.5
+    pitch_deg: [-15, 0, 15]
+    yaw_deg: [-15, 0, 15]
+    theta_step_deg: 15
+    scale_grid: [0.9, 1.05, 1.2, 1.35]
+    scale_bounds: [0.8, 1.5]
+    fft_grid_mm: 1.0
+    fft_blur_mm: 1.5
+    refine_top: 2
+    max_evals: 150
+    score_sigmas_mm: [2.0, 1.0, 0.5]
+    workers: 10
+    ribbon_points: "{particle_dir}/{reference_stem}_ribbon_points.npz"
+    ribbon_subsample: 10
+    primary_representation: "consensus_gmwm"
+    replicate_representations: ["NEUN_gmwm", "LFB_gmwm", "AT_gmwm"]
+    noise_top_planes: 20
+    representations:
+      consensus_gmwm: {particles: "{aligned_dir}/consensus_{structural}_tissue_classes_1000um.npz", features: "gmwm"}
+      consensus_tissue: {particles: "{aligned_dir}/consensus_{structural}_tissue_classes_1000um.npz", features: "tissue"}
+      NEUN_gmwm: {particles: "{aligned_dir}/{stem[NEUN]}_tissue_classes_1000um_local.npz", features: "gmwm"}
+      LFB_gmwm: {particles: "{aligned_dir}/{stem[LFB]}_tissue_classes_1000um_local.npz", features: "gmwm"}
+      AT_gmwm: {particles: "{aligned_dir}/{stem[AT]}_tissue_classes_1000um_local.npz", features: "gmwm"}
+    output_dir: "results/registrations/qnp_{job}_atlas_plane_scan"
+    export:
+      bin_mm: 0.5
+      target_particles: "{aligned_dir}/consensus_{structural}_tissue_classes_500um.npz"
+      support_sigma_mm: 2.0
+      support_min_weight: 0.05
+      # Positive-only HALO annotation masses for the xIV anatomical term: the target archive
+      # also gets nu_Annot (annotated tissue area per particle; consensus tissue & the
+      # reference stain's HALO ribbon).  Additive: X / nu_Sub / nu_All are unchanged.
+      # preprocess/qnp_particles.annotated_tissue_masses; docs/archive/section_mapping/qnp_anatomical_supervision.md.
+      annotation_maps: "{aligned_dir}/multistain_maps_32um_local.npz"
+      # true (default): the atlas source keeps only particles near the rigidly placed section
+      # (footprint weight > support_min_weight).  false: the whole half_width_mm window, so
+      # neighbouring gyri (STG, insula, FuG) stay in the source and in the QC figures; xIV's
+      # tissue support censors them.  Changes the source, so it is a model choice.
+      restrict_source_to_footprint: true
+      source_npz: "data/derivatives/sea-ad/qnp/registration_inputs/{job}/{plane_id}/ahrav2_tissue_plane.npz"
+      target_npz: "data/derivatives/sea-ad/qnp/registration_inputs/{job}/{plane_id}/qnp_consensus_500um_in_plane.npz"
+      qc_points_npz: "data/derivatives/sea-ad/qnp/registration_inputs/{job}/{plane_id}/qnp_ribbon_points_in_plane.npz"
+      # map_qnp_sections.py --stage export --section S: the stacking -> xIV hand-off writes
+      # <stacking_dir>/<run>/<section>_<plane_id>[_<candidate>]/ (same archive formats as above).
+      stacking_dir: "data/derivatives/sea-ad/qnp/registration_inputs/{job}/stacking"
+    # Stacking coordinate (skill section-to-template-mapping, steps 1-7):
+    # map_qnp_sections.py --stage roles|compress|slabs|profile|passengers|report (or --stage stack).
+    stacking:
+      output_dir: "results/registrations/qnp_{job}_stacking"
+      compressed_dir: "{aligned_dir}/compressed"
+      reference_bin_tag: "500um"   # particles compressed from, and the full level
+      compression:                 # joint XY + mass, kernel exp(-d^2/sigma^2), sigma = max(1, h)
+        levels: {"h1.5": 1.5, "h1.0": 1.0}   # ~200 (search) and ~450 (first escalation) particles
+        outer_steps: 30
+        max_pairs: 16000000
+      levels: ["h1.5", "h1.0", "500um"]      # escalation order; each conditioned on the previous
+      roles:                       # feature QC on the 32 um gray/white map (anchor vs passenger)
+        otsu_separability_min: 0.75  # membership.otsu_separability of the structural feature
+        stripe_index_max: 0.3      # spectral peak share of column/row p(WM) residual, 0.4-1.5 mm periods
+                                   # (clean maps <= 0.08; H20.33.034 ASYN 0.72, AT8 0.18 worked as anchor)
+        layer1_p_wm_max: 0.5       # mean p(WM) in the reference HALO layer 1, in the local frame
+        glial_stains: ["GFAP"]
+        override: {}               # stain -> anchor|passenger: an explicit user decision, reported as such
+      slabs:
+        y_pad_mm: 5.0              # around the target region's atlas y-extent
+        half_thickness_mm: 3.0
+        stride_mm: 3.0
+        plane_step_mm: 0.5         # planes averaged inside one slab
+        keep: 3                    # distinct slabs kept (plus the best prior-consistent one)
+      profile:
+        step_mm: 0.5
+        pad_mm: 3.0                # around each kept slab centre
+      search:                      # fresh global 2-D search at every plane (GPU)
+        theta_step_deg: 15
+        scale_grid: [0.9, 1.05, 1.2, 1.35]
+        flips: [false, true]
+        scale_bounds: [0.8, 1.5]
+        fft_grid_mm: 1.0
+        fft_blur_mm: 1.5
+        refine_top: 4
+        steps: 150
+      delta_top_planes: 20
+      families: false              # per-reflection-family profiles (--families); off by default
+      region_prior:                # --region-prior: explicit dissection-region prior (off by default).
+        # Admissible atlas support: placements away from these gyri have no atlas tissue to match
+        # (no overlap threshold).  The "MTG" block spans STG + MTG (Latimer et al. 2023, Fig. 3);
+        # ITG stays because the block's cut lobe can cross the ITS: STG/MTG-only support (6 mm)
+        # moved H20.33.034's LFB/AT off their candidate by 5-6 delta (docs/section_mapping_findings.md).
+        regions: ["MTG", "STG", "ITG"]
+        margin_mm: 6.0             # keeps the gyri's own white matter
+      candidates:                  # --stage candidates: unconstrained vs admissible best, data-only (full atlas)
+        tilt_deg: [-10, -5, 0, 5, 10]   # local pitch x yaw check at each candidate (the search is coronal)
+        refine_steps: 200          # local refinement of the admissible pose on the full (uncropped) atlas
+      # --landmark-slab: SEA-AD anatomical slab prior on the stacking coordinate (off by default).
+      # "MTG was sampled at the level of first appearance of the lateral geniculate nucleus"
+      # (Gabitto et al. 2024, Methods; A21 intermediate); 4 mm coronal slabs cut anterior ->
+      # posterior, fixed and frozen alternating (Latimer et al. 2023).  QNP comes from the fixed
+      # STG-MTG block, so neighbouring slabs stay candidates.  Restricts the AP search only
+      # (combine with --region-prior for the in-plane prior).  src/section_mapping/atlas.py.
+      landmark_slab:
+        applies_to_regions: ["middle-temporal-gyrus"]   # other ROIs: own block, or no constraint
+        landmark:
+          name: "LGN"
+          codes: [174]             # AHRAv2 'LG'; checked against the terminology
+          expected_name: "lateral geniculate nucleus (dorsal lateral geniculate nucleus)"
+          rule: "first_appearance" # most anterior coronal plane with cross-section >= min_area_mm2
+          min_area_mm2: 1.0        # (one hemisphere: atlas_scan.hemisphere)
+          # y_mm: -22.0            # manual override, atlas world mm (MNI y, +anterior); replaces the rule
+        slab_thickness_mm: 4.0
+        slab_offsets: [-1, 0, 1]   # j: landmark slab and its anterior (-1) / posterior (+1) neighbours
+        phase_step_mm: 0.5         # enumeration of the unknown cutting phase delta in [0, h)
+        extension_mm: 1.0          # beyond the nominal union of candidate slabs (parent slab unknown)
+        sampling_regions: ["MTG", "STG"]   # display/QC: the "MTG" QNP block spans STG + MTG
+        figure_label_codes:        # coronal/sagittal overlays: a few structures only
+          LGN: [174]
+          MGN: [177]
+          hippocampus: [60, 62, 63]
+          insula: [66, 67]
+          temporal_plane: [33, 34, 36]   # TTG (Heschl), planum temporale, planum polare: dorsal STG surface
+      passengers:
+        theta_step_deg: 10
+        coarse_level: "h1.0"
+        fine_level: "500um"
+    # Stacking coordinate by xIV similarity fits in two conditions (baseline vs positive-only HALO MTG
+    # supervision), ranked by one common physical-space score.  Experiment (not the workflow):
+    # src/scripts/estimate_qnp_stacking_xiv.py; docs/archive/section_mapping/qnp_stacking_xiv_anatomical.md.
+    # Needs --stage roles and compress of the stacking block above (anchors, h1.0 particles).
+    xiv_stacking:
+      output_dir: "results/registrations/qnp_{job}_stacking_xiv_anatomical"
+      atlas_bin_mm: 1.0            # atlas plane particles (0.5 mm reslice summed 2x2), whole half_width_mm window
+      section_level: "500um"       # xIV target: each anchor's own full 500 um particles (local frame)
+      start_level: "h1.0"          # GPU global search that proposes the starting poses (stacking.search)
+      coarse:                      # every depth of the target region's y-extent +- y_pad (no shortlist)
+        stride_mm: 3.0
+        y_pad_mm: 5.0
+        starts_per_depth: 3        # distinct refined scan poses per depth (same for both conditions)
+      fine:
+        step_mm: 0.5
+        pad_mm: 3.0                # around each kept coarse minimum
+        minima_per_condition: 2    # distinct coarse minima kept per section and condition (union over both)
+        min_separation_mm: 6.0
+        scan_starts_per_depth: 1   # fresh global scan pose at every fine depth, plus each condition's own
+                                   # best coarse pose of the window (conditioning on the previous level)
+      distinct_start: {min_shift_mm: 3.0, min_angle_deg: 20.0}
+      model_from_registration: "ahrav2_tissue_plane_to_qnp_H20.33.034_MTG_A"   # kernels, gamma, steps, dtype
+      model_overrides: {transform: "affine"}   # similarity in 2-D (rotation, translation, isotropic scale)
+      structural_feature_map: "identity"
+      conditions:
+        baseline: {}                                        # anatomical weight 0: the structural objective
+        supervised: {weight: 1.0, censoring: "none"}        # + uncensored HALO-MTG <-> atlas-MTG varifold term
+      evaluation:                  # common score in the fixed QNP local frame (docs/archive/section_mapping/qnp_loss_normalisation_audit.md)
+        sigmas_mm: [8.0, 4.0, 2.0, 1.0]   # = model.sigma_var_mm
+        sigma_weights: "inverse"           # 1/sigma, as the objective's 0.6/sigma factor
+        footprint_sigma_mm: 0.5            # fixed section footprint for the structural score (as scores.json)
+        lambda_struct: 1.0
+        lambda_anat: 1.0
+        scale_plausible: [0.8, 1.5]        # the scan's scale bounds; fitted scales outside are flagged
+      workers: 3                   # concurrent GPU processes for the fits
+      qc_candidates_per_condition: 2       # best + best competing minimum, refitted with full driver outputs
 qnp_section_inputs:
+  # Reference donor.  Everything not listed comes from qnp_section_defaults (resolved by
+  # config_setup/qnp_jobs.py; test_qnp_jobs.py checks the resolution).
   H20.33.034_MTG:
     region: "middle-temporal-gyrus"
-    slide_dir: "data/raw/sea-ad/qnp/middle-temporal-gyrus/H20.33.034"
-    pyramid_level: -1            # smallest Aperio level, ~8 um/pixel
-    # Gray/white separation feature per stain.  red_od_share = red-channel share of
-    # optical density (myelin/LFB-blue and hematoxylin-rich white matter high).
-    # structural: used in the gray/white consensus; others are carried as features only.
+    # Gray/white separation feature per stain.  red_od_share = red-channel share of optical
+    # density (myelin/LFB-blue and hematoxylin-rich white matter high).  structural: used in the
+    # gray/white consensus.  This explicit list (no align_features) replaces the default one:
+    # the non-structural stains here were aligned on gray/white, as in the original run.
     stains:
       NEUN: {feature: "red_od_share", wm_high: true, structural: true}
       LFB:  {feature: "red_od_share", wm_high: true, structural: true}
@@ -498,92 +726,21 @@ qnp_section_inputs:
       ASYN: {feature: "red_od_share", wm_high: true, structural: false}  # ribbon p_wm 0.14-0.35, separability 0.57
       GFAP: {feature: "red_od_share", wm_high: true, structural: false}
       I6:   {feature: "red_od_share", wm_high: true, structural: false}  # layer 1 classified as white (p_wm 0.84)
-    reference_stain: "NEUN"      # defines the donor-local QNP frame (HALO layers came from NeuN)
     annotation_misfit: ["GFAP", "AT"]  # HALO ribbon <90% on own tissue (inventory: 36%, 73%)
-    annotation_on_tissue_min: 0.9
-    smoothing_um: 100.0
-    membership_softness: 0.05
-    membership_edge_exclusion_um: 300.0   # fit the gray/white split away from the stained rim
-    bins_mm: [1.0, 0.5]
-    od_bins: 8
-    ribbon_point_step_px: 4
-    particle_dir: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034"
-    qc_dir: "results/qc/qnp/H20.33.034_MTG"
-    alignment:
-      output_dir: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/aligned"
-      search_bin_tag: "1000um"
-      refine_bin_tag: "500um"
-      theta_step_deg: 10
-      refine_top: 4
-      score_sigmas_mm: [2.0, 1.0, 0.5]
-      consensus_min_votes: 2
-      grid_pad_px: 60
-    # AHRAv2 plane scan (src/scripts/scan_atlas_planes_for_qnp.py).  Gray matter = every
-    # non-zero gyral-annotation code that is neither white matter nor dropped.
     atlas_scan:
-      annotation_nifti: "data/raw/allen/ahrav2/2025/ahrav2_gyral_annotations_500um.nii.gz"
-      template_nifti: "data/raw/allen/ahrav2/2025/ahrav2_icbm2009b_symmetric_template_500um.nii.gz"
-      terminology_csv: "data/raw/allen/ahrav2/2025/ahrav2_homba_terminology_2025.csv"
-      fine_regions:   # first entry is the target region; codes checked against the terminology
-        MTG: {codes: [30], expected_name: "middle temporal gyrus"}
-        STG: {codes: [29], expected_name: "superior temporal gyrus"}
-        ITG: {codes: [31], expected_name: "inferior temporal gyrus"}
-        FuG: {codes: [2032], expected_name: "fusiform (occipitotemporal) gyrus"}
-      white_matter_codes: [220, 222, 223, 224, 231, 233, 234, 235, 239, 244, 245, 246, 247, 249, 251, 253,
-                           367, 369, 370, 372, 374, 378, 464, 465, 468, 471, 473, 474, 475, 476, 477,
-                           1792, 1819, 1829, 2049, 2442, 2481]
-      drop_codes: [258, 259, 260, 261, 262, 264, 270, 332, 382, 482, 483, 1756, 1765, 2047, 2426]
-      hemisphere: "left"           # atlas is symmetric; reflection is searched
-      half_width_mm: 35.0          # in-plane window around the left-MTG centroid
-      reslice_mm: 0.5              # = atlas voxel size
-      scan_bin_mm: 1.0             # atlas plane aggregated 2x2 for the scan
-      y_range_mm: [-70.0, 10.0]
-      y_step_mm: 2.5
-      pitch_deg: [-15, 0, 15]
-      yaw_deg: [-15, 0, 15]
-      theta_step_deg: 15
-      scale_grid: [0.9, 1.05, 1.2, 1.35]
-      scale_bounds: [0.8, 1.5]     # atlas mm per QNP mm: shrinkage x template size x atrophy
-      fft_grid_mm: 1.0
-      fft_blur_mm: 1.5
-      refine_top: 2
-      max_evals: 150
-      score_sigmas_mm: [2.0, 1.0, 0.5]
-      workers: 10
-      ribbon_points: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/H20.33.034-A07-NEUN_ribbon_points.npz"
-      ribbon_subsample: 10
-      primary_representation: "consensus_gmwm"
-      replicate_representations: ["NEUN_gmwm", "LFB_gmwm", "AT_gmwm"]
-      noise_top_planes: 20
-      representations:
-        consensus_gmwm:
-          particles: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/aligned/consensus_NEUN_LFB_AT_tissue_classes_1000um.npz"
-          features: "gmwm"
-        consensus_tissue:   # silhouette only: the analogue of the MERFISH single-label pilot
-          particles: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/aligned/consensus_NEUN_LFB_AT_tissue_classes_1000um.npz"
-          features: "tissue"
-        NEUN_gmwm:
-          particles: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/aligned/H20.33.034-A07-NEUN_tissue_classes_1000um_local.npz"
-          features: "gmwm"
-        LFB_gmwm:
-          particles: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/aligned/H20.33.034-A7-LFB_tissue_classes_1000um_local.npz"
-          features: "gmwm"
-        AT_gmwm:
-          particles: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/aligned/H20.33.034-A7-AT_tissue_classes_1000um_local.npz"
-          features: "gmwm"
-      output_dir: "results/registrations/qnp_H20.33.034_MTG_atlas_plane_scan"
       export:
-        bin_mm: 0.5
-        target_particles: "data/derivatives/sea-ad/qnp/particles/middle-temporal-gyrus/H20.33.034/aligned/consensus_NEUN_LFB_AT_tissue_classes_500um.npz"
-        support_sigma_mm: 2.0
-        support_min_weight: 0.05
-        # {plane_id} is filled by --stage export (best plane, or --plane).
-        source_npz: "data/derivatives/sea-ad/qnp/registration_inputs/H20.33.034_MTG/{plane_id}/ahrav2_tissue_plane.npz"
-        target_npz: "data/derivatives/sea-ad/qnp/registration_inputs/H20.33.034_MTG/{plane_id}/qnp_consensus_500um_in_plane.npz"
-        qc_points_npz: "data/derivatives/sea-ad/qnp/registration_inputs/H20.33.034_MTG/{plane_id}/qnp_ribbon_points_in_plane.npz"
-      # Search-robustness re-check around the two competing minima of the coarse scan
-      # (coronal y -27.5 and pitch/yaw +15 y -62.5): finer rotation grid, more refined
-      # candidates and evaluations.  Planes: [pitch, yaw, [y0 values]].
+        # 2026-11-17: full in-plane atlas window (STG, insula, FuG kept; xIV's tissue support censors
+        # them) with nu_Anat / nu_Annot, written to full_window/ so the footprint-restricted archives
+        # (and the fits on them: the *_footprint_learned records) are kept.  Export records go to
+        # <scan output_dir>/full_window/ for the same reason.
+        restrict_source_to_footprint: false
+        record_subdir: "full_window"
+        source_npz: "data/derivatives/sea-ad/qnp/registration_inputs/H20.33.034_MTG/full_window/{plane_id}/ahrav2_tissue_plane.npz"
+        target_npz: "data/derivatives/sea-ad/qnp/registration_inputs/H20.33.034_MTG/full_window/{plane_id}/qnp_consensus_500um_in_plane.npz"
+        qc_points_npz: "data/derivatives/sea-ad/qnp/registration_inputs/H20.33.034_MTG/full_window/{plane_id}/qnp_ribbon_points_in_plane.npz"
+      # Search-robustness re-check around the two competing minima of the coarse plane scan
+      # (coronal y -27.5 and pitch/yaw +15 y -62.5): finer rotation grid, more refined candidates
+      # and evaluations (--stage scan --dense).  Planes: [pitch, yaw, [y0 values]].
       dense_search:
         theta_step_deg: 7.5
         scale_grid: [0.85, 0.95, 1.05, 1.15, 1.25, 1.35]
@@ -596,3 +753,8 @@ qnp_section_inputs:
           - [0, 0, [-29.5, -29.0, -28.5, -28.0, -27.0, -26.5, -26.0, -25.5]]
           - [15, 15, [-64.5, -64.0, -63.5, -63.0, -62.0, -61.5, -61.0, -60.5]]
         representations: ["consensus_gmwm", "NEUN_gmwm", "LFB_gmwm", "AT_gmwm"]
+  # Second donor (2026-11-16): same block naming as H20.33.034 (NeuN "A07", others "A7"),
+  # No dementia, intermediate ADNC, Braak IV.  Everything else comes from the defaults.
+  H20.33.043_MTG:
+    donor: "H20.33.043"
+    region: "middle-temporal-gyrus"
